@@ -515,8 +515,16 @@ def cmd_join(args):
 
 def cmd_invite(args):
     cfg = load_config()
-    print("share this join code PRIVATELY (it is the mesh secret):\n")
-    print(f"  mesh join {join_code(cfg)} --as <node>")
+    code = join_code(cfg)
+    print("Paste this on the new machine (share PRIVATELY — the code IS the")
+    print("mesh secret). It downloads meshwire, joins as the machine's")
+    print("hostname, and starts listening:\n")
+    print("  curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/"
+          "main/mesh.py")
+    print(f"  python3 mesh.py join {code} && python3 mesh.py watch --follow\n")
+    print(f"  # pick a name instead:  python3 mesh.py join {code} "
+          f"--as <name>")
+    print(f"  # already installed via pipx/uv?  mesh join {code}")
 
 
 def cmd_iam(args):
@@ -536,8 +544,9 @@ def cmd_send(args):
     sender = my_node(cfg, args.as_node)
     to = args.to
     if to != BROADCAST and to not in cfg["nodes"]:
-        sys.exit(f"error: unknown recipient '{to}' (nodes: {cfg['nodes']} "
-                 f"or '{BROADCAST}')")
+        print(f"note: never seen '{to}' — sending anyway (topics are "
+              f"name-derived; `mesh status` lists known nodes)",
+              file=sys.stderr)
     if to == sender:
         sys.exit("error: refusing to send to self")
     msg = " ".join(args.message)
@@ -667,9 +676,18 @@ def cmd_status(args):
         me = my_node(cfg, args.as_node)
     except SystemExit:
         pass
+    peers = load_peers(cfg)
     print(f"mesh:   {cfg['mesh']}")
     print(f"server: {cfg['server']}")
-    print(f"nodes:  {', '.join(cfg['nodes'])}")
+    print("nodes:")
+    for n in cfg["nodes"]:
+        if n == me:
+            print(f"  {n}  (this machine)")
+        elif n in peers:
+            print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
+                  f"via {peers[n]['via']})")
+        else:
+            print(f"  {n}  (never seen)")
     print(f"me:     {me or '(unset — run `mesh iam <node>`)'}")
     print(f"config: {cfg['_path']}")
     if me:
@@ -704,8 +722,12 @@ def cmd_ask(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
     to = args.to
-    if to not in cfg["nodes"] or to == me:
-        sys.exit(f"error: recipient must be another node in {cfg['nodes']}")
+    if to == me:
+        sys.exit("error: refusing to ask self")
+    if to == BROADCAST:
+        sys.exit("error: tasks go to a single node, not 'all'")
+    if to not in cfg["nodes"]:
+        print(f"note: never seen '{to}' — sending anyway", file=sys.stderr)
     text = " ".join(args.text)
     env = make_send_envelope(me, to, text)
     task_id = env["params"]["message"]["taskId"]

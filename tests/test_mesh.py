@@ -305,5 +305,64 @@ class SendRawTests(unittest.TestCase):
         self.assertNotIn("c", wrapper)
 
 
+class SendStatusInviteTests(MembershipCmdTests):
+    """Reuses the chdir-to-tmp setUp/tearDown."""
+
+    def _write_cfg(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def test_send_to_unknown_warns_but_sends(self):
+        self._write_cfg()
+        sent, err, out = [], io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: sent.append(a) or {"id": "1"}), \
+             contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="gamma", message=["hi"],
+                                             as_node=None))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("never seen 'gamma'", err.getvalue())
+
+    def test_send_to_self_still_errors(self):
+        self._write_cfg()
+        with self.assertRaises(SystemExit):
+            mesh.cmd_send(argparse.Namespace(to="alpha", message=["hi"],
+                                             as_node=None))
+
+    def test_ask_to_broadcast_errors(self):
+        self._write_cfg()
+        with self.assertRaises(SystemExit):
+            mesh.cmd_ask(argparse.Namespace(to="all", text=["x"], wait=0,
+                                            as_node=None))
+
+    def test_status_shows_last_seen(self):
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(".meshwire.json")
+        cfg["_dir"] = os.getcwd()
+        mesh.note_peer(cfg, "beta", "pong")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_status(argparse.Namespace(as_node=None))
+        text = out.getvalue()
+        self.assertIn("beta", text)
+        self.assertIn("ago", text)          # last-seen rendered
+        self.assertIn("this machine", text)  # self marked
+
+    def test_invite_prints_bootstrap_block(self):
+        self._write_cfg()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_invite(argparse.Namespace())
+        text = out.getvalue()
+        self.assertIn("curl -fsSLO https://raw.githubusercontent.com/husker/"
+                      "meshwire/main/mesh.py", text)
+        self.assertIn("python3 mesh.py join mesh1-", text)
+        self.assertIn("watch --follow", text)
+
+
 if __name__ == "__main__":
     unittest.main()
