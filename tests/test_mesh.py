@@ -129,6 +129,13 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(cfg["nodes"], ["alpha", "beta"])
             self.assertFalse(os.path.exists(mesh.peers_file(cfg)))
 
+    def test_note_peer_gitignores_peers_file_on_first_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "gamma", "message")
+            with open(os.path.join(d, ".gitignore")) as f:
+                self.assertIn(".meshwire.peers.json", f.read())
+
 
 class MembershipCmdTests(unittest.TestCase):
     """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
@@ -316,6 +323,33 @@ class SendStatusInviteTests(MembershipCmdTests):
         with open(".meshwire.node", "w") as f:
             f.write("alpha\n")
         return cfg
+
+    def test_peek_learns_peers(self):
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(".meshwire.json")
+        cfg["_dir"] = os.getcwd()
+        wire = mesh.encrypt(cfg, json.dumps(
+            {"f": "gamma", "t": "alpha", "b": "hi"}))
+        ev = json.dumps({"event": "message", "id": "p1", "time": 100,
+                         "message": wire, "title": "t"})
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return (ev + "\n").encode()
+
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", lambda *a, **k: R()), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_peek(argparse.Namespace(node=None, since="all",
+                                             as_node=None))
+        with open(".meshwire.json") as f:
+            self.assertIn("gamma", json.load(f)["nodes"])
 
     def test_send_to_unknown_warns_but_sends(self):
         self._write_cfg()

@@ -115,12 +115,15 @@ def _default_node_name():
 
 
 def _save_config(cfg):
-    """Persist config changes wherever the config actually lives."""
+    """Persist config changes atomically (a background watcher and a
+    foreground command may both learn peers at the same moment)."""
     path = cfg.get("_path") or CONFIG_NAME
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
                   f, indent=2)
         f.write("\n")
+    os.replace(tmp, path)
 
 
 def peers_file(cfg):
@@ -145,6 +148,8 @@ def note_peer(cfg, node, via):
     if node not in cfg["nodes"]:
         cfg["nodes"].append(node)
         _save_config(cfg)
+    if not os.path.exists(peers_file(cfg)):
+        _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
     peers = load_peers(cfg)
     peers[node] = {"seen": int(time.time()), "via": via}
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
@@ -495,24 +500,26 @@ def cmd_init(args):
     print("  listen here: `mesh watch --follow` (background task)")
 
 
-def _write_config_here(cfg):
-    with open(CONFIG_NAME, "w", encoding="utf-8") as f:
-        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
-                  f, indent=2)
-        f.write("\n")
+def _ensure_gitignore(dirpath):
     # keep secrets and per-machine files out of version control
     gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME,
                 PEERS_NAME]
+    gi = os.path.join(dirpath, ".gitignore")
     existing = ""
-    if os.path.isfile(".gitignore"):
-        with open(".gitignore", "r", encoding="utf-8") as f:
+    if os.path.isfile(gi):
+        with open(gi, "r", encoding="utf-8") as f:
             existing = f.read()
     add = [l for l in gi_lines if l not in existing.splitlines()]
     if add:
-        with open(".gitignore", "a", encoding="utf-8") as f:
+        with open(gi, "a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(add) + "\n")
+
+
+def _write_config_here(cfg):
+    _save_config(cfg)
+    _ensure_gitignore(os.getcwd())
 
 
 def cmd_join(args):
@@ -775,6 +782,8 @@ def cmd_peek(args):
     for m in msgs:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
         frm, text, trusted, ctl = _open(m, cfg)
+        if trusted and frm:
+            note_peer(cfg, frm, "message")
         mark = "" if trusted else " [UNVERIFIED]"
         if ctl:
             mark += f" [control:{ctl.get('mw')}]"

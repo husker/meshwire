@@ -12,8 +12,9 @@ Copilot on a Windows PC — all exchanging messages and
 
 ```bash
 pipx install git+https://github.com/husker/meshwire   # or: uv tool install ...
-mesh init home        # identity defaults to this machine's hostname
-mesh invite           # prints a block to paste on the other machine
+mesh init home           # identity defaults to this machine's hostname
+mesh invite              # prints a block to paste on the other machine
+mesh watch --follow &    # start listening (or run it in a second terminal)
 ```
 
 **Machine B** — paste the block `mesh invite` printed. It looks like:
