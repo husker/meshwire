@@ -428,6 +428,21 @@ class StreamEventsTests(unittest.TestCase):
                                       first=pre)
             self.assertEqual(next(gen)["id"], "m1")
 
+    def test_skip_set_prunes_across_seconds(self):
+        cfg = make_cfg()
+        evs = [
+            {"event": "message", "id": "m1", "time": 100, "message": "x"},
+            {"event": "message", "id": "m2", "time": 101, "message": "y"},
+            {"event": "message", "id": "m3", "time": 102, "message": "z"},
+        ]
+        skip = set()
+        with mock.patch.object(mesh, "http", fake_stream(evs)):
+            gen = mesh._stream_events(cfg, "tp", "0", deadline=None, skip=skip)
+            self.assertEqual(next(gen)["id"], "m1")
+            self.assertEqual(next(gen)["id"], "m2")
+            self.assertEqual(next(gen)["id"], "m3")
+        self.assertEqual(skip, {"m3"})
+
 
 class WatchTests(MembershipCmdTests):
     """Chdir fixture; builds a real on-disk config with identity alpha."""

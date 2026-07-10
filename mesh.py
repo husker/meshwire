@@ -589,7 +589,10 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                             return
                         continue
                     backoff = 1
-                    since = str(ev.get("time", since))
+                    t = str(ev.get("time", since))
+                    if t != since:
+                        skip.clear()  # new second — older ids can't replay
+                        since = t
                     if ev.get("id") in skip:
                         continue
                     skip.add(ev.get("id"))
