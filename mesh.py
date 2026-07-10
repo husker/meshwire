@@ -22,10 +22,10 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
+PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
 USER_AGENT = "meshwire/0.3"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -95,6 +96,68 @@ def topic(cfg, node):
 def cursor_file(cfg, node):
     # per-machine, next to the config; gitignored by `mesh init`
     return os.path.join(cfg["_dir"], f".meshwire.cursor-{node}")
+
+
+def _default_node_name():
+    """This machine's default identity: sanitized hostname, or None."""
+    name = socket.gethostname().lower()
+    for suffix in (".local", ".lan"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    name = re.sub(r"[^a-z0-9-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    if not name or name == BROADCAST:
+        return None
+    return name
+
+
+def _save_config(cfg):
+    """Persist config changes wherever the config actually lives."""
+    path = cfg.get("_path") or CONFIG_NAME
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
+                  f, indent=2)
+        f.write("\n")
+
+
+def peers_file(cfg):
+    return os.path.join(cfg["_dir"], PEERS_NAME)
+
+
+def load_peers(cfg):
+    try:
+        with open(peers_file(cfg), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def note_peer(cfg, node, via):
+    """Record a live sighting of `node`; learn unknown nodes into the config.
+
+    Membership is dynamic: any authenticated message teaches us its sender.
+    """
+    if not node or node == BROADCAST:
+        return
+    if node not in cfg["nodes"]:
+        cfg["nodes"].append(node)
+        _save_config(cfg)
+    peers = load_peers(cfg)
+    peers[node] = {"seen": int(time.time()), "via": via}
+    with open(peers_file(cfg), "w", encoding="utf-8") as f:
+        json.dump(peers, f, indent=2)
+        f.write("\n")
+
+
+def _ago(ts):
+    d = max(0, int(time.time()) - int(ts))
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
 
 
 # ---------------------------------------------------------------- crypto
@@ -372,10 +435,10 @@ def cmd_init(args):
     print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print(f"  join other machines with this code (share it privately —\n"
-          f"  it IS the mesh secret):\n")
+    print("  join other machines with this code (share it privately —\n"
+          "  it IS the mesh secret):\n")
     print(f"    mesh join {join_code(cfg)} --as <node>\n")
-    print(f"  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+    print("  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
 
 
 def _write_config_here(cfg):
@@ -384,7 +447,8 @@ def _write_config_here(cfg):
                   f, indent=2)
         f.write("\n")
     # keep secrets and per-machine files out of version control
-    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME]
+    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME,
+                PEERS_NAME]
     existing = ""
     if os.path.isfile(".gitignore"):
         with open(".gitignore", "r", encoding="utf-8") as f:
@@ -832,7 +896,7 @@ def cmd_a2a_serve(args):
     peers = [n for n in cfg["nodes"] if n != me]
     print(f"a2a bridge for mesh '{cfg['mesh']}' as node '{me}' on "
           f"http://{args.host}:{args.port}")
-    print(f"  agent card:    /.well-known/agent-card.json")
+    print("  agent card:    /.well-known/agent-card.json")
     for n in peers:
         print(f"  remote agent:  /agents/{n}  "
               f"(card: /agents/{n}/.well-known/agent-card.json)")
