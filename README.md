@@ -60,7 +60,9 @@ The loop each session runs:
 
 Works with any number of nodes; each node has an inbox topic and `all`
 broadcasts. `mesh claude-setup` prints a CLAUDE.md section with the same
-protocol for projects that don't use the plugin.
+protocol for projects that don't use the plugin — **if you use the plugin,
+skip it**. (You still run `mesh init`/`mesh join` once per machine either
+way: the plugin teaches sessions the protocol, it doesn't create the mesh.)
 
 ## How it works
 
