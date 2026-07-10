@@ -336,6 +336,20 @@ def _load_cursor(cf):
         return int(time.time()) - 5, []
 
 
+def _sender_of(ev, env):
+    """Best-effort sender node of a message event."""
+    if env:
+        meta = (env.get("params") or env.get("result") or {}).get(
+            "metadata", {}).get("mesh", {})
+        if meta.get("from"):
+            return meta["from"]
+    # plain pings carry it in the title convention "<mesh>: <from> -> <to>"
+    title = ev.get("title", "")
+    if ": " in title and " -> " in title:
+        return title.split(": ", 1)[1].split(" -> ", 1)[0]
+    return None
+
+
 def cmd_watch(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
@@ -344,18 +358,29 @@ def cmd_watch(args):
     cf = cursor_file(cfg, me)
     since, seen = _load_cursor(cf)
     deadline = time.time() + args.timeout
-    ev = _stream_once(cfg, tpc, str(since), deadline, skip=set(seen))
-    if ev is None:
-        print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
-        sys.exit(0)
+    skip = set(seen)
+    while True:
+        ev = _stream_once(cfg, tpc, str(since), deadline, skip=skip)
+        if ev is None:
+            print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
+            sys.exit(0)
+        body = _unwrap(ev, cfg)
+        env = _parse_envelope(body)
+        if _sender_of(ev, env) != me:
+            break  # a real message from someone else
+        # own broadcast echoed back — remember it, keep waiting
+        skip.add(ev.get("id"))
+        t = int(ev.get("time", time.time()))
+        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
+        since = t
+        with open(cf, "w", encoding="utf-8") as f:
+            json.dump({"since": t, "seen": seen[-50:]}, f)
     # cursor: resume from this message's second; remember ids seen in that
     # second so re-delivery on the boundary is filtered, not re-consumed
     t = int(ev.get("time", time.time()))
     seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
     with open(cf, "w", encoding="utf-8") as f:
         json.dump({"since": t, "seen": seen[-50:]}, f)
-    body = _unwrap(ev, cfg)
-    env = _parse_envelope(body)
     if env:
         kind, task_id, ctx, state, frm, text = envelope_summary(env)
         save_task(cfg, task_id, contextId=ctx, state=state,
