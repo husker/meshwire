@@ -26,6 +26,7 @@ import re
 import secrets
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -435,10 +436,10 @@ def cmd_init(args):
     print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print("  join other machines with this code (share it privately —\n"
-          "  it IS the mesh secret):\n")
+    print(f"  join other machines with this code (share it privately —\n"
+          f"  it IS the mesh secret):\n")
     print(f"    mesh join {join_code(cfg)} --as <node>\n")
-    print("  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+    print(f"  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
 
 
 def _write_config_here(cfg):
@@ -896,7 +897,7 @@ def cmd_a2a_serve(args):
     peers = [n for n in cfg["nodes"] if n != me]
     print(f"a2a bridge for mesh '{cfg['mesh']}' as node '{me}' on "
           f"http://{args.host}:{args.port}")
-    print("  agent card:    /.well-known/agent-card.json")
+    print(f"  agent card:    /.well-known/agent-card.json")
     for n in peers:
         print(f"  remote agent:  /agents/{n}  "
               f"(card: /agents/{n}/.well-known/agent-card.json)")
