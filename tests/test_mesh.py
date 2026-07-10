@@ -656,6 +656,10 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn("do not start another watcher", out.getvalue())
         self.assertIn("Only display and acknowledge ordinary MESH_MESSAGE",
                       out.getvalue())
+        self.assertIn("send its result with mesh reply without asking",
+                      out.getvalue())
+        self.assertIn("external side effects beyond the Meshwire reply",
+                      out.getvalue())
 
     def test_message_becomes_same_task_continuation_without_raw_json(self):
         self._setup_mesh()
