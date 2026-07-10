@@ -1071,9 +1071,9 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("copilot-session-hook", session["bash"])
         self.assertIn("copilot-session-hook", session["powershell"])
         handler = hooks["agentStop"][0]
-        self.assertIn("$PLUGIN_ROOT/mesh.py", handler["bash"])
+        self.assertIn("${PLUGIN_ROOT}/mesh.py", handler["bash"])
         self.assertIn("copilot-hook", handler["bash"])
-        self.assertIn("$env:PLUGIN_ROOT", handler["powershell"])
+        self.assertIn("${PLUGIN_ROOT}\\mesh.py", handler["powershell"])
         self.assertIn("copilot-hook", handler["powershell"])
         self.assertGreaterEqual(handler["timeoutSec"], 10800)
         cleanup = hooks["sessionEnd"][0]
