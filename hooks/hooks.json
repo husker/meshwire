@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f .meshwire.json ]; then echo 'This project is a meshwire node. Load the meshwire:mesh-agent skill and arm the watcher (mesh watch as a background task) to receive messages from other machines.'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

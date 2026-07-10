@@ -17,6 +17,9 @@ Stdlib only. Works on Linux, macOS, Windows (Python 3.8+).
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -94,6 +97,90 @@ def cursor_file(cfg, node):
     return os.path.join(cfg["_dir"], f".meshwire.cursor-{node}")
 
 
+# ---------------------------------------------------------------- crypto
+#
+# End-to-end encryption with only the stdlib. Standard constructions:
+#   - HKDF-SHA256 (RFC 5869) derives independent enc + mac keys from the
+#     mesh key (a 256-bit secret in .meshwire.json that never goes on the wire)
+#   - encryption: HMAC-SHA256 as a PRF in counter mode (PRF-CTR stream
+#     cipher) with a random 128-bit nonce per message
+#   - authentication: encrypt-then-MAC, HMAC-SHA256 tag over nonce+ciphertext,
+#     constant-time comparison
+# The relay (ntfy) sees only ciphertext, topic id, size, and timing. Sender/
+# recipient names travel INSIDE the encrypted payload.
+
+WIRE_MAGIC = "mw1:"
+
+
+def _hkdf(key, info, length=32):
+    prk = hmac.new(b"meshwire-hkdf-salt", key, hashlib.sha256).digest()
+    out, block, i = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([i]), hashlib.sha256).digest()
+        out += block
+        i += 1
+    return out[:length]
+
+
+def _keys(cfg):
+    key = bytes.fromhex(cfg["key"])
+    return _hkdf(key, b"enc"), _hkdf(key, b"mac")
+
+
+def _keystream_xor(k_enc, nonce, data):
+    out = bytearray()
+    for i in range(0, len(data), 32):
+        block = hmac.new(k_enc, nonce + i.to_bytes(8, "big"),
+                         hashlib.sha256).digest()
+        chunk = data[i:i + 32]
+        out += bytes(a ^ b for a, b in zip(chunk, block))
+    return bytes(out)
+
+
+def encrypt(cfg, plaintext):
+    k_enc, k_mac = _keys(cfg)
+    nonce = secrets.token_bytes(16)
+    ct = _keystream_xor(k_enc, nonce, plaintext.encode("utf-8"))
+    tag = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
+    return WIRE_MAGIC + base64.b64encode(nonce + ct + tag).decode("ascii")
+
+
+def decrypt(cfg, body):
+    """Return plaintext, or None if not-encrypted/undecryptable."""
+    if not body.startswith(WIRE_MAGIC) or not cfg.get("key"):
+        return None
+    try:
+        raw = base64.b64decode(body[len(WIRE_MAGIC):], validate=True)
+        nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
+        k_enc, k_mac = _keys(cfg)
+        want = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, want):
+            return None
+        return _keystream_xor(k_enc, nonce, ct).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def join_code(cfg):
+    """One shareable string carrying everything a machine needs to join."""
+    payload = {"mesh": cfg["mesh"], "id": cfg["id"], "key": cfg.get("key"),
+               "server": cfg["server"], "nodes": cfg["nodes"]}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return "mesh1-" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def parse_join_code(code):
+    code = code.strip()
+    if not code.startswith("mesh1-"):
+        sys.exit("error: not a meshwire join code (expected mesh1-...)")
+    b = code[len("mesh1-"):]
+    b += "=" * (-len(b) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(b))
+    except (ValueError, UnicodeDecodeError):
+        sys.exit("error: corrupt join code")
+
+
 # ---------------------------------------------------------------- http
 
 def http(url, data=None, headers=None, timeout=15):
@@ -118,6 +205,30 @@ def _unwrap(ev, cfg):
         except (urllib.error.URLError, socket.timeout):
             return ev.get("message", "")
     return ev.get("message", "")
+
+
+def _open(ev, cfg):
+    """Unwrap + decrypt + unpack a message event.
+    Returns (sender_or_None, body_text, trusted: bool). trusted=True only for
+    messages that authenticated under the mesh key."""
+    body = _unwrap(ev, cfg)
+    pt = decrypt(cfg, body)
+    if pt is not None:
+        try:
+            wrapper = json.loads(pt)
+            if isinstance(wrapper, dict) and "b" in wrapper:
+                return wrapper.get("f"), wrapper["b"], True
+        except json.JSONDecodeError:
+            pass
+        return None, pt, True
+    if body.startswith(WIRE_MAGIC):
+        return None, "", False  # encrypted but not for us / tampered
+    # legacy plaintext: sender via title convention
+    title = ev.get("title", "")
+    frm = None
+    if ": " in title and " -> " in title:
+        frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
+    return frm, body, not cfg.get("key")
 
 
 def _parse_envelope(body):
@@ -227,9 +338,16 @@ def envelope_summary(env):
 
 def send_raw(cfg, sender, to, body, title=None):
     url = f"{cfg['server']}/{topic(cfg, to)}"
-    headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
-               "X-Mesh-From": sender}
-    with http(url, data=body.encode("utf-8"), headers=headers) as r:
+    if cfg.get("key"):
+        # metadata rides inside the ciphertext; the relay learns nothing
+        # beyond topic, size, and timing
+        wire = encrypt(cfg, json.dumps({"f": sender, "t": to, "b": body}))
+        headers = {"Title": cfg["mesh"]}
+    else:
+        wire = body
+        headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
+                   "X-Mesh-From": sender}
+    with http(url, data=wire.encode("utf-8"), headers=headers) as r:
         return json.load(r)
 
 
@@ -246,14 +364,27 @@ def cmd_init(args):
     cfg = {
         "mesh": args.name,
         "id": secrets.token_hex(8),
+        "key": secrets.token_hex(32),   # E2E encryption key, never on the wire
         "server": args.server.rstrip("/"),
         "nodes": nodes,
     }
+    _write_config_here(cfg)
+    print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
+    print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
+          f"KEY. Never commit to a public repo.")
+    print(f"  join other machines with this code (share it privately —\n"
+          f"  it IS the mesh secret):\n")
+    print(f"    mesh join {join_code(cfg)} --as <node>\n")
+    print(f"  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+
+
+def _write_config_here(cfg):
     with open(CONFIG_NAME, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
+                  f, indent=2)
         f.write("\n")
-    # keep per-machine files out of version control
-    gi_lines = [NODE_NAME, ".meshwire.cursor-*", TASKS_NAME]
+    # keep secrets and per-machine files out of version control
+    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME]
     existing = ""
     if os.path.isfile(".gitignore"):
         with open(".gitignore", "r", encoding="utf-8") as f:
@@ -264,12 +395,37 @@ def cmd_init(args):
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(add) + "\n")
-    print(f"mesh '{args.name}' created: nodes {nodes}")
-    print(f"  config: {os.path.abspath(CONFIG_NAME)}  (commit this if the "
-          f"repo is PRIVATE; the id is a capability — anyone who has it can "
-          f"read/post pings)")
-    print(f"  next: `mesh iam <node>` on each machine, then `mesh watch` / "
-          f"`mesh send`.")
+
+
+def cmd_join(args):
+    if find_config():
+        sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
+    cfg = parse_join_code(args.code)
+    for field in ("mesh", "id", "server", "nodes"):
+        if not cfg.get(field):
+            sys.exit(f"error: join code missing '{field}'")
+    _write_config_here(cfg)
+    print(f"joined mesh '{cfg['mesh']}' "
+          f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'}); "
+          f"nodes: {cfg['nodes']}")
+    if args.as_node:
+        with open(NODE_NAME, "w", encoding="utf-8") as f:
+            f.write(args.as_node + "\n")
+        if args.as_node not in cfg["nodes"]:
+            cfg["nodes"].append(args.as_node)
+            _write_config_here(cfg)
+            print(f"  note: added new node '{args.as_node}' locally — other "
+                  f"machines can message it by name regardless.")
+        print(f"  this machine is '{args.as_node}'. Try: mesh send all "
+              f"\"{args.as_node} online\"")
+    else:
+        print("  next: mesh iam <node>")
+
+
+def cmd_invite(args):
+    cfg = load_config()
+    print("share this join code PRIVATELY (it is the mesh secret):\n")
+    print(f"  mesh join {join_code(cfg)} --as <node>")
 
 
 def cmd_iam(args):
@@ -291,15 +447,12 @@ def cmd_send(args):
     if to == sender:
         sys.exit("error: refusing to send to self")
     msg = " ".join(args.message)
-    url = f"{cfg['server']}/{topic(cfg, to)}"
-    headers = {"Title": f"{cfg['mesh']}: {sender} -> {to}",
-               "X-Mesh-From": sender}
     try:
-        with http(url, data=msg.encode("utf-8"), headers=headers) as r:
-            resp = json.load(r)
+        resp = send_raw(cfg, sender, to, msg)
     except (urllib.error.URLError, socket.timeout) as e:
         sys.exit(f"error: send failed: {e}")
-    print(f"sent to {to} (id {resp.get('id', '?')}): {msg}")
+    enc = " [e2e]" if cfg.get("key") else ""
+    print(f"sent to {to} (id {resp.get('id', '?')}){enc}: {msg}")
 
 
 def _stream_once(cfg, tpc, since, deadline, skip=()):
@@ -336,20 +489,6 @@ def _load_cursor(cf):
         return int(time.time()) - 5, []
 
 
-def _sender_of(ev, env):
-    """Best-effort sender node of a message event."""
-    if env:
-        meta = (env.get("params") or env.get("result") or {}).get(
-            "metadata", {}).get("mesh", {})
-        if meta.get("from"):
-            return meta["from"]
-    # plain pings carry it in the title convention "<mesh>: <from> -> <to>"
-    title = ev.get("title", "")
-    if ": " in title and " -> " in title:
-        return title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return None
-
-
 def cmd_watch(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
@@ -364,17 +503,20 @@ def cmd_watch(args):
         if ev is None:
             print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
             sys.exit(0)
-        body = _unwrap(ev, cfg)
-        env = _parse_envelope(body)
-        if _sender_of(ev, env) != me:
+        frm, body, trusted = _open(ev, cfg)
+        env = _parse_envelope(body) if trusted else None
+        if trusted and frm != me:
             break  # a real message from someone else
-        # own broadcast echoed back — remember it, keep waiting
+        # own echo, unauthenticated, or undecryptable — skip, keep waiting
         skip.add(ev.get("id"))
         t = int(ev.get("time", time.time()))
         seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
         since = t
         with open(cf, "w", encoding="utf-8") as f:
             json.dump({"since": t, "seen": seen[-50:]}, f)
+        if not trusted and body != "":
+            print(f"MESH_WARN: dropped unauthenticated message "
+                  f"id={ev.get('id')}", file=sys.stderr)
     # cursor: resume from this message's second; remember ids seen in that
     # second so re-delivery on the boundary is filtered, not re-consumed
     t = int(ev.get("time", time.time()))
@@ -382,7 +524,8 @@ def cmd_watch(args):
     with open(cf, "w", encoding="utf-8") as f:
         json.dump({"since": t, "seen": seen[-50:]}, f)
     if env:
-        kind, task_id, ctx, state, frm, text = envelope_summary(env)
+        kind, task_id, ctx, state, efrm, text = envelope_summary(env)
+        frm = efrm or frm
         save_task(cfg, task_id, contextId=ctx, state=state,
                   peer=frm, direction="inbound", text=text,
                   rpcId=env.get("id"))
@@ -396,9 +539,9 @@ def cmd_watch(args):
                   f"state={state}: {text}")
         print(json.dumps(env))
         return
-    sender = ev.get("title", "")
-    print(f"MESH_MESSAGE from={sender!r} to={me}: {body}")
-    print(json.dumps(ev))
+    print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
+    print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
+                      "time": ev.get("time")}))
 
 
 def cmd_peek(args):
@@ -416,7 +559,9 @@ def cmd_peek(args):
         print(f"(no messages for '{node}' since {args.since})")
     for m in msgs:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
-        print(f"[{ts}] {m.get('title', '')}: {m.get('message', '')}")
+        frm, text, trusted = _open(m, cfg)
+        mark = "" if trusted else " [UNVERIFIED]"
+        print(f"[{ts}] {frm or m.get('title', '')}{mark}: {text}")
 
 
 def cmd_status(args):
@@ -447,7 +592,8 @@ def _await_result(cfg, me, task_id, timeout):
         if ev is None:
             return None
         skip.add(ev.get("id"))
-        env = _parse_envelope(_unwrap(ev, cfg))
+        _, body, trusted = _open(ev, cfg)
+        env = _parse_envelope(body) if trusted else None
         if not env:
             continue
         kind, tid, ctx, state, frm, text = envelope_summary(env)
@@ -739,6 +885,15 @@ def main():
                    help="ntfy server (default: https://ntfy.sh; self-host "
                         "for private traffic)")
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("join", help="join an existing mesh from a join code")
+    p.add_argument("code", help="mesh1-... code from `mesh init`/`mesh invite`")
+    p.add_argument("--as", dest="as_node", default=None,
+                   help="claim this node name immediately")
+    p.set_defaults(fn=cmd_join)
+
+    p = sub.add_parser("invite", help="print this mesh's join code")
+    p.set_defaults(fn=cmd_invite)
 
     p = sub.add_parser("iam", help="set this machine's node identity")
     p.add_argument("node")
