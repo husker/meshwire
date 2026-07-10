@@ -40,7 +40,7 @@ NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
-USER_AGENT = "meshwire/0.3"
+USER_AGENT = "meshwire/0.5"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
@@ -1125,16 +1125,19 @@ CLAUDE_SNIPPET = """\
 This project uses meshwire (https://github.com/husker/meshwire) to link
 agent sessions on different machines. Protocol:
 
-1. Substantive content (results, requests, code) travels via the shared repo:
-   commit + push, addressed in commit messages or a designated doc.
-2. After pushing something the other machine should act on, ping it:
+1. Keep a PERSISTENT watcher running as a BACKGROUND task:
+   `python3 mesh.py watch --follow`
+   Every MESH_MESSAGE / MESH_TASK line it prints is a message arriving now —
+   read it and act on it. If the watcher task dies, restart it.
+2. Substantive content (results, requests, code) travels via the shared repo
+   when there is one: commit + push, then ping:
    `python3 mesh.py send <node|all> "one-line summary — pull"`.
-3. To receive pings instantly, keep `python3 mesh.py watch` running as a
-   BACKGROUND task. When it exits with MESH_MESSAGE, pull the repo, read what
-   changed, act on it, and re-arm the watcher (run `mesh watch` in the
-   background again).
-4. Never put secrets or real content in a ping — topics are capability URLs
-   on a public ntfy server. Pings say "look", the repo says "what".
+3. To delegate work: `mesh ask <node> "do X" --wait 120`. To answer a
+   MESH_TASK line: `mesh reply <task-id> "<result>"`.
+4. `mesh ping <node>` checks a machine is listening (prints RTT; answered
+   automatically — no agent needed on the far side).
+5. Never put secrets in a message: E2E-encrypted, but messages are requests
+   between machines, not a secrets channel.
 
 This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 """
@@ -1148,8 +1151,8 @@ def main():
     ap = argparse.ArgumentParser(
         prog="mesh",
         description="Zero-infrastructure messaging between AI agent sessions "
-                    "on different machines (ntfy.sh wake pings + your shared "
-                    "repo as the payload channel).")
+                    "on different machines: E2E-encrypted messages and A2A "
+                    "tasks over an ntfy relay, no server, no open ports.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="create a mesh in the current directory")

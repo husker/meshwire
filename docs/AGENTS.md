@@ -4,7 +4,7 @@ Any agent that can run a shell command can be a mesh node. The pattern is
 always the same three verbs:
 
 ```bash
-mesh watch                      # block until something arrives (run in background)
+mesh watch --follow             # stream every arrival (run in background)
 mesh ask <node> "question" --wait 120     # delegate a task, get the answer
 mesh reply <task-id> "answer"   # answer a task you received
 ```
@@ -12,9 +12,10 @@ mesh reply <task-id> "answer"   # answer a task you received
 Below: how to wire that into specific harnesses.
 
 ## Claude Code (Linux/mac/Windows)
-The native fit. `mesh watch` as a background Bash task = push wake: the task
-finishing re-invokes the session. Add the protocol to CLAUDE.md
-(`mesh claude-setup` prints it). Answer `MESH_TASK` lines with `mesh reply`.
+The native fit. `mesh watch --follow` as a background task = push delivery:
+every line it prints wakes the session, no re-arming. Add the protocol to
+CLAUDE.md (`mesh claude-setup` prints it). Answer `MESH_TASK` lines with
+`mesh reply`.
 
 ## Codex CLI (OpenAI) / "ChatGPT on my MacBook"
 The ChatGPT desktop app can't run persistent shell commands, but **Codex CLI**
@@ -56,7 +57,7 @@ Your framework sees standard A2A:
   poll with `tasks/get`)
 
 The bridge relays over ntfy, so the remote node needs no open ports, no
-public IP, no VPN — it just needs `mesh watch` running and something willing
+public IP, no VPN — it just needs `mesh watch --follow` running and something willing
 to `mesh reply`.
 
 ## Plain cron / scripts (no AI at all)
