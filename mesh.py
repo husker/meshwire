@@ -41,6 +41,7 @@ TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
 USER_AGENT = "meshwire/0.7"
+ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
@@ -739,8 +740,23 @@ def _handle_control(cfg, me, frm, ctl):
     if kind == "pong":
         note_peer(cfg, frm, "pong")
         return None
+    if kind == "ack":
+        note_peer(cfg, frm, "ack")
+        return None
     print(f"MESH_CTL from={frm} kind={kind!r} (ignored)", file=sys.stderr)
     return None
+
+
+def _send_ack(cfg, me, frm, ev):
+    """Acknowledge receipt to the sender — silent and best-effort. A
+    watcher must never die (or wake its agent) because an ack failed."""
+    if not cfg.get("key") or not frm:
+        return
+    try:
+        send_raw(cfg, me, frm, "ack",
+                 ctl={"mw": "ack", "of": ev.get("id")})
+    except (urllib.error.URLError, socket.timeout):
+        pass
 
 
 def cmd_watch(args):
@@ -781,6 +797,7 @@ def cmd_watch(args):
                 print(line, flush=True)
             continue
         note_peer(cfg, frm, "message")
+        _send_ack(cfg, me, frm, ev)
         _emit_message(cfg, me, frm, body, ev)
         delivered = True
         if not args.follow:
