@@ -74,6 +74,44 @@ Add the protocol to your project's `CLAUDE.md` (print it with
 Works with any number of nodes (`--nodes laptop,desktop,cloudbox,pi`). Each
 node has an inbox topic; `all` broadcasts.
 
+## A2A support: any AI talking to any AI
+
+v0.2 adds [A2A protocol](https://a2a-protocol.org) task semantics, so nodes
+don't just ping each other — they **delegate tasks and return results**, in
+standard JSON-RPC envelopes:
+
+```bash
+mesh ask desktop "run the test suite and summarize failures" --wait 300
+# → MESH_TASK_RESULT from=desktop state=completed: 2 failures, both in auth...
+
+# on the receiving side (its agent sees this via `mesh watch`):
+# MESH_TASK from=laptop task=5e52304e... state=submitted: run the test suite...
+mesh reply 5e52304e "2 failures, both in auth: ..."
+
+mesh tasks                 # ledger of everything asked/answered
+mesh card desktop          # its A2A agent card
+```
+
+And because the wire format is real A2A, `mesh a2a-serve` runs a **localhost
+bridge** that lets any A2A-capable framework (LangGraph, Google ADK, Microsoft
+Agent Framework, …) talk to remote mesh nodes as if they were ordinary A2A
+servers — discovery via agent cards, `message/send`, `tasks/get`:
+
+```bash
+mesh a2a-serve     # → http://127.0.0.1:4737/agents/<node> per remote node
+```
+
+The twist vs. vanilla A2A: A2A assumes agents expose reachable HTTP servers.
+Two laptops behind NAT can't do that. claude-mesh carries the same envelopes
+over the ntfy relay — **outbound-only connections on both ends** — so ChatGPT
+(via Codex CLI) on a MacBook, Claude Code on a Linux laptop, and Copilot on a
+Windows PC can all exchange tasks with no port forwarding, no VPN, no server.
+See [docs/AGENTS.md](docs/AGENTS.md) for per-harness wiring (Codex CLI,
+Copilot CLI, Gemini CLI, A2A frameworks, cron).
+
+`mesh` moves messages; it never calls a model. Each node answers with
+whatever brain, tools, and permissions its own harness has.
+
 ## Security model (read this)
 
 - Topics are **capability URLs**: `cmesh-<mesh>-<128-bit-hex>-<node>` on a
@@ -105,8 +143,13 @@ node has an inbox topic; `all` broadcasts.
 mesh init <name> --nodes a,b[,c...] [--server URL]   create mesh config here
 mesh iam <node>                set this machine's identity
 mesh send <node|all> <msg...>  ping a node (or broadcast)
-mesh watch [--timeout N]       block until a ping arrives, print, exit
-mesh peek [node] [--since S]   show recent pings without consuming
+mesh watch [--timeout N]       block until a message arrives, print, exit
+mesh ask <node> <text...> [--wait SECS]   delegate an A2A task
+mesh reply <task-id> <text...> [--state completed|failed|...]   answer one
+mesh tasks [get <id>]          task ledger
+mesh card [node] [--name N --description D]   A2A agent card
+mesh a2a-serve [--port 4737] [--wait 60]      localhost A2A HTTP bridge
+mesh peek [node] [--since S]   show recent messages without consuming
 mesh status                    show mesh, identity, topic
 mesh claude-setup              print the CLAUDE.md protocol section
 ```

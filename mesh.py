@@ -22,14 +22,20 @@ import os
 import secrets
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".claude-mesh.json"
 NODE_NAME = ".claude-mesh.node"
+TASKS_NAME = ".claude-mesh.tasks.json"
 BROADCAST = "all"
-USER_AGENT = "claude-mesh/0.1"
+USER_AGENT = "claude-mesh/0.2"
+MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
+TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
 
 # ---------------------------------------------------------------- config
@@ -96,6 +102,137 @@ def http(url, data=None, headers=None, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _unwrap(ev, cfg):
+    """ntfy wraps large bodies into attachments. Return the effective body
+    text of a message event, fetching the attachment when needed."""
+    att = ev.get("attachment")
+    if att and att.get("url"):
+        if att.get("size", 0) > MAX_ATTACHMENT:
+            return ev.get("message", "")
+        # only fetch from the mesh's own server, never a third-party URL
+        if not att["url"].startswith(cfg["server"] + "/"):
+            return ev.get("message", "")
+        try:
+            with http(att["url"], timeout=30) as r:
+                return r.read(MAX_ATTACHMENT).decode("utf-8", "replace")
+        except (urllib.error.URLError, socket.timeout):
+            return ev.get("message", "")
+    return ev.get("message", "")
+
+
+def _parse_envelope(body):
+    """Return the parsed A2A JSON-RPC envelope if `body` is one, else None."""
+    if not body or body[0] != "{":
+        return None
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" else None
+
+
+# ---------------------------------------------------------------- a2a tasks
+
+def tasks_file(cfg):
+    return os.path.join(cfg["_dir"], TASKS_NAME)
+
+
+def load_tasks(cfg):
+    try:
+        with open(tasks_file(cfg), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_task(cfg, task_id, **fields):
+    tasks = load_tasks(cfg)
+    t = tasks.setdefault(task_id, {})
+    t.update(fields)
+    t["updated"] = int(time.time())
+    with open(tasks_file(cfg), "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=1)
+    return t
+
+
+def _text_of(message_or_artifact):
+    return "\n".join(p.get("text", "") for p in
+                     message_or_artifact.get("parts", []) if "text" in p)
+
+
+def make_send_envelope(sender, to, text, task_id=None, context_id=None):
+    """A2A JSON-RPC message/send request, carried over the mesh transport."""
+    return {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "messageId": str(uuid.uuid4()),
+                "taskId": task_id or str(uuid.uuid4()),
+                "contextId": context_id or str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+            },
+            "metadata": {"mesh": {"from": sender, "to": to}},
+        },
+    }
+
+
+def make_result_envelope(sender, to, task_id, context_id, state, text,
+                         rpc_id=None):
+    """A2A JSON-RPC response carrying a Task with a status update/result."""
+    task = {
+        "kind": "task",
+        "id": task_id,
+        "contextId": context_id,
+        "status": {
+            "state": state,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        "metadata": {"mesh": {"from": sender, "to": to}},
+    }
+    if text:
+        part = [{"kind": "text", "text": text}]
+        if state in TERMINAL_STATES:
+            task["artifacts"] = [{"artifactId": str(uuid.uuid4()),
+                                  "name": "result", "parts": part}]
+        else:
+            task["status"]["message"] = {"kind": "message", "role": "agent",
+                                         "messageId": str(uuid.uuid4()),
+                                         "parts": part}
+    return {"jsonrpc": "2.0", "id": rpc_id or str(uuid.uuid4()),
+            "result": task}
+
+
+def envelope_summary(env):
+    """(kind, task_id, context_id, state, from_node, text) for any envelope."""
+    if "method" in env:  # request: message/send
+        msg = env.get("params", {}).get("message", {})
+        meta = env.get("params", {}).get("metadata", {}).get("mesh", {})
+        return ("request", msg.get("taskId"), msg.get("contextId"),
+                "submitted", meta.get("from"), _text_of(msg))
+    task = env.get("result", {})  # response: task status/result
+    meta = task.get("metadata", {}).get("mesh", {})
+    state = task.get("status", {}).get("state", "?")
+    text = ""
+    for a in task.get("artifacts", []) or []:
+        text += _text_of(a)
+    if not text and task.get("status", {}).get("message"):
+        text = _text_of(task["status"]["message"])
+    return ("result", task.get("id"), task.get("contextId"), state,
+            meta.get("from"), text)
+
+
+def send_raw(cfg, sender, to, body, title=None):
+    url = f"{cfg['server']}/{topic(cfg, to)}"
+    headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
+               "X-Mesh-From": sender}
+    with http(url, data=body.encode("utf-8"), headers=headers) as r:
+        return json.load(r)
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_init(args):
@@ -116,7 +253,7 @@ def cmd_init(args):
         json.dump(cfg, f, indent=2)
         f.write("\n")
     # keep per-machine files out of version control
-    gi_lines = [NODE_NAME, ".claude-mesh.cursor-*"]
+    gi_lines = [NODE_NAME, ".claude-mesh.cursor-*", TASKS_NAME]
     existing = ""
     if os.path.isfile(".gitignore"):
         with open(".gitignore", "r", encoding="utf-8") as f:
@@ -217,8 +354,25 @@ def cmd_watch(args):
     seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
     with open(cf, "w", encoding="utf-8") as f:
         json.dump({"since": t, "seen": seen[-50:]}, f)
+    body = _unwrap(ev, cfg)
+    env = _parse_envelope(body)
+    if env:
+        kind, task_id, ctx, state, frm, text = envelope_summary(env)
+        save_task(cfg, task_id, contextId=ctx, state=state,
+                  peer=frm, direction="inbound", text=text,
+                  rpcId=env.get("id"))
+        if kind == "request":
+            print(f"MESH_TASK from={frm} task={task_id} state=submitted: "
+                  f"{text}")
+            print(f"  -> to answer: mesh reply {task_id} --state completed "
+                  f"\"<result>\"")
+        else:
+            print(f"MESH_TASK_UPDATE from={frm} task={task_id} "
+                  f"state={state}: {text}")
+        print(json.dumps(env))
+        return
     sender = ev.get("title", "")
-    print(f"MESH_MESSAGE from={sender!r} to={me}: {ev.get('message', '')}")
+    print(f"MESH_MESSAGE from={sender!r} to={me}: {body}")
     print(json.dumps(ev))
 
 
@@ -254,6 +408,269 @@ def cmd_status(args):
     print(f"config: {cfg['_path']}")
     if me:
         print(f"topic:  {topic(cfg, me)}")
+
+
+def _await_result(cfg, me, task_id, timeout):
+    """Long-poll own inbox for a result envelope matching task_id, using an
+    ephemeral cursor (does not disturb `mesh watch`'s cursor)."""
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    since = str(int(time.time()) - 5)
+    deadline = time.time() + timeout
+    skip = set()
+    while time.time() < deadline:
+        ev = _stream_once(cfg, tpc, since, deadline, skip=skip)
+        if ev is None:
+            return None
+        skip.add(ev.get("id"))
+        env = _parse_envelope(_unwrap(ev, cfg))
+        if not env:
+            continue
+        kind, tid, ctx, state, frm, text = envelope_summary(env)
+        if tid == task_id and kind == "result":
+            save_task(cfg, tid, contextId=ctx, state=state, peer=frm,
+                      direction="outbound", result=text)
+            return env
+    return None
+
+
+def cmd_ask(args):
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    to = args.to
+    if to not in cfg["nodes"] or to == me:
+        sys.exit(f"error: recipient must be another node in {cfg['nodes']}")
+    text = " ".join(args.text)
+    env = make_send_envelope(me, to, text)
+    task_id = env["params"]["message"]["taskId"]
+    ctx = env["params"]["message"]["contextId"]
+    try:
+        send_raw(cfg, me, to, json.dumps(env),
+                 title=f"{cfg['mesh']}: a2a {me} -> {to}")
+    except (urllib.error.URLError, socket.timeout) as e:
+        sys.exit(f"error: send failed: {e}")
+    save_task(cfg, task_id, contextId=ctx, state="submitted", peer=to,
+              direction="outbound", text=text)
+    print(f"task {task_id} -> {to}: {text}")
+    if not args.wait:
+        print(f"  check later: mesh tasks get {task_id}")
+        return
+    print(f"  waiting up to {args.wait}s for a reply...")
+    result = _await_result(cfg, me, task_id, args.wait)
+    if result is None:
+        print(f"MESH_TASK_PENDING task={task_id} (no reply yet — "
+              f"`mesh tasks get {task_id}` later)")
+        return
+    _, _, _, state, frm, text = envelope_summary(result)
+    print(f"MESH_TASK_RESULT from={frm} task={task_id} state={state}:")
+    print(text)
+
+
+def cmd_reply(args):
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    tasks = load_tasks(cfg)
+    t = tasks.get(args.task_id)
+    if not t:
+        sys.exit(f"error: unknown task {args.task_id} (see `mesh tasks`)")
+    to = args.to or t.get("peer")
+    if not to:
+        sys.exit("error: task has no peer recorded; pass --to <node>")
+    text = " ".join(args.text)
+    env = make_result_envelope(me, to, args.task_id, t.get("contextId"),
+                               args.state, text, rpc_id=t.get("rpcId"))
+    try:
+        send_raw(cfg, me, to, json.dumps(env),
+                 title=f"{cfg['mesh']}: a2a {me} -> {to}")
+    except (urllib.error.URLError, socket.timeout) as e:
+        sys.exit(f"error: send failed: {e}")
+    save_task(cfg, args.task_id, state=args.state, result=text)
+    print(f"task {args.task_id} -> {to}: {args.state}")
+
+
+def cmd_tasks(args):
+    cfg = load_config()
+    tasks = load_tasks(cfg)
+    if args.action == "get":
+        t = tasks.get(args.task_id)
+        if not t:
+            sys.exit(f"error: unknown task {args.task_id}")
+        print(json.dumps({args.task_id: t}, indent=2))
+        return
+    if not tasks:
+        print("(no tasks)")
+        return
+    for tid, t in sorted(tasks.items(), key=lambda kv: kv[1].get("updated", 0)):
+        ts = time.strftime("%m-%d %H:%M", time.localtime(t.get("updated", 0)))
+        arrow = "->" if t.get("direction") == "outbound" else "<-"
+        print(f"[{ts}] {tid[:8]} {arrow} {t.get('peer', '?'):<10} "
+              f"{t.get('state', '?'):<10} {t.get('text', '')[:60]}")
+
+
+def agent_card(cfg, node, base_url=None):
+    cards = cfg.get("cards", {})
+    c = cards.get(node, {})
+    return {
+        "protocolVersion": "0.3.0",
+        "name": c.get("name", f"{cfg['mesh']}/{node}"),
+        "description": c.get(
+            "description",
+            f"Agent node '{node}' in claude-mesh '{cfg['mesh']}', reachable "
+            f"over the mesh transport (ntfy relay)."),
+        "url": base_url or f"mesh://{cfg['mesh']}/{node}",
+        "version": c.get("version", "0.2.0"),
+        "capabilities": {"streaming": False, "pushNotifications": True},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": c.get("skills", [{
+            "id": "general",
+            "name": "General agent",
+            "description": c.get("description", "Ask it anything it can do "
+                                 "on its machine."),
+            "tags": ["general"],
+        }]),
+    }
+
+
+def cmd_card(args):
+    cfg = load_config()
+    node = args.node or my_node(cfg, None)
+    if args.description or args.name:
+        cards = cfg.setdefault("cards", {})
+        c = cards.setdefault(node, {})
+        if args.name:
+            c["name"] = args.name
+        if args.description:
+            c["description"] = args.description
+        cfg_out = {k: v for k, v in cfg.items() if not k.startswith("_")}
+        with open(cfg["_path"], "w", encoding="utf-8") as f:
+            json.dump(cfg_out, f, indent=2)
+            f.write("\n")
+    print(json.dumps(agent_card(cfg, node), indent=2))
+
+
+# ---------------------------------------------------------------- a2a bridge
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    """Localhost HTTP server speaking standard A2A JSON-RPC, bridging to
+    remote mesh nodes over the ntfy transport. Lets any A2A-capable framework
+    on this machine talk to agents on other machines with no open ports."""
+    cfg = None
+    me = None
+    wait = 60
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *a):
+        sys.stderr.write("a2a-bridge: " + fmt % a + "\n")
+
+    def do_GET(self):
+        cfg, me = self.cfg, self.me
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        peers = [n for n in cfg["nodes"] if n != me]
+        if parts == [".well-known", "agent-card.json"]:
+            # the bridge itself presents the mesh as a directory agent
+            card = agent_card(cfg, me, f"http://{self.server.server_address[0]}"
+                                       f":{self.server.server_address[1]}/")
+            card["description"] = (f"claude-mesh bridge on node '{me}'. "
+                                   f"Remote agents: " + ", ".join(
+                                       f"/agents/{n}" for n in peers))
+            return self._json(200, card)
+        if parts == ["agents"]:
+            return self._json(200, {"agents": peers})
+        if (len(parts) == 4 and parts[0] == "agents"
+                and parts[2:] == [".well-known", "agent-card.json"]
+                and parts[1] in peers):
+            base = (f"http://{self.server.server_address[0]}"
+                    f":{self.server.server_address[1]}/agents/{parts[1]}")
+            return self._json(200, agent_card(cfg, parts[1], base))
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        cfg, me = self.cfg, self.me
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if len(parts) != 2 or parts[0] != "agents" \
+                or parts[1] not in cfg["nodes"] or parts[1] == me:
+            return self._json(404, {"error": "POST to /agents/<node>"})
+        node = parts[1]
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            rpc = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, KeyError):
+            return self._json(400, {"jsonrpc": "2.0", "id": None, "error":
+                                    {"code": -32700, "message": "parse error"}})
+        method = rpc.get("method")
+        if method == "tasks/get":
+            tid = rpc.get("params", {}).get("id")
+            t = load_tasks(cfg).get(tid)
+            if not t:
+                return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                        "error": {"code": -32001,
+                                                  "message": "task not found"}})
+            task = {"kind": "task", "id": tid, "contextId": t.get("contextId"),
+                    "status": {"state": t.get("state", "submitted")}}
+            if t.get("result"):
+                task["artifacts"] = [{"artifactId": "r", "name": "result",
+                                      "parts": [{"kind": "text",
+                                                 "text": t["result"]}]}]
+            return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                    "result": task})
+        if method != "message/send":
+            return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                    "error": {"code": -32601,
+                                              "message": "method not found"}})
+        msg = rpc.get("params", {}).get("message", {})
+        text = _text_of(msg)
+        env = make_send_envelope(me, node, text,
+                                 task_id=msg.get("taskId"),
+                                 context_id=msg.get("contextId"))
+        task_id = env["params"]["message"]["taskId"]
+        ctx = env["params"]["message"]["contextId"]
+        try:
+            send_raw(cfg, me, node, json.dumps(env),
+                     title=f"{cfg['mesh']}: a2a {me} -> {node}")
+        except (urllib.error.URLError, socket.timeout) as e:
+            return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                    "error": {"code": -32003,
+                                              "message": f"relay failed: {e}"}})
+        save_task(cfg, task_id, contextId=ctx, state="submitted", peer=node,
+                  direction="outbound", text=text)
+        result = _await_result(cfg, me, task_id, self.wait)
+        if result is not None:
+            return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                    "result": result["result"]})
+        # A2A allows returning a non-terminal Task; client polls tasks/get
+        return self._json(200, {"jsonrpc": "2.0", "id": rpc.get("id"),
+                                "result": {"kind": "task", "id": task_id,
+                                           "contextId": ctx,
+                                           "status": {"state": "submitted"}}})
+
+
+def cmd_a2a_serve(args):
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    _BridgeHandler.cfg = cfg
+    _BridgeHandler.me = me
+    _BridgeHandler.wait = args.wait
+    srv = ThreadingHTTPServer((args.host, args.port), _BridgeHandler)
+    peers = [n for n in cfg["nodes"] if n != me]
+    print(f"a2a bridge for mesh '{cfg['mesh']}' as node '{me}' on "
+          f"http://{args.host}:{args.port}")
+    print(f"  agent card:    /.well-known/agent-card.json")
+    for n in peers:
+        print(f"  remote agent:  /agents/{n}  "
+              f"(card: /agents/{n}/.well-known/agent-card.json)")
+    print(f"  JSON-RPC POST message/send | tasks/get to /agents/<node>; "
+          f"blocking wait {args.wait}s")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 CLAUDE_SNIPPET = """\
@@ -329,6 +746,47 @@ def main():
     p = sub.add_parser("status", help="show mesh config and this node")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("ask", help="send an A2A task to another node")
+    p.add_argument("to")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--wait", type=int, default=0, metavar="SECS",
+                   help="block up to SECS for the reply (0 = fire and forget)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_ask)
+
+    p = sub.add_parser("reply", help="answer a received A2A task")
+    p.add_argument("task_id")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--state", default="completed",
+                   choices=sorted(TERMINAL_STATES | {"working",
+                                                     "input-required"}))
+    p.add_argument("--to", default=None, help="override recipient node")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_reply)
+
+    p = sub.add_parser("tasks", help="list or inspect A2A tasks")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "get"])
+    p.add_argument("task_id", nargs="?", default=None)
+    p.set_defaults(fn=cmd_tasks)
+
+    p = sub.add_parser("card", help="show (or set) a node's A2A agent card")
+    p.add_argument("node", nargs="?", default=None)
+    p.add_argument("--name", default=None)
+    p.add_argument("--description", default=None)
+    p.set_defaults(fn=cmd_card)
+
+    p = sub.add_parser("a2a-serve",
+                       help="run a localhost A2A HTTP bridge so standard "
+                            "A2A clients can reach remote mesh nodes")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=4737)
+    p.add_argument("--wait", type=int, default=60,
+                   help="seconds message/send blocks for a reply before "
+                        "returning a pending task (default 60)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_a2a_serve)
 
     p = sub.add_parser("claude-setup",
                        help="print a CLAUDE.md section teaching an agent "
