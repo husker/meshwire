@@ -11,6 +11,7 @@ import secrets
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -216,6 +217,28 @@ class MembershipCmdTests(unittest.TestCase):
             f.write("gamma\n")
         self.assertEqual(mesh.my_node(cfg), "gamma")
         self.assertIn("gamma", cfg["nodes"])
+
+    def test_my_node_without_identity_exits(self):
+        cfg = make_cfg(self._tmp.name)
+        with self.assertRaises(SystemExit):
+            mesh.my_node(cfg)
+        self.assertNotIn(None, cfg["nodes"])
+
+    def test_join_survives_announce_failure(self):
+        code = mesh.join_code({"mesh": "home", "id": "i1", "key": "aa" * 32,
+                               "server": "https://ntfy.example",
+                               "nodes": []})
+
+        def boom(*a, **k):
+            raise urllib.error.URLError("relay down")
+
+        buf = io.StringIO()
+        with mock.patch.object(mesh, "send_raw", boom), \
+             contextlib.redirect_stdout(buf):
+            mesh.cmd_join(argparse.Namespace(code=code, as_node="pc"))
+        with open(".meshwire.json") as f:
+            self.assertIn("pc", json.load(f)["nodes"])
+        self.assertIn("announce failed", buf.getvalue())
 
 
 class AgoTests(unittest.TestCase):

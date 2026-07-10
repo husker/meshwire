@@ -27,7 +27,6 @@ import secrets
 import socket
 import sys
 import threading
-
 import time
 import urllib.error
 import urllib.request
@@ -81,6 +80,9 @@ def my_node(cfg, override=None):
     if not name and os.path.isfile(node_file(cfg)):
         with open(node_file(cfg), "r", encoding="utf-8") as f:
             name = f.read().strip()
+    if not name:
+        sys.exit("error: this machine has no node identity. Run "
+                 "`mesh iam <node>` (or pass --as / set MESHWIRE_NODE).")
     if name not in cfg["nodes"]:
         cfg["nodes"].append(name)
         if cfg.get("_path"):
