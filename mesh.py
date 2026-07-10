@@ -27,6 +27,7 @@ import secrets
 import socket
 import sys
 import threading
+
 import time
 import urllib.error
 import urllib.request
@@ -80,13 +81,10 @@ def my_node(cfg, override=None):
     if not name and os.path.isfile(node_file(cfg)):
         with open(node_file(cfg), "r", encoding="utf-8") as f:
             name = f.read().strip()
-    if not name:
-        sys.exit("error: this machine has no node identity. Run "
-                 "`mesh iam <node>` (or pass --as / set MESHWIRE_NODE).")
     if name not in cfg["nodes"]:
-        sys.exit(f"error: node '{name}' is not in the mesh {cfg['nodes']}. "
-                 f"Run `mesh iam <node>` with a listed node, or edit "
-                 f"{CONFIG_NAME}.")
+        cfg["nodes"].append(name)
+        if cfg.get("_path"):
+            _save_config(cfg)
     return name
 
 
@@ -431,11 +429,15 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
 def cmd_init(args):
     if find_config():
         sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
-    nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
-    if len(nodes) < 2:
-        sys.exit("error: need at least 2 nodes (--nodes a,b)")
+    nodes = [n.strip() for n in (args.nodes or "").split(",") if n.strip()]
     if BROADCAST in nodes:
         sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
+    me = args.as_node or _default_node_name()
+    if not me or me == BROADCAST:
+        sys.exit("error: couldn't derive a usable node name from the "
+                 "hostname — pass --as <name>")
+    if me not in nodes:
+        nodes.insert(0, me)
     cfg = {
         "mesh": args.name,
         "id": secrets.token_hex(8),
@@ -444,13 +446,15 @@ def cmd_init(args):
         "nodes": nodes,
     }
     _write_config_here(cfg)
-    print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
+    with open(NODE_NAME, "w", encoding="utf-8") as f:
+        f.write(me + "\n")
+    print(f"mesh '{args.name}' created — this machine is '{me}' "
+          f"(end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print("  join other machines with this code (share it privately —\n"
-          "  it IS the mesh secret):\n")
-    print(f"    mesh join {join_code(cfg)} --as <node>\n")
-    print("  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+    print("  add another machine: run `mesh invite` and paste the block it "
+          "prints on that machine.")
+    print("  listen here: `mesh watch --follow` (background task)")
 
 
 def _write_config_here(cfg):
@@ -477,25 +481,34 @@ def cmd_join(args):
     if find_config():
         sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
     cfg = parse_join_code(args.code)
-    for field in ("mesh", "id", "server", "nodes"):
+    for field in ("mesh", "id", "server"):
         if not cfg.get(field):
             sys.exit(f"error: join code missing '{field}'")
+    cfg.setdefault("nodes", [])
+    me = args.as_node or _default_node_name()
+    if not me or me == BROADCAST:
+        sys.exit("error: couldn't derive a usable node name from the "
+                 "hostname — pass --as <name>")
+    if me not in cfg["nodes"]:
+        cfg["nodes"].append(me)
     _write_config_here(cfg)
-    print(f"joined mesh '{cfg['mesh']}' "
-          f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'}); "
-          f"nodes: {cfg['nodes']}")
-    if args.as_node:
-        with open(NODE_NAME, "w", encoding="utf-8") as f:
-            f.write(args.as_node + "\n")
-        if args.as_node not in cfg["nodes"]:
-            cfg["nodes"].append(args.as_node)
-            _write_config_here(cfg)
-            print(f"  note: added new node '{args.as_node}' locally — other "
-                  f"machines can message it by name regardless.")
-        print(f"  this machine is '{args.as_node}'. Try: mesh send all "
-              f"\"{args.as_node} online\"")
-    else:
-        print("  next: mesh iam <node>")
+    with open(NODE_NAME, "w", encoding="utf-8") as f:
+        f.write(me + "\n")
+    cfg["_path"] = os.path.abspath(CONFIG_NAME)
+    cfg["_dir"] = os.getcwd()
+    print(f"joined mesh '{cfg['mesh']}' as '{me}' "
+          f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
+    if cfg.get("key"):
+        try:
+            send_raw(cfg, me, BROADCAST, f"{me} joined the mesh",
+                     ctl={"mw": "announce"})
+            print("  announced — other machines learn this node "
+                  "automatically.")
+        except (urllib.error.URLError, socket.timeout):
+            print("  (announce failed; peers learn this node when it first "
+                  "sends)")
+    print(f"  try: mesh send all \"{me} online\"   |   "
+          f"listen: mesh watch --follow")
 
 
 def cmd_invite(args):
@@ -506,8 +519,11 @@ def cmd_invite(args):
 
 def cmd_iam(args):
     cfg = load_config()
+    if args.node == BROADCAST:
+        sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
     if args.node not in cfg["nodes"]:
-        sys.exit(f"error: '{args.node}' not in mesh nodes {cfg['nodes']}")
+        cfg["nodes"].append(args.node)
+        _save_config(cfg)
     with open(node_file(cfg), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
@@ -957,8 +973,11 @@ def main():
 
     p = sub.add_parser("init", help="create a mesh in the current directory")
     p.add_argument("name", help="short mesh name (letters/digits/dashes)")
-    p.add_argument("--nodes", required=True,
-                   help="comma-separated node names, e.g. laptop,desktop")
+    p.add_argument("--as", dest="as_node", default=None,
+                   help="this machine's node name (default: hostname)")
+    p.add_argument("--nodes", default=None,
+                   help="optional comma-separated seed list of node names "
+                        "(machines can always join later with the code)")
     p.add_argument("--server", default="https://ntfy.sh",
                    help="ntfy server (default: https://ntfy.sh; self-host "
                         "for private traffic)")

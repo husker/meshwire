@@ -2,6 +2,9 @@
 
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
+import argparse
+import contextlib
+import io
 import json
 import os
 import secrets
@@ -123,6 +126,96 @@ class PeerTests(unittest.TestCase):
             mesh.note_peer(cfg, None, "message")
             self.assertEqual(cfg["nodes"], ["alpha", "beta"])
             self.assertFalse(os.path.exists(mesh.peers_file(cfg)))
+
+
+class MembershipCmdTests(unittest.TestCase):
+    """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
+
+    def setUp(self):
+        self._env = os.environ.pop("MESHWIRE_NODE", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        if self._env is not None:
+            os.environ["MESHWIRE_NODE"] = self._env
+
+    def test_init_without_nodes_uses_hostname(self):
+        ns = argparse.Namespace(name="home", nodes=None,
+                                server="https://ntfy.sh", as_node=None)
+        buf = io.StringIO()
+        with mock.patch("socket.gethostname", return_value="Laptop.local"), \
+             contextlib.redirect_stdout(buf):
+            mesh.cmd_init(ns)
+        with open(".meshwire.json") as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["nodes"], ["laptop"])
+        with open(".meshwire.node") as f:
+            self.assertEqual(f.read().strip(), "laptop")
+        with open(".gitignore") as f:
+            self.assertIn(".meshwire.peers.json", f.read())
+
+    def test_init_unusable_hostname_requires_as(self):
+        ns = argparse.Namespace(name="home", nodes=None,
+                                server="https://ntfy.sh", as_node=None)
+        with mock.patch("socket.gethostname", return_value="'''"):
+            with self.assertRaises(SystemExit):
+                mesh.cmd_init(ns)
+
+    def test_join_defaults_identity_and_announces(self):
+        code = mesh.join_code({"mesh": "home", "id": "i1", "key": "aa" * 32,
+                               "server": "https://ntfy.example",
+                               "nodes": ["laptop"]})
+        calls = []
+
+        def fake_send(cfg, s, t, b, title=None, ctl=None):
+            calls.append((s, t, ctl))
+            return {"id": "1"}
+
+        buf = io.StringIO()
+        with mock.patch.object(mesh, "send_raw", fake_send), \
+             mock.patch("socket.gethostname", return_value="desktop.local"), \
+             contextlib.redirect_stdout(buf):
+            mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
+        with open(".meshwire.json") as f:
+            self.assertIn("desktop", json.load(f)["nodes"])
+        self.assertEqual(calls, [("desktop", "all", {"mw": "announce"})])
+
+    def test_join_plaintext_mesh_skips_announce(self):
+        code = mesh.join_code({"mesh": "home", "id": "i1", "key": None,
+                               "server": "https://ntfy.example", "nodes": []})
+        calls = []
+        buf = io.StringIO()
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: calls.append(1)), \
+             contextlib.redirect_stdout(buf):
+            mesh.cmd_join(argparse.Namespace(code=code, as_node="pc"))
+        self.assertEqual(calls, [])
+
+    def test_iam_accepts_new_name_and_learns_it(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(), f)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mesh.cmd_iam(argparse.Namespace(node="gamma"))
+        with open(".meshwire.json") as f:
+            self.assertIn("gamma", json.load(f)["nodes"])
+
+    def test_iam_rejects_broadcast_name(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(), f)
+        with self.assertRaises(SystemExit):
+            mesh.cmd_iam(argparse.Namespace(node="all"))
+
+    def test_my_node_autolearns_unknown_identity(self):
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.node_file(cfg), "w") as f:
+            f.write("gamma\n")
+        self.assertEqual(mesh.my_node(cfg), "gamma")
+        self.assertIn("gamma", cfg["nodes"])
 
 
 class AgoTests(unittest.TestCase):
