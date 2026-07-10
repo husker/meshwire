@@ -765,3 +765,36 @@ class AutoWatchTests(MembershipCmdTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PluginManifestTests(unittest.TestCase):
+    """The Codex plugin files parse, point at real paths, and match versions."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _load(self, rel):
+        with open(os.path.join(self.ROOT, rel)) as f:
+            return json.load(f)
+
+    def test_codex_manifest_valid(self):
+        m = self._load(".codex-plugin/plugin.json")
+        self.assertRegex(m["name"], r"^[a-z0-9][a-z0-9-]*$")
+        self.assertTrue(m["skills"].startswith("./"))
+        self.assertTrue(os.path.isdir(os.path.join(self.ROOT, m["skills"])))
+
+    def test_marketplace_catalog_valid(self):
+        cat = self._load(".agents/plugins/marketplace.json")
+        entry = cat["plugins"][0]
+        self.assertEqual(entry["source"]["source"], "local")
+        target = os.path.normpath(
+            os.path.join(self.ROOT, entry["source"]["path"]))
+        self.assertTrue(os.path.isfile(
+            os.path.join(target, ".codex-plugin", "plugin.json")))
+
+    def test_plugin_versions_match_pyproject(self):
+        with open(os.path.join(self.ROOT, "pyproject.toml")) as f:
+            py = f.read()
+        for rel in (".codex-plugin/plugin.json",
+                    ".claude-plugin/plugin.json"):
+            v = self._load(rel)["version"]
+            self.assertIn(f'version = "{v}"', py)

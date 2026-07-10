@@ -1,0 +1,19 @@
+{
+  "name": "meshwire",
+  "plugins": [
+    {
+      "name": "meshwire",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity",
+      "interface": {
+        "displayName": "meshwire"
+      }
+    }
+  ]
+}

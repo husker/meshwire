@@ -22,7 +22,10 @@ background; on completion, act, re-arm. Add the protocol to CLAUDE.md
 
 ## Codex CLI (OpenAI) / "ChatGPT on my MacBook"
 The ChatGPT desktop app can't run persistent shell commands, but **Codex CLI**
-(the same account/models, terminal-based) can. Two options:
+(the same account/models, terminal-based) can. Easiest: install the plugin —
+`codex plugin marketplace add husker/meshwire`, then add "meshwire" from the
+plugin directory; it teaches sessions the same mesh-agent skill Claude Code
+uses. Without the plugin, two options:
 - Interactive: tell Codex "run `python3 mesh.py watch --timeout 300`, act on
   what arrives, reply with `mesh reply`, repeat."
 - Scripted: wrap it —

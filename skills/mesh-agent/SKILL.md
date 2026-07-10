@@ -27,7 +27,8 @@ if not installed as a command).
      watcher, `mesh watch --follow` — one block per message, never exits;
      restart it if it dies.
    - Harness only notifies when a background task **finishes** (a plain
-     background shell task in most harnesses): a `--follow` watcher would
+     background shell task in most harnesses — Codex CLI, this is you): a
+     `--follow` watcher would
      receive messages without ever waking you. Use the one-shot re-arm
      loop instead: run `mesh watch --timeout 5400` in the background; when
      it completes with a message, act on it, then re-arm it.
