@@ -364,5 +364,143 @@ class SendStatusInviteTests(MembershipCmdTests):
         self.assertIn("watch --follow", text)
 
 
+class _TestDone(Exception):
+    """Raised by the fake transport when its scripted events run out."""
+
+
+class _FakeResp:
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def fake_stream(events):
+    """A mesh.http replacement: first call streams `events`, next call raises
+    _TestDone so tests escape the reconnect loop deterministically."""
+    lines = [json.dumps(e).encode() + b"\n" for e in events]
+    state = {"calls": 0}
+
+    def _http(url, data=None, headers=None, timeout=15):
+        state["calls"] += 1
+        if state["calls"] > 1:
+            raise _TestDone()
+        return _FakeResp(lines)
+
+    return _http
+
+
+class StreamEventsTests(unittest.TestCase):
+    def test_yields_messages_dedupes_and_survives_noise(self):
+        cfg = make_cfg()
+        evs = [
+            {"event": "open"},
+            {"event": "message", "id": "m1", "time": 100, "message": "x"},
+            {"event": "message", "id": "m1", "time": 100, "message": "x"},
+            {"event": "keepalive"},
+            {"event": "message", "id": "m2", "time": 101, "message": "y"},
+        ]
+        with mock.patch.object(mesh, "http", fake_stream(evs)):
+            gen = mesh._stream_events(cfg, "tp", "0", deadline=None)
+            self.assertEqual(next(gen)["id"], "m1")
+            self.assertEqual(next(gen)["id"], "m2")
+            with mock.patch("time.sleep"):
+                self.assertRaises(_TestDone, next, gen)
+
+    def test_first_response_consumed_before_dialing(self):
+        cfg = make_cfg()
+        ev = {"event": "message", "id": "m1", "time": 100, "message": "x"}
+        pre = _FakeResp([json.dumps(ev).encode() + b"\n"])
+
+        def no_dial(url, **kw):
+            raise AssertionError("dialed despite pre-opened response")
+
+        with mock.patch.object(mesh, "http", no_dial):
+            gen = mesh._stream_events(cfg, "tp", "0",
+                                      deadline=mesh.time.time() + 60,
+                                      first=pre)
+            self.assertEqual(next(gen)["id"], "m1")
+
+
+class WatchTests(MembershipCmdTests):
+    """Chdir fixture; builds a real on-disk config with identity alpha."""
+
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def _msg_event(self, cfg, frm, body, eid, t, ctl=None):
+        payload = {"f": frm, "t": "alpha", "b": body}
+        if ctl:
+            payload["c"] = ctl
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(payload))}
+
+    def test_one_shot_delivers_message_and_saves_cursor(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "hello there", "m1", 200)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertIn("MESH_MESSAGE from='beta' to=alpha: hello there",
+                      out.getvalue())
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f)["since"], 200)
+
+    def test_follow_delivers_multiple_messages(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "one", "m1", 200),
+               self._msg_event(cfg, "beta", "two", "m2", 201)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertIn("one", out.getvalue())
+        self.assertIn("two", out.getvalue())
+
+    def test_control_message_does_not_consume_one_shot(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "ping", "m1", 200,
+                               ctl={"mw": "ping", "n": "n1"}),
+               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "1"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("MESH_MESSAGE from='beta' to=alpha: ping",
+                         out.getvalue())
+        self.assertIn("real message", out.getvalue())
+
+
+class AwaitResultTests(MembershipCmdTests):
+    def test_await_matches_task_id(self):
+        cfg = make_cfg(self._tmp.name)
+        env = mesh.make_result_envelope("beta", "alpha", "T1", "C1",
+                                        "completed", "42")
+        wire = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": json.dumps(env)}))
+        evs = [{"event": "message", "id": "r1", "time": 300, "message": wire}]
+        with mock.patch.object(mesh, "http", fake_stream(evs)):
+            got = mesh._await_result(cfg, "alpha", "T1", timeout=60)
+        self.assertEqual(got["result"]["id"], "T1")
+
+
 if __name__ == "__main__":
     unittest.main()

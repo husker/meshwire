@@ -558,27 +558,52 @@ def cmd_send(args):
     print(f"sent to {to} (id {resp.get('id', '?')}){enc}: {msg}")
 
 
-def _stream_once(cfg, tpc, since, deadline, skip=()):
-    """Long-poll topic(s) until a message not in `skip` arrives or deadline
-    passes. Returns the message dict, or None on timeout."""
-    while time.time() < deadline:
-        chunk = min(300, max(5, int(deadline - time.time())))
-        url = f"{cfg['server']}/{tpc}/json?since={since}"
+def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
+    """Yield ntfy message events from `tpc` until `deadline` (None = forever).
+
+    Dedupes via the shared, mutated `skip` set; advances `since` internally
+    so reconnects don't replay; backs off 1s→2s→…→30s only when connections
+    die fast (<5s). `first` is an optional already-open response consumed
+    before dialing — callers can subscribe before triggering traffic."""
+    skip = skip if skip is not None else set()
+    backoff = 1
+    while deadline is None or time.time() < deadline:
+        chunk = (300 if deadline is None
+                 else min(300, max(5, int(deadline - time.time()))))
+        started = time.time()
         try:
-            with http(url, timeout=chunk) as r:
+            r = first
+            first = None
+            if r is None:
+                r = http(f"{cfg['server']}/{tpc}/json?since={since}",
+                         timeout=chunk)
+            with r:
                 for raw in r:
                     try:
                         ev = json.loads(raw.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
-                    if (ev.get("event") == "message"
-                            and ev.get("id") not in skip):
-                        return ev
-                    if time.time() >= deadline:
-                        return None
-        except (urllib.error.URLError, socket.timeout, TimeoutError):
-            pass  # chunk expired or connection dropped — reconnect
-    return None
+                    if ev.get("event") != "message":
+                        backoff = 1  # keepalives prove the link is healthy
+                        if deadline and time.time() >= deadline:
+                            return
+                        continue
+                    backoff = 1
+                    since = str(ev.get("time", since))
+                    if ev.get("id") in skip:
+                        continue
+                    skip.add(ev.get("id"))
+                    yield ev
+                    if deadline and time.time() >= deadline:
+                        return
+        except (urllib.error.URLError, socket.timeout, TimeoutError,
+                ConnectionError):
+            pass
+        if time.time() - started < 5:
+            time.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 30)
+        else:
+            backoff = 1
 
 
 def _load_cursor(cf):
@@ -592,40 +617,9 @@ def _load_cursor(cf):
         return int(time.time()) - 5, []
 
 
-def cmd_watch(args):
-    cfg = load_config()
-    me = my_node(cfg, args.as_node)
-    # subscribe to own inbox AND the broadcast topic in one stream
-    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-    cf = cursor_file(cfg, me)
-    since, seen = _load_cursor(cf)
-    deadline = time.time() + args.timeout
-    skip = set(seen)
-    while True:
-        ev = _stream_once(cfg, tpc, str(since), deadline, skip=skip)
-        if ev is None:
-            print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
-            sys.exit(0)
-        frm, body, trusted, ctl = _open(ev, cfg)
-        env = _parse_envelope(body) if trusted else None
-        if trusted and frm != me:
-            break  # a real message from someone else
-        # own echo, unauthenticated, or undecryptable — skip, keep waiting
-        skip.add(ev.get("id"))
-        t = int(ev.get("time", time.time()))
-        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
-        since = t
-        with open(cf, "w", encoding="utf-8") as f:
-            json.dump({"since": t, "seen": seen[-50:]}, f)
-        if not trusted and body != "":
-            print(f"MESH_WARN: dropped unauthenticated message "
-                  f"id={ev.get('id')}", file=sys.stderr)
-    # cursor: resume from this message's second; remember ids seen in that
-    # second so re-delivery on the boundary is filtered, not re-consumed
-    t = int(ev.get("time", time.time()))
-    seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
-    with open(cf, "w", encoding="utf-8") as f:
-        json.dump({"since": t, "seen": seen[-50:]}, f)
+def _emit_message(cfg, me, frm, body, ev):
+    """Print one inbound message or task (shared by one-shot and --follow)."""
+    env = _parse_envelope(body)
     if env:
         kind, task_id, ctx, state, efrm, text = envelope_summary(env)
         frm = efrm or frm
@@ -640,11 +634,56 @@ def cmd_watch(args):
         else:
             print(f"MESH_TASK_UPDATE from={frm} task={task_id} "
                   f"state={state}: {text}")
-        print(json.dumps(env))
-        return
-    print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
-    print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
-                      "time": ev.get("time")}))
+        print(json.dumps(env), flush=True)
+    else:
+        print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
+        print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
+                          "time": ev.get("time")}), flush=True)
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    # subscribe to own inbox AND the broadcast topic in one stream
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    cf = cursor_file(cfg, me)
+    since, seen = _load_cursor(cf)
+    skip = set(seen)
+    timeout = args.timeout or (None if args.follow else 10800)
+    deadline = (time.time() + timeout) if timeout else None
+
+    def save_cursor(ev):
+        # resume from this message's second; remember ids seen in that second
+        # so re-delivery on the boundary is filtered, not re-consumed
+        nonlocal since, seen
+        t = int(ev.get("time", time.time()))
+        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
+        since = t
+        with open(cf, "w", encoding="utf-8") as f:
+            json.dump({"since": t, "seen": seen[-50:]}, f)
+
+    delivered = False
+    for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        save_cursor(ev)
+        if not trusted:
+            if body != "":
+                print(f"MESH_WARN: dropped unauthenticated message "
+                      f"id={ev.get('id')}", file=sys.stderr)
+            continue
+        if frm == me:
+            continue  # own echo (e.g. broadcast)
+        if ctl:
+            print(f"MESH_CTL from={frm} kind={ctl.get('mw')}",
+                  file=sys.stderr)
+            continue
+        note_peer(cfg, frm, "message")
+        _emit_message(cfg, me, frm, body, ev)
+        delivered = True
+        if not args.follow:
+            return
+    if not delivered:
+        print(f"MESH_TIMEOUT: no message for '{me}' in {timeout}s")
 
 
 def cmd_peek(args):
@@ -694,26 +733,24 @@ def cmd_status(args):
         print(f"topic:  {topic(cfg, me)}")
 
 
-def _await_result(cfg, me, task_id, timeout):
-    """Long-poll own inbox for a result envelope matching task_id, using an
+def _await_result(cfg, me, task_id, timeout, first=None):
+    """Stream own inbox for a result envelope matching task_id, using an
     ephemeral cursor (does not disturb `mesh watch`'s cursor)."""
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-    since = str(int(time.time()) - 5)
     deadline = time.time() + timeout
-    skip = set()
-    while time.time() < deadline:
-        ev = _stream_once(cfg, tpc, since, deadline, skip=skip)
-        if ev is None:
-            return None
-        skip.add(ev.get("id"))
-        _, body, trusted, ctl = _open(ev, cfg)
-        env = _parse_envelope(body) if trusted else None
+    for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
+                             first=first):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        if not trusted or ctl:
+            continue
+        note_peer(cfg, frm, "message")
+        env = _parse_envelope(body)
         if not env:
             continue
-        kind, tid, ctx, state, frm, text = envelope_summary(env)
+        kind, tid, ctx, state, efrm, text = envelope_summary(env)
         if tid == task_id and kind == "result":
-            save_task(cfg, tid, contextId=ctx, state=state, peer=frm,
-                      direction="outbound", result=text)
+            save_task(cfg, tid, contextId=ctx, state=state,
+                      peer=efrm or frm, direction="outbound", result=text)
             return env
     return None
 
@@ -1028,10 +1065,14 @@ def main():
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("watch",
-                       help="block until a ping arrives for this node, print "
-                            "it, exit (run as a background task)")
-    p.add_argument("--timeout", type=int, default=10800,
-                   help="max seconds to wait (default 10800 = 3h)")
+                       help="receive messages: --follow streams forever "
+                            "(preferred, run as a background task); without "
+                            "it, print one message and exit")
+    p.add_argument("--follow", action="store_true",
+                   help="keep streaming — print every message as it arrives")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="max seconds to wait (one-shot default 10800 = 3h; "
+                        "--follow default: forever)")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
 
