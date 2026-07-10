@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-mesh"
-version = "0.2.0"
+name = "meshwire"
+version = "0.3.0"
 description = "Zero-infrastructure messaging between AI agent sessions on different machines (ntfy.sh wake pings + your shared repo as the payload channel)"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "James Gagan", email = "james.gagan@gmail.com" }]
 requires-python = ">=3.8"
-keywords = ["claude", "claude-code", "agents", "ntfy", "messaging", "multi-agent"]
+keywords = ["agents", "a2a", "claude", "chatgpt", "copilot", "ntfy", "messaging", "multi-agent"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -19,10 +19,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/husker/claude-mesh"
+Homepage = "https://github.com/husker/meshwire"
 
 [project.scripts]
 mesh = "mesh:main"
+meshwire = "mesh:main"
 
 [tool.setuptools]
 py-modules = ["mesh"]

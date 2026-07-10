@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-mesh: zero-infrastructure messaging between AI agent sessions on
+"""meshwire: zero-infrastructure messaging between AI agent sessions on
 different machines.
 
 Two-layer design:
@@ -29,11 +29,11 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-CONFIG_NAME = ".claude-mesh.json"
-NODE_NAME = ".claude-mesh.node"
-TASKS_NAME = ".claude-mesh.tasks.json"
+CONFIG_NAME = ".meshwire.json"
+NODE_NAME = ".meshwire.node"
+TASKS_NAME = ".meshwire.tasks.json"
 BROADCAST = "all"
-USER_AGENT = "claude-mesh/0.2"
+USER_AGENT = "meshwire/0.3"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
@@ -41,7 +41,7 @@ TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 # ---------------------------------------------------------------- config
 
 def find_config(start=None):
-    """Walk up from `start` (default cwd) looking for .claude-mesh.json."""
+    """Walk up from `start` (default cwd) looking for .meshwire.json."""
     d = os.path.abspath(start or os.getcwd())
     while True:
         p = os.path.join(d, CONFIG_NAME)
@@ -70,14 +70,14 @@ def node_file(cfg):
 
 
 def my_node(cfg, override=None):
-    """Resolve this machine's node name: --as flag > env > .claude-mesh.node."""
-    name = override or os.environ.get("CLAUDE_MESH_NODE")
+    """Resolve this machine's node name: --as flag > env > .meshwire.node."""
+    name = override or os.environ.get("MESHWIRE_NODE")
     if not name and os.path.isfile(node_file(cfg)):
         with open(node_file(cfg), "r", encoding="utf-8") as f:
             name = f.read().strip()
     if not name:
         sys.exit("error: this machine has no node identity. Run "
-                 "`mesh iam <node>` (or pass --as / set CLAUDE_MESH_NODE).")
+                 "`mesh iam <node>` (or pass --as / set MESHWIRE_NODE).")
     if name not in cfg["nodes"]:
         sys.exit(f"error: node '{name}' is not in the mesh {cfg['nodes']}. "
                  f"Run `mesh iam <node>` with a listed node, or edit "
@@ -86,12 +86,12 @@ def my_node(cfg, override=None):
 
 
 def topic(cfg, node):
-    return f"cmesh-{cfg['mesh']}-{cfg['id']}-{node}"
+    return f"mw-{cfg['mesh']}-{cfg['id']}-{node}"
 
 
 def cursor_file(cfg, node):
     # per-machine, next to the config; gitignored by `mesh init`
-    return os.path.join(cfg["_dir"], f".claude-mesh.cursor-{node}")
+    return os.path.join(cfg["_dir"], f".meshwire.cursor-{node}")
 
 
 # ---------------------------------------------------------------- http
@@ -253,7 +253,7 @@ def cmd_init(args):
         json.dump(cfg, f, indent=2)
         f.write("\n")
     # keep per-machine files out of version control
-    gi_lines = [NODE_NAME, ".claude-mesh.cursor-*", TASKS_NAME]
+    gi_lines = [NODE_NAME, ".meshwire.cursor-*", TASKS_NAME]
     existing = ""
     if os.path.isfile(".gitignore"):
         with open(".gitignore", "r", encoding="utf-8") as f:
@@ -514,7 +514,7 @@ def agent_card(cfg, node, base_url=None):
         "name": c.get("name", f"{cfg['mesh']}/{node}"),
         "description": c.get(
             "description",
-            f"Agent node '{node}' in claude-mesh '{cfg['mesh']}', reachable "
+            f"Agent node '{node}' in meshwire '{cfg['mesh']}', reachable "
             f"over the mesh transport (ntfy relay)."),
         "url": base_url or f"mesh://{cfg['mesh']}/{node}",
         "version": c.get("version", "0.2.0"),
@@ -577,7 +577,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             # the bridge itself presents the mesh as a directory agent
             card = agent_card(cfg, me, f"http://{self.server.server_address[0]}"
                                        f":{self.server.server_address[1]}/")
-            card["description"] = (f"claude-mesh bridge on node '{me}'. "
+            card["description"] = (f"meshwire bridge on node '{me}'. "
                                    f"Remote agents: " + ", ".join(
                                        f"/agents/{n}" for n in peers))
             return self._json(200, card)
@@ -674,9 +674,9 @@ def cmd_a2a_serve(args):
 
 
 CLAUDE_SNIPPET = """\
-## Cross-machine agent comms (claude-mesh)
+## Cross-machine agent comms (meshwire)
 
-This project uses claude-mesh (https://github.com/husker/claude-mesh) to link
+This project uses meshwire (https://github.com/husker/meshwire) to link
 agent sessions on different machines. Protocol:
 
 1. Substantive content (results, requests, code) travels via the shared repo:
@@ -690,7 +690,7 @@ agent sessions on different machines. Protocol:
 4. Never put secrets or real content in a ping — topics are capability URLs
    on a public ntfy server. Pings say "look", the repo says "what".
 
-This machine's identity: see `.claude-mesh.node` (set with `mesh iam <node>`).
+This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 """
 
 

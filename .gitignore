@@ -1,5 +1,5 @@
 dist/
 __pycache__/
 *.egg-info/
-.claude-mesh.node
-.claude-mesh.cursor-*
+.meshwire.node
+.meshwire.cursor-*

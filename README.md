@@ -1,8 +1,12 @@
-# claude-mesh
+# meshwire
 
-**Zero-infrastructure messaging between AI agent sessions on different
-machines.** One stdlib-only Python file. No server to run, no accounts, no
-API keys.
+*(formerly `claude-mesh` — renamed because it was never Claude-specific: any
+agent that can run a shell command can join)*
+
+**Zero-infrastructure messaging between AI agents on different machines** —
+Claude Code on a Linux laptop, ChatGPT (via Codex CLI) on a MacBook, Copilot
+on a Windows PC, all exchanging [A2A](https://a2a-protocol.org) tasks. One
+stdlib-only Python file. No server to run, no accounts, no API keys.
 
 Born from a real need: two Claude Code sessions — a Linux laptop and a Windows
 desktop — collaborating on a mathematical search campaign, coordinating work
@@ -13,7 +17,7 @@ pull now" without a human relaying messages.
 
 Agent sessions on different machines almost always already share a payload
 channel: a git repo. What's missing is **wake latency** — the other session
-doesn't know something landed until its next poll. claude-mesh fixes exactly
+doesn't know something landed until its next poll. meshwire fixes exactly
 that gap, and nothing more:
 
 1. **Payload travels via your shared repo** (commit → push). Full audit trail,
@@ -32,10 +36,10 @@ process.
 Machine A (in your shared project directory):
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/husker/claude-mesh/main/mesh.py
+curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
 python3 mesh.py init myproject --nodes laptop,desktop
 python3 mesh.py iam laptop
-git add .claude-mesh.json mesh.py && git commit -m "add mesh" && git push
+git add .meshwire.json mesh.py && git commit -m "add mesh" && git push
 ```
 
 Machine B (after `git pull`):
@@ -54,7 +58,7 @@ python3 mesh.py peek                   # show recent pings, don't consume
 python3 mesh.py status                 # who am I, what mesh, what topic
 ```
 
-Or install as a command: `pipx install git+https://github.com/husker/claude-mesh`
+Or install as a command: `pipx install git+https://github.com/husker/meshwire`
 → `mesh send ...`
 
 ## Using it from a Claude Code session
@@ -102,7 +106,7 @@ mesh a2a-serve     # → http://127.0.0.1:4737/agents/<node> per remote node
 ```
 
 The twist vs. vanilla A2A: A2A assumes agents expose reachable HTTP servers.
-Two laptops behind NAT can't do that. claude-mesh carries the same envelopes
+Two laptops behind NAT can't do that. meshwire carries the same envelopes
 over the ntfy relay — **outbound-only connections on both ends** — so ChatGPT
 (via Codex CLI) on a MacBook, Claude Code on a Linux laptop, and Copilot on a
 Windows PC can all exchange tasks with no port forwarding, no VPN, no server.
@@ -114,9 +118,9 @@ whatever brain, tools, and permissions its own harness has.
 
 ## Security model (read this)
 
-- Topics are **capability URLs**: `cmesh-<mesh>-<128-bit-hex>-<node>` on a
+- Topics are **capability URLs**: `mw-<mesh>-<128-bit-hex>-<node>` on a
   public ntfy server. Anyone who learns the topic can read and post pings.
-  - Commit `.claude-mesh.json` **only to private repos**. For public repos,
+  - Commit `.meshwire.json` **only to private repos**. For public repos,
     share it out-of-band (it's one small file).
   - **Never put secrets or real content in a ping.** Pings are wake-up calls;
     content belongs in your (access-controlled) repo.
@@ -125,11 +129,11 @@ whatever brain, tools, and permissions its own harness has.
     the authenticated channel (git), not on instructions embedded in pings.
 - Want private traffic? Self-host ntfy (`mesh init --server https://ntfy.example.com`)
   or use ntfy's paid reserved topics with auth.
-- `.claude-mesh.node` and cursor files are per-machine and auto-gitignored.
+- `.meshwire.node` and cursor files are per-machine and auto-gitignored.
 
 ## How it compares
 
-| | claude-mesh | shared MCP queue | SSH + headless agent | plain git polling |
+| | meshwire | shared MCP queue | SSH + headless agent | plain git polling |
 |---|---|---|---|---|
 | Infrastructure | none | server to run | SSH + reachable host | none |
 | Wake latency | ~1–3 s | poll interval | seconds | poll interval |
