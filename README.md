@@ -12,22 +12,20 @@ Copilot on a Windows PC — all exchanging messages and
 
 ```bash
 pipx install git+https://github.com/husker/meshwire   # or: uv tool install ...
-mesh init home           # identity defaults to this machine's hostname
-mesh invite              # prints a block to paste on the other machine
-mesh watch --follow &    # start listening (or run it in a second terminal)
+mesh init home   # prints a block to paste on machine B, then starts listening
 ```
 
-**Machine B** — paste the block `mesh invite` printed. It looks like:
+**Machine B** — paste the block `mesh init` printed. It looks like:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
-python3 mesh.py join mesh1-XXXX... && python3 mesh.py watch --follow
+python3 mesh.py join mesh1-XXXX...
 ```
 
 That's it: downloaded, joined (named after its hostname), listening.
 Machine A prints `MESH_NODE_JOINED` the moment B joins.
 
-**Talk** (from machine A):
+**Talk** (from a new terminal, on either machine):
 
 ```bash
 mesh send all "hello mesh"     # B's watcher prints it about a second later
@@ -74,6 +72,10 @@ VPN, and no server of yours. Topics are derived from the mesh secret and
 the node name, so nothing is ever registered anywhere; delivery latency is
 about a second. `mesh watch --follow` holds one streaming connection and
 prints each message as it lands.
+
+In a terminal, `init` and `join` flow straight into that watcher when they
+finish — programs calling mesh (scripts, agent harnesses; anything without
+a TTY) get the plain return-immediately behavior instead.
 
 ## Delegating tasks: any AI talking to any AI
 
@@ -139,8 +141,8 @@ What you still must do:
 ## CLI reference
 
 ```
-mesh init <name> [--as NODE] [--server URL]   create a mesh here (identity = hostname)
-mesh join <code> [--as NODE]   join from a code; announces itself to the mesh
+mesh init <name> [--as NODE] [--server URL]   create a mesh; in a terminal, prints the invite block and keeps listening
+mesh join <code> [--as NODE]   join from a code, announce, and (in a terminal) keep listening
 mesh invite                    print the join code + paste-able bootstrap block
 mesh iam <node>                set/change this machine's identity
 mesh send <node|all> <msg...>  message a node (or broadcast)

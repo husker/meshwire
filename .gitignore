@@ -1,5 +1,3 @@
-dist/
+uv.lock
 __pycache__/
-*.egg-info/
-.meshwire.node
-.meshwire.cursor-*
+*.pyc

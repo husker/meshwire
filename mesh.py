@@ -40,7 +40,7 @@ NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
-USER_AGENT = "meshwire/0.5"
+USER_AGENT = "meshwire/0.6"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
@@ -495,9 +495,13 @@ def cmd_init(args):
           f"(end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print("  add another machine: run `mesh invite` and paste the block it "
-          "prints on that machine.")
-    print("  listen here: `mesh watch --follow` (background task)")
+    if _interactive():
+        print()
+        _print_invite(cfg)
+    else:
+        print("  add another machine: run `mesh invite` and paste the block "
+              "it prints on that machine.")
+    _watch_if_interactive()
 
 
 def _ensure_gitignore(dirpath):
@@ -552,22 +556,25 @@ def cmd_join(args):
         except (urllib.error.URLError, socket.timeout):
             print("  (announce failed; peers learn this node when it first "
                   "sends)")
-    print(f"  try: mesh send all \"{me} online\"   |   "
-          f"listen: mesh watch --follow")
+    print(f"  try: mesh send all \"{me} online\"")
+    _watch_if_interactive()
 
 
-def cmd_invite(args):
-    cfg = load_config()
+def _print_invite(cfg):
     code = join_code(cfg)
     print("Paste this on the new machine (share PRIVATELY — the code IS the")
     print("mesh secret). It downloads meshwire, joins as the machine's")
     print("hostname, and starts listening:\n")
     print("  curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/"
           "main/mesh.py")
-    print(f"  python3 mesh.py join {code} && python3 mesh.py watch --follow\n")
+    print(f"  python3 mesh.py join {code}\n")
     print(f"  # pick a name instead:  python3 mesh.py join {code} "
           f"--as <name>")
     print(f"  # already installed via pipx/uv?  mesh join {code}")
+
+
+def cmd_invite(args):
+    _print_invite(load_config())
 
 
 def cmd_iam(args):
@@ -685,6 +692,22 @@ def _emit_message(cfg, me, frm, body, ev):
         print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
         print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
                           "time": ev.get("time")}), flush=True)
+
+
+def _interactive():
+    """True when a human is at the terminal — init/join then flow straight
+    into the watcher. Scripts, tests, and agent shells (non-TTY) get the
+    return-immediately behavior and manage their own watcher."""
+    return sys.stdout.isatty()
+
+
+def _watch_if_interactive():
+    """After a successful init/join in a terminal, become the watcher.
+    Ctrl-C (handled in main()) stops the program and the watching with it."""
+    if not _interactive():
+        return
+    print("\nlistening for messages — Ctrl-C to stop")
+    cmd_watch(argparse.Namespace(follow=True, timeout=None, as_node=None))
 
 
 def _stream_open(cfg, tpc, since, timeout):
@@ -1275,7 +1298,11 @@ def main():
     p.set_defaults(fn=cmd_claude_setup)
 
     args = ap.parse_args()
-    args.fn(args)
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

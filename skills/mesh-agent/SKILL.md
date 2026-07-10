@@ -17,6 +17,9 @@ if not installed as a command).
    `mesh init <name>` starts a new mesh (identity defaults to this machine's
    hostname; no machine list needed), and `mesh invite` prints a block to
    paste on any other machine to add it.
+   (In an interactive terminal those commands keep running as the watcher;
+   from this session's shell they return immediately — arm the watcher
+   yourself, next step.)
 2. **Arm the persistent watcher as a BACKGROUND task**: `mesh watch --follow`
    It prints one block per incoming message and never exits; each block
    arriving wakes this session. THIS IS THE DELIVERY MECHANISM. If the

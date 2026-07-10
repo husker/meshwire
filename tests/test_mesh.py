@@ -396,7 +396,6 @@ class SendStatusInviteTests(MembershipCmdTests):
         self.assertIn("curl -fsSLO https://raw.githubusercontent.com/husker/"
                       "meshwire/main/mesh.py", text)
         self.assertIn("python3 mesh.py join mesh1-", text)
-        self.assertIn("watch --follow", text)
 
 
 class _TestDone(Exception):
@@ -687,6 +686,81 @@ class PostReuseTests(unittest.TestCase):
             out = mesh._post(cfg, "tp2", b"b", {})
         self.assertEqual(out, {"id": "ok"})
         self.assertEqual(len(_FakeConn.instances), 2)  # reconnected once
+
+
+class AutoWatchTests(MembershipCmdTests):
+    """init/join flow into the watcher in a terminal; return otherwise."""
+
+    def _init_ns(self):
+        return argparse.Namespace(name="home", nodes=None,
+                                  server="https://ntfy.sh", as_node="alpha")
+
+    def test_init_flows_into_watcher_in_terminal(self):
+        calls = []
+        out = io.StringIO()
+
+        def fake_watch(a):
+            calls.append((a, os.path.isfile(".meshwire.json")))
+
+        with mock.patch.object(mesh, "_interactive", lambda: True), \
+             mock.patch.object(mesh, "cmd_watch", fake_watch), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_init(self._init_ns())
+        self.assertTrue(calls[0][1])  # config existed when watching began
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].follow)
+        self.assertIsNone(calls[0][0].timeout)
+        self.assertIn("Ctrl-C to stop", out.getvalue())
+        # a terminal user can't run `mesh invite` anymore — init must
+        # print the paste block itself before watching
+        self.assertIn("python3 mesh.py join mesh1-", out.getvalue())
+
+    def test_init_returns_when_not_a_terminal(self):
+        calls = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_interactive", lambda: False), \
+             mock.patch.object(mesh, "cmd_watch",
+                               lambda a: calls.append(a)), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_init(self._init_ns())
+        self.assertEqual(calls, [])
+        self.assertIn("mesh invite", out.getvalue())  # pointer line kept
+
+    def test_join_announces_before_watching(self):
+        code = mesh.join_code({"mesh": "home", "id": "i1", "key": "aa" * 32,
+                               "server": "https://ntfy.example",
+                               "nodes": []})
+        order = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_interactive", lambda: True), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: order.append("announce")
+                               or {"id": "1"}), \
+             mock.patch.object(mesh, "cmd_watch",
+                               lambda a: order.append("watch")), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_join(argparse.Namespace(code=code, as_node="pc"))
+        self.assertEqual(order, ["announce", "watch"])
+
+    def test_invite_block_has_no_watch_tail(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(), f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_invite(argparse.Namespace())
+        self.assertNotIn("watch --follow", out.getvalue())
+        self.assertIn("python3 mesh.py join mesh1-", out.getvalue())
+
+    def test_main_exits_130_on_ctrl_c(self):
+        def boom(a):
+            raise KeyboardInterrupt
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_status", boom), \
+             mock.patch.object(sys, "argv", ["mesh", "status"]), \
+             contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                mesh.main()
+        self.assertEqual(cm.exception.code, 130)
 
 
 if __name__ == "__main__":
