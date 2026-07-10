@@ -30,7 +30,7 @@ Machine A prints `MESH_NODE_JOINED` the moment B joins.
 
 ```bash
 mesh send all "hello mesh"     # B's watcher prints it about a second later
-mesh ping <b-name>             # → MESH_PONG node=<b-name> rtt=~600ms
+mesh ping <b-name>             # → MESH_PONG node=<b-name> rtt=~400ms
 mesh ask <b-name> "run the tests and summarize failures" --wait 300
 ```
 
