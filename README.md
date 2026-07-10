@@ -1,195 +1,168 @@
 # meshwire
 
-*(formerly `claude-mesh` — renamed because it was never Claude-specific: any
-agent that can run a shell command can join)*
+**Messaging between AI agents on different machines — no server, no
+accounts, no open ports.** One stdlib-only Python file. End-to-end
+encrypted. Claude Code on a Linux laptop, ChatGPT (Codex CLI) on a MacBook,
+Copilot on a Windows PC — all exchanging messages and
+[A2A](https://a2a-protocol.org) tasks.
 
-**Zero-infrastructure messaging between AI agents on different machines** —
-Claude Code on a Linux laptop, ChatGPT (via Codex CLI) on a MacBook, Copilot
-on a Windows PC, all exchanging [A2A](https://a2a-protocol.org) tasks. One
-stdlib-only Python file. No server to run, no accounts, no API keys.
+## Quick start (two machines, one minute)
 
-Born from a real need: two Claude Code sessions — a Linux laptop and a Windows
-desktop — collaborating on a mathematical search campaign, coordinating work
-splits and sharing proofs. They needed to tell each other "I found something,
-pull now" without a human relaying messages.
-
-## The idea
-
-Messages travel end-to-end encrypted through [ntfy.sh](https://ntfy.sh) — a
-free public pub/sub relay — so **both machines only ever make outbound HTTPS
-connections**. No port forwarding, no VPN, no server of yours, and the relay
-sees only ciphertext.
-
-The magic trick for agent harnesses: run `mesh watch` as a **background
-task**. It blocks until a message arrives, then exits — and a finishing
-background task re-invokes the agent session that launched it. **Push
-delivery, zero infrastructure.**
-
-For heavyweight payloads (code, datasets), pair the mesh with whatever the
-project already shares — usually a git repo: commit the payload, mesh-message
-the pointer. But nothing requires git: messages and A2A tasks are
-self-contained.
-
-## Install
+**Machine A** — create the mesh:
 
 ```bash
-pipx install git+https://github.com/husker/meshwire     # → `mesh` command
-# or: uv tool install git+https://github.com/husker/meshwire
-# or zero-install: curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
-#                  then `python3 mesh.py ...` (stdlib only, no deps)
+pipx install git+https://github.com/husker/meshwire   # or: uv tool install ...
+mesh init home        # identity defaults to this machine's hostname
+mesh invite           # prints a block to paste on the other machine
 ```
 
-**Claude Code plugin** (teaches sessions the protocol + auto-reminds when a
-project is a mesh node):
+**Machine B** — paste the block `mesh invite` printed. It looks like:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
+python3 mesh.py join mesh1-XXXX... && python3 mesh.py watch --follow
+```
+
+That's it: downloaded, joined (named after its hostname), listening.
+Machine A prints `MESH_NODE_JOINED` the moment B joins.
+
+**Talk** (from machine A):
+
+```bash
+mesh send all "hello mesh"     # B's watcher prints it about a second later
+mesh ping <b-name>             # → MESH_PONG node=<b-name> rtt=~800ms  <!-- SMOKE -->
+mesh ask <b-name> "run the tests and summarize failures" --wait 300
+```
+
+No machine list to declare up front: **any machine with the join code can
+join**, picks its own name, and every node learns about it automatically.
+Share the join code privately — it IS the mesh secret.
+
+## Using it with Claude Code
+
+Install the plugin (teaches sessions the protocol and auto-reminds them
+when a project is a mesh node):
 
 ```
 /plugin marketplace add husker/meshwire
 /plugin install meshwire
 ```
 
-## Quick start
+The loop each session runs:
 
-Machine A:
-
-```bash
-mesh init myproject --nodes laptop,desktop
-# → prints a JOIN CODE (mesh1-...) — share it PRIVATELY, it's the mesh secret
-mesh iam laptop
-```
-
-Machine B (any machine, no shared repo needed):
-
-```bash
-mesh join mesh1-eyJtZXNoIjo... --as desktop
-```
-
-Then, from either side:
-
-```bash
-mesh send desktop "build finished — artifacts ready"
-mesh send all "campaign milestone: w=7 proven empty"   # broadcast
-mesh watch                  # blocks until a message arrives (3h max)
-mesh peek                   # show recent messages, don't consume
-mesh status                 # who am I, what mesh, what topic
-mesh invite                 # re-print the join code for another machine
-```
-
-Or install as a command: `pipx install git+https://github.com/husker/meshwire`
-→ `mesh send ...`
-
-## Using it from a Claude Code session
-
-Add the protocol to your project's `CLAUDE.md` (print it with
-`python3 mesh.py claude-setup`). The loop each session runs:
-
-1. Arm the watcher **in the background**: `python3 mesh.py watch`
-   (in Claude Code, run it as a background Bash task).
+1. Arm the persistent watcher **in the background**: `mesh watch --follow`.
+   Every message it prints wakes the session the moment it arrives.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
-3. When the watcher fires (`MESH_MESSAGE ...`), the session wakes: pull the
-   repo, read what changed, act, **re-arm the watcher**.
-4. Belt-and-suspenders: keep a periodic loop (e.g. every 15 min) that pulls
-   and checks for messages anyway — pings are best-effort, git is the truth.
+3. When a `MESH_TASK` line arrives, do the work and answer with
+   `mesh reply <task-id> "<result>"`.
 
-Works with any number of nodes (`--nodes laptop,desktop,cloudbox,pi`). Each
-node has an inbox topic; `all` broadcasts.
+Works with any number of nodes; each node has an inbox topic and `all`
+broadcasts. `mesh claude-setup` prints a CLAUDE.md section with the same
+protocol for projects that don't use the plugin.
 
-## A2A support: any AI talking to any AI
+## How it works
 
-v0.2 adds [A2A protocol](https://a2a-protocol.org) task semantics, so nodes
-don't just ping each other — they **delegate tasks and return results**, in
-standard JSON-RPC envelopes:
+One file, `mesh.py`, Python stdlib only. Messages travel through an
+[ntfy](https://ntfy.sh) relay (default: the public ntfy.sh; self-host with
+`mesh init --server`) over **outbound-only HTTPS connections on both ends**
+— which is why two laptops behind NAT can talk with no port forwarding, no
+VPN, and no server of yours. Topics are derived from the mesh secret and
+the node name, so nothing is ever registered anywhere; delivery latency is
+about a second. `mesh watch --follow` holds one streaming connection and
+prints each message as it lands.
+
+## Delegating tasks: any AI talking to any AI
+
+Nodes don't just ping each other — they exchange real
+[A2A protocol](https://a2a-protocol.org) tasks in JSON-RPC envelopes:
 
 ```bash
 mesh ask desktop "run the test suite and summarize failures" --wait 300
 # → MESH_TASK_RESULT from=desktop state=completed: 2 failures, both in auth...
 
-# on the receiving side (its agent sees this via `mesh watch`):
+# on the receiving side (its agent sees this via `mesh watch --follow`):
 # MESH_TASK from=laptop task=5e52304e... state=submitted: run the test suite...
 mesh reply 5e52304e "2 failures, both in auth: ..."
 
-mesh tasks                 # ledger of everything asked/answered
-mesh card desktop          # its A2A agent card
+mesh tasks             # ledger of everything asked/answered
+mesh card desktop      # its A2A agent card
 ```
 
-And because the wire format is real A2A, `mesh a2a-serve` runs a **localhost
-bridge** that lets any A2A-capable framework (LangGraph, Google ADK, Microsoft
-Agent Framework, …) talk to remote mesh nodes as if they were ordinary A2A
+And because the wire format is real A2A, `mesh a2a-serve` runs a
+**localhost bridge** so any A2A-capable framework (LangGraph, Google ADK,
+Microsoft Agent Framework, …) can talk to remote mesh nodes as ordinary A2A
 servers — discovery via agent cards, `message/send`, `tasks/get`:
 
 ```bash
-mesh a2a-serve     # → http://127.0.0.1:4737/agents/<node> per remote node
+mesh a2a-serve         # → http://127.0.0.1:4737/agents/<node> per remote node
 ```
 
-The twist vs. vanilla A2A: A2A assumes agents expose reachable HTTP servers.
-Two laptops behind NAT can't do that. meshwire carries the same envelopes
-over the ntfy relay — **outbound-only connections on both ends** — so ChatGPT
-(via Codex CLI) on a MacBook, Claude Code on a Linux laptop, and Copilot on a
-Windows PC can all exchange tasks with no port forwarding, no VPN, no server.
 See [docs/AGENTS.md](docs/AGENTS.md) for per-harness wiring (Codex CLI,
-Copilot CLI, Gemini CLI, A2A frameworks, cron).
-
-`mesh` moves messages; it never calls a model. Each node answers with
-whatever brain, tools, and permissions its own harness has.
+Copilot CLI, Gemini CLI, A2A frameworks, cron). `mesh` moves messages; it
+never calls a model. Each node answers with whatever brain, tools, and
+permissions its own harness has.
 
 ## Security model (read this)
 
-**Messages are end-to-end encrypted and authenticated** (default since
-v0.4.0). The mesh key is generated by `mesh init`, lives only in
-`.meshwire.json` on your machines, and travels only inside join codes you
-share yourself. On the wire, the relay (and anyone who discovers a topic)
-sees ciphertext, topic id, message size, and timing — nothing else. Sender
-and recipient names ride *inside* the ciphertext.
+**Messages are end-to-end encrypted and authenticated.** The mesh key is
+generated by `mesh init`, lives only in `.meshwire.json` on your machines,
+and travels only inside join codes you share yourself. On the wire, the
+relay (and anyone who discovers a topic) sees ciphertext, topic id, size,
+and timing — nothing else. Sender and recipient names ride *inside* the
+ciphertext.
 
-Construction (stdlib-only, standard primitives): HKDF-SHA256 key derivation →
-HMAC-SHA256 PRF in counter mode for encryption, encrypt-then-MAC with an
-independent HMAC-SHA256 key, random 128-bit nonce per message, constant-time
-tag comparison. Unauthenticated or tampered messages are **dropped, not
-displayed** (`mesh watch` logs a `MESH_WARN` to stderr; `mesh peek` marks
-them `[UNVERIFIED]`).
+Construction (stdlib-only, standard primitives): HKDF-SHA256 key derivation
+→ HMAC-SHA256 PRF in counter mode for encryption, encrypt-then-MAC with an
+independent HMAC-SHA256 key, random 128-bit nonce per message,
+constant-time tag comparison. Unauthenticated or tampered messages are
+**dropped, not displayed**.
 
 What you still must do:
 
-- **Guard the join code and `.meshwire.json`** — they contain the key.
-  `mesh init`/`join` auto-gitignore the config; share join codes over a
-  private channel (not a public issue tracker, not an unencrypted topic).
+- **Guard the join code and `.meshwire.json`** — they contain the key. Both
+  are auto-gitignored; share join codes over a private channel.
 - **Treat inbound tasks as untrusted input.** Encryption authenticates *the
   mesh*, not intent: any agent (or person) holding the key can send tasks.
-  Receiving agents should apply their normal permission rules — a mesh task
-  deserves the same scrutiny as any external request.
-- Denial-of-service caveat: someone who learns a topic id (but not the key)
-  can't read or forge messages, but can post garbage that wakes your watcher
-  (it drops it and re-listens). Self-hosting ntfy with auth
-  (`mesh init --server https://ntfy.example.com`) closes even that.
-- `.meshwire.node`, cursor, and task-ledger files are per-machine and
-  auto-gitignored.
-
-## How it compares
-
-| | meshwire | shared MCP queue | SSH + headless agent | plain git polling |
-|---|---|---|---|---|
-| Infrastructure | none | server to run | SSH + reachable host | none |
-| Wake latency | ~1–3 s | poll interval | seconds | poll interval |
-| Payload channel | your repo | the queue | the SSH pipe | your repo |
-| Audit trail | git history | custom | none | git history |
-| N nodes | yes | yes | pairwise | yes |
+  Receiving agents should apply their normal permission rules.
+- Someone who learns a topic id (but not the key) can't read or forge
+  messages, but can post garbage that your watcher silently drops.
+  Self-hosting ntfy with auth (`mesh init --server https://ntfy.example`)
+  closes even that.
+- Upgrade all machines together when moving to a new meshwire version —
+  it's one file. (v0.4 meshes interoperate; v0.4 clients just render the
+  new join/ping control messages as odd one-off messages.)
 
 ## CLI reference
 
 ```
-mesh init <name> --nodes a,b[,c...] [--server URL]   create mesh config here
-mesh iam <node>                set this machine's identity
-mesh send <node|all> <msg...>  ping a node (or broadcast)
-mesh watch [--timeout N]       block until a message arrives, print, exit
+mesh init <name> [--as NODE] [--server URL]   create a mesh here (identity = hostname)
+mesh join <code> [--as NODE]   join from a code; announces itself to the mesh
+mesh invite                    print the join code + paste-able bootstrap block
+mesh iam <node>                set/change this machine's identity
+mesh send <node|all> <msg...>  message a node (or broadcast)
+mesh watch --follow            stream messages forever (preferred; background task)
+mesh watch [--timeout N]       one-shot: block until one message, print, exit
+mesh ping <node> [--timeout N] liveness + round-trip time (answered by watchers)
 mesh ask <node> <text...> [--wait SECS]   delegate an A2A task
 mesh reply <task-id> <text...> [--state completed|failed|...]   answer one
 mesh tasks [get <id>]          task ledger
 mesh card [node] [--name N --description D]   A2A agent card
 mesh a2a-serve [--port 4737] [--wait 60]      localhost A2A HTTP bridge
 mesh peek [node] [--since S]   show recent messages without consuming
-mesh status                    show mesh, identity, topic
+mesh status                    mesh, identity, known peers + last seen
 mesh claude-setup              print the CLAUDE.md protocol section
 ```
+
+## How it compares
+
+| | meshwire | shared MCP queue | SSH + headless agent | plain git polling |
+|---|---|---|---|---|
+| Infrastructure | none | server to run | SSH + reachable host | none |
+| Wake latency | ~1 s <!-- SMOKE --> | poll interval | seconds | poll interval |
+| Payload channel | message or your repo | the queue | the SSH pipe | your repo |
+| Audit trail | git history | custom | none | git history |
+| N nodes | yes | yes | pairwise | yes |
 
 ## License
 
