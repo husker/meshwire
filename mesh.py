@@ -26,6 +26,7 @@ import re
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -39,6 +40,7 @@ CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
+REPLAY_NAME = ".meshwire.replay-{}.json"
 BROADCAST = "all"
 USER_AGENT = "meshwire/0.7"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
@@ -119,16 +121,55 @@ def _save_config(cfg):
     """Persist config changes atomically (a background watcher and a
     foreground command may both learn peers at the same moment)."""
     path = cfg.get("_path") or CONFIG_NAME
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
-                  f, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    _write_json_secure(
+        path, {k: v for k, v in cfg.items() if not k.startswith("_")},
+        indent=2)
+
+
+def _write_json_secure(path, value, indent=None):
+    """Atomically write JSON through a same-directory mode-0600 temp file."""
+    destination = os.path.abspath(path)
+    directory = os.path.dirname(destination)
+    prefix = f".{os.path.basename(destination)}."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            json.dump(value, f, indent=indent)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, destination)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def peers_file(cfg):
     return os.path.join(cfg["_dir"], PEERS_NAME)
+
+
+def replay_file(cfg, node):
+    return os.path.join(cfg["_dir"], REPLAY_NAME.format(node))
+
+
+def load_replays(cfg, node):
+    try:
+        with open(replay_file(cfg, node), "r", encoding="utf-8") as f:
+            values = json.load(f)
+        return set(values) if isinstance(values, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def save_replays(cfg, node, values):
+    _write_json_secure(replay_file(cfg, node), sorted(values))
 
 
 def load_peers(cfg):
@@ -248,9 +289,24 @@ def parse_join_code(code):
     b = code[len("mesh1-"):]
     b += "=" * (-len(b) % 4)
     try:
-        return json.loads(base64.urlsafe_b64decode(b))
-    except (ValueError, UnicodeDecodeError):
+        decoded = json.loads(base64.urlsafe_b64decode(b))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         sys.exit("error: corrupt join code")
+    allowed = {"mesh", "id", "key", "server", "nodes"}
+    if not isinstance(decoded, dict) or set(decoded) - allowed:
+        sys.exit("error: join code contains unsupported fields")
+    if not all(isinstance(decoded.get(k), str)
+               for k in ("mesh", "id", "server")):
+        sys.exit("error: join code has invalid field types")
+    key = decoded.get("key")
+    if key is not None and (not isinstance(key, str)
+                            or not re.fullmatch(r"[0-9a-fA-F]{64}", key)):
+        sys.exit("error: join code has invalid key")
+    nodes = decoded.get("nodes", [])
+    if not isinstance(nodes, list) or not all(isinstance(n, str) for n in nodes):
+        sys.exit("error: join code has invalid nodes")
+    return {"mesh": decoded["mesh"], "id": decoded["id"], "key": key,
+            "server": decoded["server"], "nodes": list(nodes)}
 
 
 # ---------------------------------------------------------------- http
@@ -284,25 +340,31 @@ def _open(ev, cfg):
     Returns (sender_or_None, body_text, trusted: bool, ctl_or_None).
     trusted=True only for messages that authenticated under the mesh key;
     ctl is the control payload ("c" field) for announce/ping/pong messages."""
+    return _open_with_fingerprint(ev, cfg)[:4]
+
+
+def _open_with_fingerprint(ev, cfg):
+    """Like _open, plus a stable fingerprint of authenticated ciphertext."""
     body = _unwrap(ev, cfg)
     pt = decrypt(cfg, body)
     if pt is not None:
+        fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
         try:
             wrapper = json.loads(pt)
             if isinstance(wrapper, dict) and "b" in wrapper:
                 return (wrapper.get("f"), wrapper["b"], True,
-                        wrapper.get("c"))
+                        wrapper.get("c"), fingerprint)
         except json.JSONDecodeError:
             pass
-        return None, pt, True, None
+        return None, pt, True, None, fingerprint
     if body.startswith(WIRE_MAGIC):
-        return None, "", False, None  # encrypted but not for us / tampered
+        return None, "", False, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, body, not cfg.get("key"), None
+    return frm, body, not cfg.get("key"), None, None
 
 
 def _parse_envelope(body):
@@ -507,8 +569,8 @@ def cmd_init(args):
 
 def _ensure_gitignore(dirpath):
     # keep secrets and per-machine files out of version control
-    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME,
-                PEERS_NAME]
+    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
+                ".meshwire.replay-*", TASKS_NAME, PEERS_NAME]
     gi = os.path.join(dirpath, ".gitignore")
     existing = ""
     if os.path.isfile(gi):
@@ -541,11 +603,11 @@ def cmd_join(args):
                  "hostname — pass --as <name>")
     if me not in cfg["nodes"]:
         cfg["nodes"].append(me)
+    cfg["_path"] = os.path.abspath(CONFIG_NAME)
+    cfg["_dir"] = os.getcwd()
     _write_config_here(cfg)
     with open(NODE_NAME, "w", encoding="utf-8") as f:
         f.write(me + "\n")
-    cfg["_path"] = os.path.abspath(CONFIG_NAME)
-    cfg["_dir"] = os.getcwd()
     print(f"joined mesh '{cfg['mesh']}' as '{me}' "
           f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
     if cfg.get("key"):
@@ -821,6 +883,7 @@ def cmd_watch(args):
     cf = cursor_file(cfg, me)
     since, seen = _load_cursor(cf)
     skip = set(seen)
+    replay_seen = load_replays(cfg, me)
     timeout = args.timeout or (None if args.follow else 10800)
     deadline = (time.time() + timeout) if timeout else None
 
@@ -836,13 +899,20 @@ def cmd_watch(args):
 
     delivered = False
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
-        frm, body, trusted, ctl = _open(ev, cfg)
+        frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(ev, cfg)
         save_cursor(ev)
         if not trusted:
             if body != "":
                 print(f"MESH_WARN: dropped unauthenticated message "
                       f"id={ev.get('id')}", file=sys.stderr)
             continue
+        if fingerprint in replay_seen:
+            if frm != me and not ctl:
+                _send_ack(cfg, me, frm, ev)
+            continue
+        if fingerprint:
+            replay_seen.add(fingerprint)
+            save_replays(cfg, me, replay_seen)
         if frm == me:
             continue  # own echo (e.g. broadcast)
         if ctl:

@@ -3,6 +3,7 @@
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -62,6 +63,37 @@ class JoinCodeTests(unittest.TestCase):
     def test_garbage_code_exits(self):
         with self.assertRaises(SystemExit):
             mesh.parse_join_code("garbage")
+
+    def test_rejects_internal_fields(self):
+        payload = {
+            "mesh": "home",
+            "id": "i1",
+            "key": "aa" * 32,
+            "server": "https://ntfy.example",
+            "nodes": [],
+            "_path": "victim.json",
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        code = "mesh1-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        with self.assertRaises(SystemExit):
+            mesh.parse_join_code(code)
+
+
+class ConfigPermissionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_config_is_0600_after_create_and_rewrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            old_umask = os.umask(0o022)
+            try:
+                mesh._save_config(cfg)
+                self.assertEqual(os.stat(cfg["_path"]).st_mode & 0o777, 0o600)
+                os.chmod(cfg["_path"], 0o600)
+                cfg["nodes"].append("gamma")
+                mesh._save_config(cfg)
+                self.assertEqual(os.stat(cfg["_path"]).st_mode & 0o777, 0o600)
+            finally:
+                os.umask(old_umask)
 
 
 class EnvelopeTests(unittest.TestCase):
@@ -512,8 +544,8 @@ class WatchTests(MembershipCmdTests):
 
     def test_follow_delivers_multiple_messages(self):
         cfg = self._setup_mesh()
-        evs = [self._msg_event(cfg, "beta", "one", "m1", 200),
-               self._msg_event(cfg, "beta", "two", "m2", 201)]
+        evs = [self._msg_event(cfg, "beta", "same", "m1", 200),
+               self._msg_event(cfg, "beta", "same", "m2", 201)]
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
              mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
@@ -521,8 +553,38 @@ class WatchTests(MembershipCmdTests):
             self.assertRaises(_TestDone, mesh.cmd_watch,
                               argparse.Namespace(timeout=None, as_node=None,
                                                  follow=True))
-        self.assertIn("one", out.getvalue())
-        self.assertIn("two", out.getvalue())
+        self.assertEqual(out.getvalue().count("message\": \"same"), 2)
+
+    def test_replayed_ciphertext_is_emitted_once(self):
+        cfg = self._setup_mesh()
+        original = self._msg_event(cfg, "beta", "deploy", "m1", 200)
+        replay = dict(original, id="m2", time=201)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([original, replay])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertEqual(out.getvalue().count("MESH_MESSAGE from='beta'"), 1)
+
+    def test_replay_is_suppressed_after_watcher_restart(self):
+        cfg = self._setup_mesh()
+        original = self._msg_event(cfg, "beta", "deploy", "m1", 200)
+        replay = dict(original, id="m2", time=201)
+        with mock.patch.object(mesh, "http", fake_stream([original])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([replay])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertNotIn("MESH_MESSAGE from='beta'", out.getvalue())
 
     def test_control_message_does_not_consume_one_shot(self):
         cfg = self._setup_mesh()
