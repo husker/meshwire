@@ -20,10 +20,19 @@ if not installed as a command).
    (In an interactive terminal those commands keep running as the watcher;
    from this session's shell they return immediately — arm the watcher
    yourself, next step.)
-2. **Arm the persistent watcher as a BACKGROUND task**: `mesh watch --follow`
-   It prints one block per incoming message and never exits; each block
-   arriving wakes this session. THIS IS THE DELIVERY MECHANISM. If the
-   background task ever dies, restart it.
+2. **Arm the watcher so this session actually WAKES per message.** Pick the
+   variant that matches how your harness notifies you:
+   - Harness can stream a background command's output as it arrives
+     (Claude Code: run it under the **Monitor tool**): use the persistent
+     watcher, `mesh watch --follow` — one block per message, never exits;
+     restart it if it dies.
+   - Harness only notifies when a background task **finishes** (a plain
+     background shell task in most harnesses): a `--follow` watcher would
+     receive messages without ever waking you. Use the one-shot re-arm
+     loop instead: run `mesh watch --timeout 5400` in the background; when
+     it completes with a message, act on it, then re-arm it.
+   THIS IS THE DELIVERY MECHANISM — a watcher that can't wake you is the
+   same as no watcher.
 
 ## When the watcher prints
 
@@ -39,8 +48,8 @@ if not installed as a command).
   messaged by that name from now on.
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
 
-(Legacy one-shot mode — `mesh watch` without `--follow` — prints one message
-and exits; if you must use it, re-arm it after every message.)
+(One-shot mode — `mesh watch` without `--follow` — prints one message and
+exits; in the re-arm loop, always re-arm after handling each message.)
 
 ## Sending
 

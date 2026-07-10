@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f .meshwire.json ]; then echo 'This project is a meshwire node. Load the meshwire:mesh-agent skill and arm the persistent watcher (mesh watch --follow as a background task) to receive messages from other machines.'; fi"
+            "command": "if [ -f .meshwire.json ]; then echo 'This project is a meshwire node. Load the meshwire:mesh-agent skill and arm the watcher in a way that wakes this session per message (mesh watch --follow under the Monitor tool, or the one-shot re-arm loop — the skill explains which).'; fi"
           }
         ]
       }

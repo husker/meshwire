@@ -1157,10 +1157,13 @@ CLAUDE_SNIPPET = """\
 This project uses meshwire (https://github.com/husker/meshwire) to link
 agent sessions on different machines. Protocol:
 
-1. Keep a PERSISTENT watcher running as a BACKGROUND task:
-   `python3 mesh.py watch --follow`
-   Every MESH_MESSAGE / MESH_TASK line it prints is a message arriving now —
-   read it and act on it. If the watcher task dies, restart it.
+1. Keep a watcher armed so this session WAKES on each message:
+   - If your harness streams a background command's output as it arrives
+     (Claude Code: the Monitor tool), run `python3 mesh.py watch --follow`
+     there — one MESH_MESSAGE / MESH_TASK block per message, never exits.
+   - If your harness only notifies when a background task FINISHES, use
+     the one-shot loop: `python3 mesh.py watch --timeout 5400` in the
+     background; when it completes with a message, act, then re-arm it.
 2. Substantive content (results, requests, code) travels via the shared repo
    when there is one: commit + push, then ping:
    `python3 mesh.py send <node|all> "one-line summary — pull"`.

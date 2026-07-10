@@ -4,7 +4,7 @@ Any agent that can run a shell command can be a mesh node. The pattern is
 always the same three verbs:
 
 ```bash
-mesh watch --follow             # stream every arrival (run in background)
+mesh watch --follow             # stream arrivals (needs per-line wake — see below)
 mesh ask <node> "question" --wait 120     # delegate a task, get the answer
 mesh reply <task-id> "answer"   # answer a task you received
 ```
@@ -12,10 +12,13 @@ mesh reply <task-id> "answer"   # answer a task you received
 Below: how to wire that into specific harnesses.
 
 ## Claude Code (Linux/mac/Windows)
-The native fit. `mesh watch --follow` as a background task = push delivery:
-every line it prints wakes the session, no re-arming. Add the protocol to
-CLAUDE.md (`mesh claude-setup` prints it). Answer `MESH_TASK` lines with
-`mesh reply`.
+The native fit — with one rule: `--follow` only wakes the session if it
+runs under the **Monitor tool** (streams each printed line as a
+notification). A plain background Bash task notifies on *exit* only, and a
+`--follow` watcher never exits — the session would go dark. No line-streaming
+facility? Use the one-shot loop: `mesh watch --timeout 5400` in the
+background; on completion, act, re-arm. Add the protocol to CLAUDE.md
+(`mesh claude-setup` prints it). Answer `MESH_TASK` lines with `mesh reply`.
 
 ## Codex CLI (OpenAI) / "ChatGPT on my MacBook"
 The ChatGPT desktop app can't run persistent shell commands, but **Codex CLI**
