@@ -6,9 +6,6 @@
     "name": "James Gagan"
   },
   "homepage": "https://github.com/husker/meshwire",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/husker/meshwire.git"
-  },
+  "repository": "https://github.com/husker/meshwire.git",
   "license": "MIT"
 }

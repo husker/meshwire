@@ -2,11 +2,25 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup",
+        "matcher": "startup|resume",
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f .meshwire.json ]; then echo 'This project is a meshwire node. Load the meshwire:mesh-agent skill and arm the watcher in a way that wakes this session per message (mesh watch --follow under the Monitor tool, or the one-shot re-arm loop — the skill explains which).'; fi"
+            "command": "python3 \"$PLUGIN_ROOT/mesh.py\" codex-session-hook",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\mesh.py\" codex-session-hook"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/mesh.py\" codex-hook --timeout 86370",
+            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\mesh.py\" codex-hook --timeout 86370",
+            "timeout": 86400,
+            "statusMessage": "Waiting for Meshwire messages"
           }
         ]
       }

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "python3 \"$PLUGIN_ROOT/mesh.py\" copilot-session-hook",
+        "powershell": "py -3 \"$env:PLUGIN_ROOT\\mesh.py\" copilot-session-hook",
+        "timeoutSec": 10
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "python3 \"$PLUGIN_ROOT/mesh.py\" copilot-hook --timeout 86370",
+        "powershell": "py -3 \"$env:PLUGIN_ROOT\\mesh.py\" copilot-hook --timeout 86370",
+        "timeoutSec": 86400
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "python3 \"$PLUGIN_ROOT/mesh.py\" agent-hook-cleanup --harness copilot",
+        "powershell": "py -3 \"$env:PLUGIN_ROOT\\mesh.py\" agent-hook-cleanup --harness copilot",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

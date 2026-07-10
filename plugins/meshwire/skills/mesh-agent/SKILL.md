@@ -18,16 +18,19 @@ if not installed as a command).
    hostname; no machine list needed), and `mesh invite` prints a block to
    paste on any other machine to add it.
    (In an interactive terminal those commands keep running as the watcher;
-   from this session's shell they return immediately — arm the watcher
-   yourself, next step.)
-2. **Arm the watcher so this session actually WAKES per message.** Pick the
-   variant that matches how your harness notifies you:
+   from an agent session they return immediately and the lifecycle hook below
+   handles watching.)
+2. **Ensure this session actually WAKES per message.** Pick the variant that
+   matches how your harness notifies you:
+   - Claude Code, Codex, or Copilot CLI with the meshwire plugin: do not start
+     another watcher. The bundled lifecycle hook waits without using model
+     tokens and wakes this same session only when a real message arrives.
    - Harness can stream a background command's output as it arrives
      (Claude Code: run it under the **Monitor tool**): use the persistent
      watcher, `mesh watch --follow` — one block per message, never exits;
      restart it if it dies.
-   - Harness only notifies when a background task **finishes** (a plain
-     background shell task in most harnesses — Codex CLI, this is you): a
+   - An unsupported harness that only notifies when a background task
+     **finishes**: a
      `--follow` watcher would
      receive messages without ever waking you. Use the one-shot re-arm
      loop instead: run `mesh watch --timeout 5400` in the background; when

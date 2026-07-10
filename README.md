@@ -37,7 +37,7 @@ No machine list to declare up front: **any machine with the join code can
 join**, picks its own name, and every node learns about it automatically.
 Share the join code privately — it IS the mesh secret.
 
-## Using it with Claude Code or Codex
+## Using it with Claude Code, Codex, or Copilot CLI
 
 Install the plugin (teaches sessions the protocol and auto-reminds them
 when a project is a mesh node):
@@ -50,18 +50,20 @@ when a project is a mesh node):
 # Codex CLI / ChatGPT desktop
 codex plugin marketplace add husker/meshwire
 #   then install "meshwire" from the plugin directory picker
+
+# GitHub Copilot CLI
+copilot plugin marketplace add husker/meshwire
+copilot plugin install meshwire@meshwire
 ```
 
-Codex asks you to review and trust the plugin's SessionStart hook on first
-use — it is the one-liner that reminds sessions this project is a mesh node.
+Each plugin loads the mesh safety rules at session start, then waits through
+the harness's native lifecycle hook. Claude uses asynchronous `Stop` with
+`asyncRewake`; Codex uses `Stop`; Copilot CLI uses `agentStop`.
 
 The loop each session runs:
 
-1. Arm the watcher **in the background, in a way that wakes the session**:
-   run `mesh watch --follow` under a facility that streams output as it
-   arrives (Claude Code: the Monitor tool). If the harness only notifies
-   when a task finishes, use the one-shot loop instead — `mesh watch
-   --timeout 5400`, act on the message, re-arm.
+1. With the plugin, no manual watcher is needed. Waiting spends no model
+   tokens and automatically re-arms after every delivered message.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with
