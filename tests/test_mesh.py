@@ -134,5 +134,60 @@ class AgoTests(unittest.TestCase):
         self.assertEqual(mesh._ago(now - 172800), "2d ago")
 
 
+class OpenControlTests(unittest.TestCase):
+    def test_open_returns_control_field(self):
+        cfg = make_cfg()
+        wire = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "ping",
+             "c": {"mw": "ping", "n": "x1"}}))
+        frm, body, trusted, ctl = mesh._open({"message": wire}, cfg)
+        self.assertEqual((frm, body, trusted), ("beta", "ping", True))
+        self.assertEqual(ctl, {"mw": "ping", "n": "x1"})
+
+    def test_open_without_control_returns_none_ctl(self):
+        cfg = make_cfg()
+        wire = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "hi"}))
+        frm, body, trusted, ctl = mesh._open({"message": wire}, cfg)
+        self.assertEqual((frm, body, trusted, ctl), ("beta", "hi", True, None))
+
+    def test_open_foreign_ciphertext_untrusted(self):
+        wire = mesh.encrypt(make_cfg(), "x")
+        frm, body, trusted, ctl = mesh._open({"message": wire}, make_cfg())
+        self.assertEqual((body, trusted, ctl), ("", False, None))
+
+
+class SendRawTests(unittest.TestCase):
+    def test_ctl_rides_inside_ciphertext(self):
+        cfg = make_cfg()
+        sent = {}
+
+        def fake_post(cfg_, tpc, data, headers):
+            sent["tpc"], sent["data"], sent["headers"] = tpc, data, headers
+            return {"id": "m1"}
+
+        with mock.patch.object(mesh, "_post", fake_post):
+            mesh.send_raw(cfg, "alpha", "beta", "ping",
+                          ctl={"mw": "ping", "n": "n1"})
+        self.assertEqual(sent["tpc"], mesh.topic(cfg, "beta"))
+        wrapper = json.loads(mesh.decrypt(cfg, sent["data"].decode()))
+        self.assertEqual(wrapper["c"], {"mw": "ping", "n": "n1"})
+        self.assertEqual(wrapper["b"], "ping")
+        self.assertEqual(sent["headers"]["Title"], cfg["mesh"])  # generic title
+
+    def test_plain_message_has_no_c_key(self):
+        cfg = make_cfg()
+        sent = {}
+
+        def fake_post(cfg_, tpc, data, headers):
+            sent["data"] = data
+            return {"id": "m1"}
+
+        with mock.patch.object(mesh, "_post", fake_post):
+            mesh.send_raw(cfg, "alpha", "beta", "hello")
+        wrapper = json.loads(mesh.decrypt(cfg, sent["data"].decode()))
+        self.assertNotIn("c", wrapper)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -273,26 +273,28 @@ def _unwrap(ev, cfg):
 
 def _open(ev, cfg):
     """Unwrap + decrypt + unpack a message event.
-    Returns (sender_or_None, body_text, trusted: bool). trusted=True only for
-    messages that authenticated under the mesh key."""
+    Returns (sender_or_None, body_text, trusted: bool, ctl_or_None).
+    trusted=True only for messages that authenticated under the mesh key;
+    ctl is the control payload ("c" field) for announce/ping/pong messages."""
     body = _unwrap(ev, cfg)
     pt = decrypt(cfg, body)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
             if isinstance(wrapper, dict) and "b" in wrapper:
-                return wrapper.get("f"), wrapper["b"], True
+                return (wrapper.get("f"), wrapper["b"], True,
+                        wrapper.get("c"))
         except json.JSONDecodeError:
             pass
-        return None, pt, True
+        return None, pt, True, None
     if body.startswith(WIRE_MAGIC):
-        return None, "", False  # encrypted but not for us / tampered
+        return None, "", False, None  # encrypted but not for us / tampered
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, body, not cfg.get("key")
+    return frm, body, not cfg.get("key"), None
 
 
 def _parse_envelope(body):
@@ -400,19 +402,28 @@ def envelope_summary(env):
             meta.get("from"), text)
 
 
-def send_raw(cfg, sender, to, body, title=None):
-    url = f"{cfg['server']}/{topic(cfg, to)}"
+def _post(cfg, tpc, data, headers):
+    """POST a message to the relay. (Transport seam — kept trivial here;
+    connection reuse lands behind this same signature.)"""
+    url = f"{cfg['server']}/{tpc}"
+    with http(url, data=data, headers=headers) as r:
+        return json.load(r)
+
+
+def send_raw(cfg, sender, to, body, title=None, ctl=None):
     if cfg.get("key"):
         # metadata rides inside the ciphertext; the relay learns nothing
         # beyond topic, size, and timing
-        wire = encrypt(cfg, json.dumps({"f": sender, "t": to, "b": body}))
+        payload = {"f": sender, "t": to, "b": body}
+        if ctl:
+            payload["c"] = ctl
+        wire = encrypt(cfg, json.dumps(payload))
         headers = {"Title": cfg["mesh"]}
     else:
         wire = body
         headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
                    "X-Mesh-From": sender}
-    with http(url, data=wire.encode("utf-8"), headers=headers) as r:
-        return json.load(r)
+    return _post(cfg, topic(cfg, to), wire.encode("utf-8"), headers)
 
 
 # ---------------------------------------------------------------- commands
@@ -436,10 +447,10 @@ def cmd_init(args):
     print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print(f"  join other machines with this code (share it privately —\n"
-          f"  it IS the mesh secret):\n")
+    print("  join other machines with this code (share it privately —\n"
+          "  it IS the mesh secret):\n")
     print(f"    mesh join {join_code(cfg)} --as <node>\n")
-    print(f"  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+    print("  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
 
 
 def _write_config_here(cfg):
@@ -568,7 +579,7 @@ def cmd_watch(args):
         if ev is None:
             print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
             sys.exit(0)
-        frm, body, trusted = _open(ev, cfg)
+        frm, body, trusted, ctl = _open(ev, cfg)
         env = _parse_envelope(body) if trusted else None
         if trusted and frm != me:
             break  # a real message from someone else
@@ -624,8 +635,10 @@ def cmd_peek(args):
         print(f"(no messages for '{node}' since {args.since})")
     for m in msgs:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
-        frm, text, trusted = _open(m, cfg)
+        frm, text, trusted, ctl = _open(m, cfg)
         mark = "" if trusted else " [UNVERIFIED]"
+        if ctl:
+            mark += f" [control:{ctl.get('mw')}]"
         print(f"[{ts}] {frm or m.get('title', '')}{mark}: {text}")
 
 
@@ -657,7 +670,7 @@ def _await_result(cfg, me, task_id, timeout):
         if ev is None:
             return None
         skip.add(ev.get("id"))
-        _, body, trusted = _open(ev, cfg)
+        _, body, trusted, ctl = _open(ev, cfg)
         env = _parse_envelope(body) if trusted else None
         if not env:
             continue
@@ -897,7 +910,7 @@ def cmd_a2a_serve(args):
     peers = [n for n in cfg["nodes"] if n != me]
     print(f"a2a bridge for mesh '{cfg['mesh']}' as node '{me}' on "
           f"http://{args.host}:{args.port}")
-    print(f"  agent card:    /.well-known/agent-card.json")
+    print("  agent card:    /.well-known/agent-card.json")
     for n in peers:
         print(f"  remote agent:  /agents/{n}  "
               f"(card: /agents/{n}/.well-known/agent-card.json)")
