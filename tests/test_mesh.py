@@ -516,6 +516,7 @@ class WatchTests(MembershipCmdTests):
                self._msg_event(cfg, "beta", "two", "m2", 201)]
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
              mock.patch("time.sleep"), contextlib.redirect_stdout(out):
             self.assertRaises(_TestDone, mesh.cmd_watch,
                               argparse.Namespace(timeout=None, as_node=None,
@@ -834,21 +835,24 @@ class AckReceiverTests(MembershipCmdTests):
     def test_watch_acks_before_emitting(self):
         cfg = self._setup_mesh()
         evs = [self._msg_event(cfg, "beta", "hello", "m77", 500)]
-        sent = []
+        order = []
 
         def fake_send(c, s, t, b, title=None, ctl=None):
-            sent.append((s, t, ctl))
+            order.append(("ack", ctl))
             return {"id": "x"}
+
+        def fake_emit(c, me, frm, body, ev):
+            order.append(("emit", ev.get("id")))
 
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
              mock.patch.object(mesh, "send_raw", fake_send), \
+             mock.patch.object(mesh, "_emit_message", fake_emit), \
              contextlib.redirect_stdout(out):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
-        self.assertEqual(sent, [("alpha", "beta",
-                                 {"mw": "ack", "of": "m77"})])
-        self.assertIn("MESH_MESSAGE", out.getvalue())
+        self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77"}),
+                                 ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
         cfg = self._setup_mesh()
@@ -918,6 +922,24 @@ class AckReceiverTests(MembershipCmdTests):
                                        {"mw": "ack", "of": "m1"})
             self.assertIsNone(out)
             self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "ack")
+
+    def test_plaintext_mesh_watch_does_not_ack(self):
+        cfg = make_cfg(key=False)
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        ev = {"event": "message", "id": "p1", "time": 500, "message": "hi",
+              "title": "t: beta -> alpha"}
+        sent = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([ev])), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: sent.append(1) or {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":
