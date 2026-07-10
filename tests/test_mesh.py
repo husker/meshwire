@@ -358,7 +358,7 @@ class SendStatusInviteTests(MembershipCmdTests):
                                lambda *a, **k: sent.append(a) or {"id": "1"}), \
              contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             mesh.cmd_send(argparse.Namespace(to="gamma", message=["hi"],
-                                             as_node=None))
+                                             as_node=None, no_wait=True))
         self.assertEqual(len(sent), 1)
         self.assertIn("never seen 'gamma'", err.getvalue())
 
@@ -366,7 +366,7 @@ class SendStatusInviteTests(MembershipCmdTests):
         self._write_cfg()
         with self.assertRaises(SystemExit):
             mesh.cmd_send(argparse.Namespace(to="alpha", message=["hi"],
-                                             as_node=None))
+                                             as_node=None, no_wait=True))
 
     def test_ask_to_broadcast_errors(self):
         self._write_cfg()
@@ -940,6 +940,96 @@ class AckReceiverTests(MembershipCmdTests):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         self.assertEqual(sent, [])
+
+
+class AckSenderTests(MembershipCmdTests):
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def _ack_event(self, cfg, frm, of, eid, t):
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(
+                    {"f": frm, "t": "alpha", "b": "ack",
+                     "c": {"mw": "ack", "of": of}}))}
+
+    def test_send_prints_delivered_on_ack(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "msg9", "a1", 600)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msg9"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertRegex(out.getvalue(), r"delivered to beta \(\d+ms\)")
+
+    def test_send_ignores_wrong_of_and_reports_no_ack(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "OTHER", "a1", 600)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msg9"}), \
+             mock.patch.object(mesh, "ACK_WAIT", 0), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("no ack yet", out.getvalue())
+
+    def test_send_no_wait_skips_subscribe(self):
+        self._setup_mesh()
+        out = io.StringIO()
+
+        def no_dial(*a, **k):
+            raise AssertionError("subscribed despite --no-wait")
+
+        with mock.patch.object(mesh, "http", no_dial), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m1"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=True))
+        self.assertIn("sent to beta", out.getvalue())
+        self.assertNotIn("delivered", out.getvalue())
+
+    def test_broadcast_lists_all_ackers(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "msgB", "a1", 600),
+               self._ack_event(cfg, "gamma", "msgB", "a2", 601)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msgB"}), \
+             mock.patch.object(mesh, "ACK_WAIT", 1), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="all", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("acked by: beta, gamma", out.getvalue())
+
+    def test_plaintext_mesh_sends_like_today(self):
+        cfg = make_cfg(key=False)
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        out = io.StringIO()
+
+        def no_dial(*a, **k):
+            raise AssertionError("plaintext mesh must not subscribe")
+
+        with mock.patch.object(mesh, "http", no_dial), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m1"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("sent to beta", out.getvalue())
 
 
 if __name__ == "__main__":

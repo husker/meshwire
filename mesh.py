@@ -601,12 +601,37 @@ def cmd_send(args):
     if to == sender:
         sys.exit("error: refusing to send to self")
     msg = " ".join(args.message)
+    wait = bool(cfg.get("key")) and not args.no_wait
+    first = None
+    if wait:
+        try:  # be listening before the message ships
+            first = _stream_open(
+                cfg, f"{topic(cfg, sender)},{topic(cfg, BROADCAST)}",
+                str(int(time.time()) - 5), ACK_WAIT + 5)
+        except (urllib.error.URLError, socket.timeout):
+            pass
+    t0 = time.monotonic()
     try:
         resp = send_raw(cfg, sender, to, msg)
     except (urllib.error.URLError, socket.timeout) as e:
         sys.exit(f"error: send failed: {e}")
     enc = " [e2e]" if cfg.get("key") else ""
     print(f"sent to {to} (id {resp.get('id', '?')}){enc}: {msg}")
+    if not wait:
+        return
+    acks = _await_acks(cfg, sender, resp.get("id"), t0, ACK_WAIT,
+                       first=first, want_all=(to == BROADCAST))
+    if to == BROADCAST:
+        if acks:
+            print("acked by: " + ", ".join(n for n, _ in acks))
+        else:
+            print("sent — no ack yet (nodes may be offline; the relay "
+                  "holds the message)")
+    elif acks:
+        print(f"delivered to {acks[0][0]} ({acks[0][1]}ms)")
+    else:
+        print("sent — no ack yet (node may be offline; the relay holds "
+              "the message)")
 
 
 def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
@@ -757,6 +782,35 @@ def _send_ack(cfg, me, frm, ev):
                  ctl={"mw": "ack", "of": ev.get("id")})
     except (urllib.error.URLError, socket.timeout):
         pass
+
+
+def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
+    """Collect {"mw": "ack", "of": msg_id} control messages addressed to
+    `me`. Returns a list of (node, ms). want_all=False returns on the
+    first ack (directed send); True collects until the window closes
+    (broadcast). Never raises on transport trouble — an ack wait is
+    best-effort reporting, not delivery."""
+    got = []
+    if not msg_id:
+        return got
+    deadline = time.time() + timeout
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    try:
+        for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5),
+                                 deadline, first=first):
+            frm, body, trusted, ctl = _open(ev, cfg)
+            if not trusted or not ctl or ctl.get("mw") != "ack":
+                continue
+            if ctl.get("of") != msg_id or not frm:
+                continue
+            if frm not in [n for n, _ in got]:
+                got.append((frm, int((time.monotonic() - t0) * 1000)))
+                note_peer(cfg, frm, "ack")
+            if not want_all:
+                return got
+    except Exception:
+        pass  # reporting only — the message itself is already sent
+    return got
 
 
 def cmd_watch(args):
@@ -1237,6 +1291,8 @@ def main():
     p.add_argument("message", nargs="+")
     p.add_argument("--as", dest="as_node", default=None,
                    help="override sender identity")
+    p.add_argument("--no-wait", dest="no_wait", action="store_true",
+                   help="don't wait for the delivery ack")
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("watch",
