@@ -644,6 +644,39 @@ def _emit_message(cfg, me, frm, body, ev):
                           "time": ev.get("time")}), flush=True)
 
 
+def _stream_open(cfg, tpc, since, timeout):
+    """Eagerly open a subscribe stream (pass as `first=` to _stream_events).
+    Lets callers be listening BEFORE they trigger the traffic they await."""
+    return http(f"{cfg['server']}/{tpc}/json?since={since}", timeout=timeout)
+
+
+def _handle_control(cfg, me, frm, ctl):
+    """React to an announce/ping/pong control message.
+    Returns an agent-facing stdout line, or None (control chatter never
+    surfaces as MESH_MESSAGE and never wakes an agent, except the rare and
+    useful MESH_NODE_JOINED)."""
+    kind = ctl.get("mw")
+    if kind == "announce":
+        note_peer(cfg, frm, "announce")
+        return f"MESH_NODE_JOINED node={frm}"
+    if kind == "ping":
+        note_peer(cfg, frm, "message")
+        try:
+            send_raw(cfg, me, frm, "pong",
+                     ctl={"mw": "pong", "n": ctl.get("n"),
+                          "ts": ctl.get("ts")})
+            print(f"MESH_PING from={frm} (answered)", file=sys.stderr)
+        except (urllib.error.URLError, socket.timeout):
+            print(f"MESH_PING from={frm} (pong send failed)",
+                  file=sys.stderr)
+        return None
+    if kind == "pong":
+        note_peer(cfg, frm, "pong")
+        return None
+    print(f"MESH_CTL from={frm} kind={kind!r} (ignored)", file=sys.stderr)
+    return None
+
+
 def cmd_watch(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
@@ -677,8 +710,9 @@ def cmd_watch(args):
         if frm == me:
             continue  # own echo (e.g. broadcast)
         if ctl:
-            print(f"MESH_CTL from={frm} kind={ctl.get('mw')}",
-                  file=sys.stderr)
+            line = _handle_control(cfg, me, frm, ctl)
+            if line:
+                print(line, flush=True)
             continue
         note_peer(cfg, frm, "message")
         _emit_message(cfg, me, frm, body, ev)
@@ -736,6 +770,45 @@ def cmd_status(args):
         print(f"topic:  {topic(cfg, me)}")
 
 
+def cmd_ping(args):
+    cfg = load_config()
+    if not cfg.get("key"):
+        sys.exit("error: ping needs an encrypted mesh (create one with a "
+                 "current `mesh init`)")
+    me = my_node(cfg, args.as_node)
+    to = args.node
+    if to == me or to == BROADCAST:
+        sys.exit("error: ping one other node")
+    nonce = secrets.token_hex(8)
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    first = None
+    try:  # subscribe BEFORE sending so the pong can't slip past us
+        first = _stream_open(cfg, tpc, str(int(time.time()) - 5),
+                             min(args.timeout, 300))
+    except (urllib.error.URLError, socket.timeout):
+        pass  # _stream_events will dial on its own
+    t0 = time.monotonic()
+    try:
+        send_raw(cfg, me, to, "ping",
+                 ctl={"mw": "ping", "n": nonce, "ts": time.time()})
+    except (urllib.error.URLError, socket.timeout) as e:
+        sys.exit(f"error: ping send failed: {e}")
+    deadline = time.time() + args.timeout
+    for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
+                             first=first):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        if not trusted or not ctl:
+            continue
+        if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
+            rtt = int((time.monotonic() - t0) * 1000)
+            note_peer(cfg, frm or to, "pong")
+            print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
+            return
+    print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s — no watcher "
+          f"running there, or offline", file=sys.stderr)
+    sys.exit(1)
+
+
 def _await_result(cfg, me, task_id, timeout, first=None):
     """Stream own inbox for a result envelope matching task_id, using an
     ephemeral cursor (does not disturb `mesh watch`'s cursor)."""
@@ -772,6 +845,14 @@ def cmd_ask(args):
     env = make_send_envelope(me, to, text)
     task_id = env["params"]["message"]["taskId"]
     ctx = env["params"]["message"]["contextId"]
+    first = None
+    if args.wait:
+        tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        try:  # be listening before the question ships
+            first = _stream_open(cfg, tpc, str(int(time.time()) - 5),
+                                 min(args.wait, 300))
+        except (urllib.error.URLError, socket.timeout):
+            pass
     try:
         send_raw(cfg, me, to, json.dumps(env),
                  title=f"{cfg['mesh']}: a2a {me} -> {to}")
@@ -784,7 +865,7 @@ def cmd_ask(args):
         print(f"  check later: mesh tasks get {task_id}")
         return
     print(f"  waiting up to {args.wait}s for a reply...")
-    result = _await_result(cfg, me, task_id, args.wait)
+    result = _await_result(cfg, me, task_id, args.wait, first=first)
     if result is None:
         print(f"MESH_TASK_PENDING task={task_id} (no reply yet — "
               f"`mesh tasks get {task_id}` later)")
@@ -1091,6 +1172,13 @@ def main():
     p = sub.add_parser("status", help="show mesh config and this node")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("ping", help="liveness + round-trip time to a node "
+                                    "(answered automatically by watchers)")
+    p.add_argument("node")
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_ping)
 
     p = sub.add_parser("ask", help="send an A2A task to another node")
     p.add_argument("to")

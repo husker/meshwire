@@ -517,5 +517,93 @@ class AwaitResultTests(MembershipCmdTests):
         self.assertEqual(got["result"]["id"], "T1")
 
 
+class ControlHandlingTests(unittest.TestCase):
+    def test_ping_gets_ponged_with_same_nonce(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            sent = []
+
+            def fake_send(c, s, t, b, title=None, ctl=None):
+                sent.append((s, t, ctl))
+                return {"id": "1"}
+
+            with mock.patch.object(mesh, "send_raw", fake_send):
+                out = mesh._handle_control(cfg, "alpha", "beta",
+                                           {"mw": "ping", "n": "n9", "ts": 5})
+            self.assertIsNone(out)
+            self.assertEqual(sent, [("alpha", "beta",
+                                     {"mw": "pong", "n": "n9", "ts": 5})])
+
+    def test_announce_prints_marker_and_learns_node(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            out = mesh._handle_control(cfg, "alpha", "gamma",
+                                       {"mw": "announce"})
+            self.assertEqual(out, "MESH_NODE_JOINED node=gamma")
+            self.assertIn("gamma", cfg["nodes"])
+
+    def test_pong_is_silent_but_noted(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            out = mesh._handle_control(cfg, "alpha", "beta",
+                                       {"mw": "pong", "n": "x"})
+            self.assertIsNone(out)
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "pong")
+
+
+class PingCmdTests(MembershipCmdTests):
+    def test_ping_prints_rtt(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        pong = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "pong",
+             "c": {"mw": "pong", "n": "fixednonce", "ts": 1.0}}))
+        evs = [{"event": "message", "id": "p1", "time": 400, "message": pong}]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "1"}), \
+             mock.patch.object(mesh.secrets, "token_hex",
+                               return_value="fixednonce"), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_ping(argparse.Namespace(node="beta", timeout=5,
+                                             as_node=None))
+        self.assertRegex(out.getvalue(), r"MESH_PONG node=beta rtt=\d+ms")
+
+    def test_ping_plaintext_mesh_errors(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(key=False), f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        with self.assertRaises(SystemExit):
+            mesh.cmd_ping(argparse.Namespace(node="beta", timeout=5,
+                                             as_node=None))
+
+
+class AskOrderTests(MembershipCmdTests):
+    def test_ask_subscribes_before_sending(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        order = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_stream_open",
+                               lambda *a, **k: order.append("open")), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: order.append("send")
+                               or {"id": "1"}), \
+             mock.patch.object(mesh, "_await_result",
+                               lambda *a, **k: None), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_ask(argparse.Namespace(to="beta", text=["hi"], wait=5,
+                                            as_node=None))
+        self.assertEqual(order, ["open", "send"])
+
+
 if __name__ == "__main__":
     unittest.main()
