@@ -763,29 +763,35 @@ class AutoWatchTests(MembershipCmdTests):
         self.assertEqual(cm.exception.code, 130)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PluginManifestTests(unittest.TestCase):
-    """The Codex plugin files parse, point at real paths, and match versions."""
+    """The Codex plugin files parse, point at real paths, and match versions.
+
+    The Codex plugin lives nested at plugins/meshwire/ (Codex silently drops
+    a plugin whose folder is the marketplace root) with real COPIES of the
+    shared skill/hook (its installer skips symlinks) — the byte-identity
+    test below is what makes that duplication safe.
+    """
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PLUGIN_DIR = os.path.join(ROOT, "plugins", "meshwire")
+    MANIFEST = "plugins/meshwire/.codex-plugin/plugin.json"
 
     def _load(self, rel):
         with open(os.path.join(self.ROOT, rel)) as f:
             return json.load(f)
 
     def test_codex_manifest_valid(self):
-        m = self._load(".codex-plugin/plugin.json")
+        m = self._load(self.MANIFEST)
         self.assertRegex(m["name"], r"^[a-z0-9][a-z0-9-]*$")
         self.assertTrue(m["skills"].startswith("./"))
-        self.assertTrue(os.path.isdir(os.path.join(self.ROOT, m["skills"])))
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.PLUGIN_DIR, m["skills"])))
 
     def test_marketplace_catalog_valid(self):
         cat = self._load(".agents/plugins/marketplace.json")
         entry = cat["plugins"][0]
         self.assertEqual(entry["source"]["source"], "local")
+        self.assertTrue(entry["source"]["path"].startswith("./"))
         target = os.path.normpath(
             os.path.join(self.ROOT, entry["source"]["path"]))
         self.assertTrue(os.path.isfile(
@@ -794,7 +800,17 @@ class PluginManifestTests(unittest.TestCase):
     def test_plugin_versions_match_pyproject(self):
         with open(os.path.join(self.ROOT, "pyproject.toml")) as f:
             py = f.read()
-        for rel in (".codex-plugin/plugin.json",
-                    ".claude-plugin/plugin.json"):
+        for rel in (self.MANIFEST, ".claude-plugin/plugin.json"):
             v = self._load(rel)["version"]
             self.assertIn(f'version = "{v}"', py)
+
+    def test_codex_plugin_copies_match_masters(self):
+        for rel in ("skills/mesh-agent/SKILL.md", "hooks/hooks.json"):
+            with open(os.path.join(self.ROOT, rel), "rb") as f:
+                master = f.read()
+            with open(os.path.join(self.PLUGIN_DIR, rel), "rb") as f:
+                self.assertEqual(f.read(), master, rel)
+
+
+if __name__ == "__main__":
+    unittest.main()
