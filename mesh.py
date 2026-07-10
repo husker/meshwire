@@ -40,7 +40,7 @@ NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
-USER_AGENT = "meshwire/0.6"
+USER_AGENT = "meshwire/0.7"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 

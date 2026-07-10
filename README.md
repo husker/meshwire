@@ -37,15 +37,23 @@ No machine list to declare up front: **any machine with the join code can
 join**, picks its own name, and every node learns about it automatically.
 Share the join code privately — it IS the mesh secret.
 
-## Using it with Claude Code
+## Using it with Claude Code or Codex
 
 Install the plugin (teaches sessions the protocol and auto-reminds them
 when a project is a mesh node):
 
 ```
+# Claude Code
 /plugin marketplace add husker/meshwire
 /plugin install meshwire
+
+# Codex CLI / ChatGPT desktop
+codex plugin marketplace add husker/meshwire
+#   then install "meshwire" from the plugin directory picker
 ```
+
+Codex asks you to review and trust the plugin's SessionStart hook on first
+use — it is the one-liner that reminds sessions this project is a mesh node.
 
 The loop each session runs:
 
