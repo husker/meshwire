@@ -22,21 +22,25 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 TASKS_NAME = ".meshwire.tasks.json"
+PEERS_NAME = ".meshwire.peers.json"
 BROADCAST = "all"
-USER_AGENT = "meshwire/0.3"
+USER_AGENT = "meshwire/0.5"
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
@@ -82,9 +86,9 @@ def my_node(cfg, override=None):
         sys.exit("error: this machine has no node identity. Run "
                  "`mesh iam <node>` (or pass --as / set MESHWIRE_NODE).")
     if name not in cfg["nodes"]:
-        sys.exit(f"error: node '{name}' is not in the mesh {cfg['nodes']}. "
-                 f"Run `mesh iam <node>` with a listed node, or edit "
-                 f"{CONFIG_NAME}.")
+        cfg["nodes"].append(name)
+        if cfg.get("_path"):
+            _save_config(cfg)
     return name
 
 
@@ -95,6 +99,73 @@ def topic(cfg, node):
 def cursor_file(cfg, node):
     # per-machine, next to the config; gitignored by `mesh init`
     return os.path.join(cfg["_dir"], f".meshwire.cursor-{node}")
+
+
+def _default_node_name():
+    """This machine's default identity: sanitized hostname, or None."""
+    name = socket.gethostname().lower()
+    for suffix in (".local", ".lan"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    name = re.sub(r"[^a-z0-9-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    if not name or name == BROADCAST:
+        return None
+    return name
+
+
+def _save_config(cfg):
+    """Persist config changes atomically (a background watcher and a
+    foreground command may both learn peers at the same moment)."""
+    path = cfg.get("_path") or CONFIG_NAME
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
+                  f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def peers_file(cfg):
+    return os.path.join(cfg["_dir"], PEERS_NAME)
+
+
+def load_peers(cfg):
+    try:
+        with open(peers_file(cfg), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def note_peer(cfg, node, via):
+    """Record a live sighting of `node`; learn unknown nodes into the config.
+
+    Membership is dynamic: any authenticated message teaches us its sender.
+    """
+    if not node or node == BROADCAST:
+        return
+    if node not in cfg["nodes"]:
+        cfg["nodes"].append(node)
+        _save_config(cfg)
+    if not os.path.exists(peers_file(cfg)):
+        _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
+    peers = load_peers(cfg)
+    peers[node] = {"seen": int(time.time()), "via": via}
+    with open(peers_file(cfg), "w", encoding="utf-8") as f:
+        json.dump(peers, f, indent=2)
+        f.write("\n")
+
+
+def _ago(ts):
+    d = max(0, int(time.time()) - int(ts))
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
 
 
 # ---------------------------------------------------------------- crypto
@@ -209,26 +280,28 @@ def _unwrap(ev, cfg):
 
 def _open(ev, cfg):
     """Unwrap + decrypt + unpack a message event.
-    Returns (sender_or_None, body_text, trusted: bool). trusted=True only for
-    messages that authenticated under the mesh key."""
+    Returns (sender_or_None, body_text, trusted: bool, ctl_or_None).
+    trusted=True only for messages that authenticated under the mesh key;
+    ctl is the control payload ("c" field) for announce/ping/pong messages."""
     body = _unwrap(ev, cfg)
     pt = decrypt(cfg, body)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
             if isinstance(wrapper, dict) and "b" in wrapper:
-                return wrapper.get("f"), wrapper["b"], True
+                return (wrapper.get("f"), wrapper["b"], True,
+                        wrapper.get("c"))
         except json.JSONDecodeError:
             pass
-        return None, pt, True
+        return None, pt, True, None
     if body.startswith(WIRE_MAGIC):
-        return None, "", False  # encrypted but not for us / tampered
+        return None, "", False, None  # encrypted but not for us / tampered
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, body, not cfg.get("key")
+    return frm, body, not cfg.get("key"), None
 
 
 def _parse_envelope(body):
@@ -336,19 +409,62 @@ def envelope_summary(env):
             meta.get("from"), text)
 
 
-def send_raw(cfg, sender, to, body, title=None):
-    url = f"{cfg['server']}/{topic(cfg, to)}"
+_LOCAL = threading.local()  # per-thread keep-alive conns (a2a-serve threads)
+
+
+def _post(cfg, tpc, data, headers):
+    """POST to the relay, reusing one keep-alive connection per server —
+    saves a TLS handshake (~0.3-0.5s) on every send after the first."""
+    u = urllib.parse.urlsplit(cfg["server"])
+    conns = getattr(_LOCAL, "conns", None)
+    if conns is None:
+        conns = _LOCAL.conns = {}
+    key = (u.scheme, u.netloc)
+    err = None
+    for attempt in (1, 2):
+        conn = conns.get(key)
+        if conn is None:
+            cls = (HTTPSConnection if u.scheme == "https"
+                   else HTTPConnection)
+            conn = conns[key] = cls(u.netloc, timeout=15)
+        try:
+            h = dict(headers)
+            h.setdefault("User-Agent", USER_AGENT)
+            conn.request("POST", f"{u.path}/{tpc}", body=data, headers=h)
+            resp = conn.getresponse()
+            out = resp.read()
+            if resp.status >= 400:
+                raise urllib.error.HTTPError(
+                    f"{cfg['server']}/{tpc}", resp.status,
+                    out.decode("utf-8", "replace")[:200], None, None)
+            return json.loads(out)
+        except urllib.error.HTTPError:
+            raise  # a real relay answer — do not retry, do not rewrap
+        except (HTTPException, ConnectionError, socket.timeout,
+                OSError) as e:
+            err = e
+            conns.pop(key, None)
+            try:
+                conn.close()
+            except Exception:
+                pass
+    raise urllib.error.URLError(f"send failed after retry: {err}")
+
+
+def send_raw(cfg, sender, to, body, title=None, ctl=None):
     if cfg.get("key"):
         # metadata rides inside the ciphertext; the relay learns nothing
         # beyond topic, size, and timing
-        wire = encrypt(cfg, json.dumps({"f": sender, "t": to, "b": body}))
+        payload = {"f": sender, "t": to, "b": body}
+        if ctl:
+            payload["c"] = ctl
+        wire = encrypt(cfg, json.dumps(payload))
         headers = {"Title": cfg["mesh"]}
     else:
         wire = body
         headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
                    "X-Mesh-From": sender}
-    with http(url, data=wire.encode("utf-8"), headers=headers) as r:
-        return json.load(r)
+    return _post(cfg, topic(cfg, to), wire.encode("utf-8"), headers)
 
 
 # ---------------------------------------------------------------- commands
@@ -356,11 +472,15 @@ def send_raw(cfg, sender, to, body, title=None):
 def cmd_init(args):
     if find_config():
         sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
-    nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
-    if len(nodes) < 2:
-        sys.exit("error: need at least 2 nodes (--nodes a,b)")
+    nodes = [n.strip() for n in (args.nodes or "").split(",") if n.strip()]
     if BROADCAST in nodes:
         sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
+    me = args.as_node or _default_node_name()
+    if not me or me == BROADCAST:
+        sys.exit("error: couldn't derive a usable node name from the "
+                 "hostname — pass --as <name>")
+    if me not in nodes:
+        nodes.insert(0, me)
     cfg = {
         "mesh": args.name,
         "id": secrets.token_hex(8),
@@ -369,69 +489,94 @@ def cmd_init(args):
         "nodes": nodes,
     }
     _write_config_here(cfg)
-    print(f"mesh '{args.name}' created: nodes {nodes} (end-to-end encrypted)")
+    with open(NODE_NAME, "w", encoding="utf-8") as f:
+        f.write(me + "\n")
+    print(f"mesh '{args.name}' created — this machine is '{me}' "
+          f"(end-to-end encrypted)")
     print(f"  config: {os.path.abspath(CONFIG_NAME)}  — contains the mesh "
           f"KEY. Never commit to a public repo.")
-    print(f"  join other machines with this code (share it privately —\n"
-          f"  it IS the mesh secret):\n")
-    print(f"    mesh join {join_code(cfg)} --as <node>\n")
-    print(f"  then here: `mesh iam <node>`, and `mesh watch` / `mesh send`.")
+    print("  add another machine: run `mesh invite` and paste the block it "
+          "prints on that machine.")
+    print("  listen here: `mesh watch --follow` (background task)")
 
 
-def _write_config_here(cfg):
-    with open(CONFIG_NAME, "w", encoding="utf-8") as f:
-        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")},
-                  f, indent=2)
-        f.write("\n")
+def _ensure_gitignore(dirpath):
     # keep secrets and per-machine files out of version control
-    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME]
+    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*", TASKS_NAME,
+                PEERS_NAME]
+    gi = os.path.join(dirpath, ".gitignore")
     existing = ""
-    if os.path.isfile(".gitignore"):
-        with open(".gitignore", "r", encoding="utf-8") as f:
+    if os.path.isfile(gi):
+        with open(gi, "r", encoding="utf-8") as f:
             existing = f.read()
     add = [l for l in gi_lines if l not in existing.splitlines()]
     if add:
-        with open(".gitignore", "a", encoding="utf-8") as f:
+        with open(gi, "a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(add) + "\n")
+
+
+def _write_config_here(cfg):
+    _save_config(cfg)
+    _ensure_gitignore(os.getcwd())
 
 
 def cmd_join(args):
     if find_config():
         sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
     cfg = parse_join_code(args.code)
-    for field in ("mesh", "id", "server", "nodes"):
+    for field in ("mesh", "id", "server"):
         if not cfg.get(field):
             sys.exit(f"error: join code missing '{field}'")
+    cfg.setdefault("nodes", [])
+    me = args.as_node or _default_node_name()
+    if not me or me == BROADCAST:
+        sys.exit("error: couldn't derive a usable node name from the "
+                 "hostname — pass --as <name>")
+    if me not in cfg["nodes"]:
+        cfg["nodes"].append(me)
     _write_config_here(cfg)
-    print(f"joined mesh '{cfg['mesh']}' "
-          f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'}); "
-          f"nodes: {cfg['nodes']}")
-    if args.as_node:
-        with open(NODE_NAME, "w", encoding="utf-8") as f:
-            f.write(args.as_node + "\n")
-        if args.as_node not in cfg["nodes"]:
-            cfg["nodes"].append(args.as_node)
-            _write_config_here(cfg)
-            print(f"  note: added new node '{args.as_node}' locally — other "
-                  f"machines can message it by name regardless.")
-        print(f"  this machine is '{args.as_node}'. Try: mesh send all "
-              f"\"{args.as_node} online\"")
-    else:
-        print("  next: mesh iam <node>")
+    with open(NODE_NAME, "w", encoding="utf-8") as f:
+        f.write(me + "\n")
+    cfg["_path"] = os.path.abspath(CONFIG_NAME)
+    cfg["_dir"] = os.getcwd()
+    print(f"joined mesh '{cfg['mesh']}' as '{me}' "
+          f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
+    if cfg.get("key"):
+        try:
+            send_raw(cfg, me, BROADCAST, f"{me} joined the mesh",
+                     ctl={"mw": "announce"})
+            print("  announced — other machines learn this node "
+                  "automatically.")
+        except (urllib.error.URLError, socket.timeout):
+            print("  (announce failed; peers learn this node when it first "
+                  "sends)")
+    print(f"  try: mesh send all \"{me} online\"   |   "
+          f"listen: mesh watch --follow")
 
 
 def cmd_invite(args):
     cfg = load_config()
-    print("share this join code PRIVATELY (it is the mesh secret):\n")
-    print(f"  mesh join {join_code(cfg)} --as <node>")
+    code = join_code(cfg)
+    print("Paste this on the new machine (share PRIVATELY — the code IS the")
+    print("mesh secret). It downloads meshwire, joins as the machine's")
+    print("hostname, and starts listening:\n")
+    print("  curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/"
+          "main/mesh.py")
+    print(f"  python3 mesh.py join {code} && python3 mesh.py watch --follow\n")
+    print(f"  # pick a name instead:  python3 mesh.py join {code} "
+          f"--as <name>")
+    print(f"  # already installed via pipx/uv?  mesh join {code}")
 
 
 def cmd_iam(args):
     cfg = load_config()
+    if args.node == BROADCAST:
+        sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
     if args.node not in cfg["nodes"]:
-        sys.exit(f"error: '{args.node}' not in mesh nodes {cfg['nodes']}")
+        cfg["nodes"].append(args.node)
+        _save_config(cfg)
     with open(node_file(cfg), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
@@ -442,8 +587,9 @@ def cmd_send(args):
     sender = my_node(cfg, args.as_node)
     to = args.to
     if to != BROADCAST and to not in cfg["nodes"]:
-        sys.exit(f"error: unknown recipient '{to}' (nodes: {cfg['nodes']} "
-                 f"or '{BROADCAST}')")
+        print(f"note: never seen '{to}' — sending anyway (topics are "
+              f"name-derived; `mesh status` lists known nodes)",
+              file=sys.stderr)
     if to == sender:
         sys.exit("error: refusing to send to self")
     msg = " ".join(args.message)
@@ -455,27 +601,55 @@ def cmd_send(args):
     print(f"sent to {to} (id {resp.get('id', '?')}){enc}: {msg}")
 
 
-def _stream_once(cfg, tpc, since, deadline, skip=()):
-    """Long-poll topic(s) until a message not in `skip` arrives or deadline
-    passes. Returns the message dict, or None on timeout."""
-    while time.time() < deadline:
-        chunk = min(300, max(5, int(deadline - time.time())))
-        url = f"{cfg['server']}/{tpc}/json?since={since}"
+def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
+    """Yield ntfy message events from `tpc` until `deadline` (None = forever).
+
+    Dedupes via the shared, mutated `skip` set; advances `since` internally
+    so reconnects don't replay; backs off 1s→2s→…→30s only when connections
+    die fast (<5s). `first` is an optional already-open response consumed
+    before dialing — callers can subscribe before triggering traffic."""
+    skip = skip if skip is not None else set()
+    backoff = 1
+    while deadline is None or time.time() < deadline:
+        chunk = (300 if deadline is None
+                 else min(300, max(5, int(deadline - time.time()))))
+        started = time.time()
         try:
-            with http(url, timeout=chunk) as r:
+            r = first
+            first = None
+            if r is None:
+                r = http(f"{cfg['server']}/{tpc}/json?since={since}",
+                         timeout=chunk)
+            with r:
                 for raw in r:
                     try:
                         ev = json.loads(raw.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
-                    if (ev.get("event") == "message"
-                            and ev.get("id") not in skip):
-                        return ev
-                    if time.time() >= deadline:
-                        return None
-        except (urllib.error.URLError, socket.timeout, TimeoutError):
-            pass  # chunk expired or connection dropped — reconnect
-    return None
+                    if ev.get("event") != "message":
+                        backoff = 1  # keepalives prove the link is healthy
+                        if deadline and time.time() >= deadline:
+                            return
+                        continue
+                    backoff = 1
+                    t = str(ev.get("time", since))
+                    if t != since:
+                        skip.clear()  # new second — older ids can't replay
+                        since = t
+                    if ev.get("id") in skip:
+                        continue
+                    skip.add(ev.get("id"))
+                    yield ev
+                    if deadline and time.time() >= deadline:
+                        return
+        except (urllib.error.URLError, socket.timeout, TimeoutError,
+                ConnectionError):
+            pass
+        if time.time() - started < 5:
+            time.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 30)
+        else:
+            backoff = 1
 
 
 def _load_cursor(cf):
@@ -489,40 +663,9 @@ def _load_cursor(cf):
         return int(time.time()) - 5, []
 
 
-def cmd_watch(args):
-    cfg = load_config()
-    me = my_node(cfg, args.as_node)
-    # subscribe to own inbox AND the broadcast topic in one stream
-    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-    cf = cursor_file(cfg, me)
-    since, seen = _load_cursor(cf)
-    deadline = time.time() + args.timeout
-    skip = set(seen)
-    while True:
-        ev = _stream_once(cfg, tpc, str(since), deadline, skip=skip)
-        if ev is None:
-            print(f"MESH_TIMEOUT: no message for '{me}' in {args.timeout}s")
-            sys.exit(0)
-        frm, body, trusted = _open(ev, cfg)
-        env = _parse_envelope(body) if trusted else None
-        if trusted and frm != me:
-            break  # a real message from someone else
-        # own echo, unauthenticated, or undecryptable — skip, keep waiting
-        skip.add(ev.get("id"))
-        t = int(ev.get("time", time.time()))
-        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
-        since = t
-        with open(cf, "w", encoding="utf-8") as f:
-            json.dump({"since": t, "seen": seen[-50:]}, f)
-        if not trusted and body != "":
-            print(f"MESH_WARN: dropped unauthenticated message "
-                  f"id={ev.get('id')}", file=sys.stderr)
-    # cursor: resume from this message's second; remember ids seen in that
-    # second so re-delivery on the boundary is filtered, not re-consumed
-    t = int(ev.get("time", time.time()))
-    seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
-    with open(cf, "w", encoding="utf-8") as f:
-        json.dump({"since": t, "seen": seen[-50:]}, f)
+def _emit_message(cfg, me, frm, body, ev):
+    """Print one inbound message or task (shared by one-shot and --follow)."""
+    env = _parse_envelope(body)
     if env:
         kind, task_id, ctx, state, efrm, text = envelope_summary(env)
         frm = efrm or frm
@@ -537,11 +680,90 @@ def cmd_watch(args):
         else:
             print(f"MESH_TASK_UPDATE from={frm} task={task_id} "
                   f"state={state}: {text}")
-        print(json.dumps(env))
-        return
-    print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
-    print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
-                      "time": ev.get("time")}))
+        print(json.dumps(env), flush=True)
+    else:
+        print(f"MESH_MESSAGE from={frm!r} to={me}: {body}")
+        print(json.dumps({"from": frm, "message": body, "id": ev.get("id"),
+                          "time": ev.get("time")}), flush=True)
+
+
+def _stream_open(cfg, tpc, since, timeout):
+    """Eagerly open a subscribe stream (pass as `first=` to _stream_events).
+    Lets callers be listening BEFORE they trigger the traffic they await."""
+    return http(f"{cfg['server']}/{tpc}/json?since={since}", timeout=timeout)
+
+
+def _handle_control(cfg, me, frm, ctl):
+    """React to an announce/ping/pong control message.
+    Returns an agent-facing stdout line, or None (control chatter never
+    surfaces as MESH_MESSAGE and never wakes an agent, except the rare and
+    useful MESH_NODE_JOINED)."""
+    kind = ctl.get("mw")
+    if kind == "announce":
+        note_peer(cfg, frm, "announce")
+        return f"MESH_NODE_JOINED node={frm}"
+    if kind == "ping":
+        note_peer(cfg, frm, "message")
+        try:
+            send_raw(cfg, me, frm, "pong",
+                     ctl={"mw": "pong", "n": ctl.get("n"),
+                          "ts": ctl.get("ts")})
+            print(f"MESH_PING from={frm} (answered)", file=sys.stderr)
+        except (urllib.error.URLError, socket.timeout):
+            print(f"MESH_PING from={frm} (pong send failed)",
+                  file=sys.stderr)
+        return None
+    if kind == "pong":
+        note_peer(cfg, frm, "pong")
+        return None
+    print(f"MESH_CTL from={frm} kind={kind!r} (ignored)", file=sys.stderr)
+    return None
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    # subscribe to own inbox AND the broadcast topic in one stream
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    cf = cursor_file(cfg, me)
+    since, seen = _load_cursor(cf)
+    skip = set(seen)
+    timeout = args.timeout or (None if args.follow else 10800)
+    deadline = (time.time() + timeout) if timeout else None
+
+    def save_cursor(ev):
+        # resume from this message's second; remember ids seen in that second
+        # so re-delivery on the boundary is filtered, not re-consumed
+        nonlocal since, seen
+        t = int(ev.get("time", time.time()))
+        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
+        since = t
+        with open(cf, "w", encoding="utf-8") as f:
+            json.dump({"since": t, "seen": seen[-50:]}, f)
+
+    delivered = False
+    for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        save_cursor(ev)
+        if not trusted:
+            if body != "":
+                print(f"MESH_WARN: dropped unauthenticated message "
+                      f"id={ev.get('id')}", file=sys.stderr)
+            continue
+        if frm == me:
+            continue  # own echo (e.g. broadcast)
+        if ctl:
+            line = _handle_control(cfg, me, frm, ctl)
+            if line:
+                print(line, flush=True)
+            continue
+        note_peer(cfg, frm, "message")
+        _emit_message(cfg, me, frm, body, ev)
+        delivered = True
+        if not args.follow:
+            return
+    if not delivered:
+        print(f"MESH_TIMEOUT: no message for '{me}' in {timeout}s")
 
 
 def cmd_peek(args):
@@ -559,8 +781,12 @@ def cmd_peek(args):
         print(f"(no messages for '{node}' since {args.since})")
     for m in msgs:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
-        frm, text, trusted = _open(m, cfg)
+        frm, text, trusted, ctl = _open(m, cfg)
+        if trusted and frm:
+            note_peer(cfg, frm, "message")
         mark = "" if trusted else " [UNVERIFIED]"
+        if ctl:
+            mark += f" [control:{ctl.get('mw')}]"
         print(f"[{ts}] {frm or m.get('title', '')}{mark}: {text}")
 
 
@@ -571,35 +797,81 @@ def cmd_status(args):
         me = my_node(cfg, args.as_node)
     except SystemExit:
         pass
+    peers = load_peers(cfg)
     print(f"mesh:   {cfg['mesh']}")
     print(f"server: {cfg['server']}")
-    print(f"nodes:  {', '.join(cfg['nodes'])}")
+    print("nodes:")
+    for n in cfg["nodes"]:
+        if n == me:
+            print(f"  {n}  (this machine)")
+        elif n in peers:
+            print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
+                  f"via {peers[n]['via']})")
+        else:
+            print(f"  {n}  (never seen)")
     print(f"me:     {me or '(unset — run `mesh iam <node>`)'}")
     print(f"config: {cfg['_path']}")
     if me:
         print(f"topic:  {topic(cfg, me)}")
 
 
-def _await_result(cfg, me, task_id, timeout):
-    """Long-poll own inbox for a result envelope matching task_id, using an
+def cmd_ping(args):
+    cfg = load_config()
+    if not cfg.get("key"):
+        sys.exit("error: ping needs an encrypted mesh (create one with a "
+                 "current `mesh init`)")
+    me = my_node(cfg, args.as_node)
+    to = args.node
+    if to == me or to == BROADCAST:
+        sys.exit("error: ping one other node")
+    nonce = secrets.token_hex(8)
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    first = None
+    try:  # subscribe BEFORE sending so the pong can't slip past us
+        first = _stream_open(cfg, tpc, str(int(time.time()) - 5),
+                             min(args.timeout, 300))
+    except (urllib.error.URLError, socket.timeout):
+        pass  # _stream_events will dial on its own
+    t0 = time.monotonic()
+    try:
+        send_raw(cfg, me, to, "ping",
+                 ctl={"mw": "ping", "n": nonce, "ts": time.time()})
+    except (urllib.error.URLError, socket.timeout) as e:
+        sys.exit(f"error: ping send failed: {e}")
+    deadline = time.time() + args.timeout
+    for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
+                             first=first):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        if not trusted or not ctl:
+            continue
+        if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
+            rtt = int((time.monotonic() - t0) * 1000)
+            note_peer(cfg, frm or to, "pong")
+            print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
+            return
+    print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s — no watcher "
+          f"running there, or offline", file=sys.stderr)
+    sys.exit(1)
+
+
+def _await_result(cfg, me, task_id, timeout, first=None):
+    """Stream own inbox for a result envelope matching task_id, using an
     ephemeral cursor (does not disturb `mesh watch`'s cursor)."""
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-    since = str(int(time.time()) - 5)
     deadline = time.time() + timeout
-    skip = set()
-    while time.time() < deadline:
-        ev = _stream_once(cfg, tpc, since, deadline, skip=skip)
-        if ev is None:
-            return None
-        skip.add(ev.get("id"))
-        _, body, trusted = _open(ev, cfg)
-        env = _parse_envelope(body) if trusted else None
+    for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
+                             first=first):
+        frm, body, trusted, ctl = _open(ev, cfg)
+        if not trusted or ctl:
+            continue
+        note_peer(cfg, frm, "message")
+        env = _parse_envelope(body)
         if not env:
             continue
-        kind, tid, ctx, state, frm, text = envelope_summary(env)
+        kind, tid, ctx, state, efrm, text = envelope_summary(env)
         if tid == task_id and kind == "result":
-            save_task(cfg, tid, contextId=ctx, state=state, peer=frm,
-                      direction="outbound", result=text)
+            save_task(cfg, tid, contextId=ctx, state=state,
+                      peer=efrm or frm, direction="outbound", result=text)
             return env
     return None
 
@@ -608,12 +880,24 @@ def cmd_ask(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
     to = args.to
-    if to not in cfg["nodes"] or to == me:
-        sys.exit(f"error: recipient must be another node in {cfg['nodes']}")
+    if to == me:
+        sys.exit("error: refusing to ask self")
+    if to == BROADCAST:
+        sys.exit("error: tasks go to a single node, not 'all'")
+    if to not in cfg["nodes"]:
+        print(f"note: never seen '{to}' — sending anyway", file=sys.stderr)
     text = " ".join(args.text)
     env = make_send_envelope(me, to, text)
     task_id = env["params"]["message"]["taskId"]
     ctx = env["params"]["message"]["contextId"]
+    first = None
+    if args.wait:
+        tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        try:  # be listening before the question ships
+            first = _stream_open(cfg, tpc, str(int(time.time()) - 5),
+                                 min(args.wait, 300))
+        except (urllib.error.URLError, socket.timeout):
+            pass
     try:
         send_raw(cfg, me, to, json.dumps(env),
                  title=f"{cfg['mesh']}: a2a {me} -> {to}")
@@ -626,7 +910,7 @@ def cmd_ask(args):
         print(f"  check later: mesh tasks get {task_id}")
         return
     print(f"  waiting up to {args.wait}s for a reply...")
-    result = _await_result(cfg, me, task_id, args.wait)
+    result = _await_result(cfg, me, task_id, args.wait, first=first)
     if result is None:
         print(f"MESH_TASK_PENDING task={task_id} (no reply yet — "
               f"`mesh tasks get {task_id}` later)")
@@ -832,7 +1116,7 @@ def cmd_a2a_serve(args):
     peers = [n for n in cfg["nodes"] if n != me]
     print(f"a2a bridge for mesh '{cfg['mesh']}' as node '{me}' on "
           f"http://{args.host}:{args.port}")
-    print(f"  agent card:    /.well-known/agent-card.json")
+    print("  agent card:    /.well-known/agent-card.json")
     for n in peers:
         print(f"  remote agent:  /agents/{n}  "
               f"(card: /agents/{n}/.well-known/agent-card.json)")
@@ -850,16 +1134,19 @@ CLAUDE_SNIPPET = """\
 This project uses meshwire (https://github.com/husker/meshwire) to link
 agent sessions on different machines. Protocol:
 
-1. Substantive content (results, requests, code) travels via the shared repo:
-   commit + push, addressed in commit messages or a designated doc.
-2. After pushing something the other machine should act on, ping it:
+1. Keep a PERSISTENT watcher running as a BACKGROUND task:
+   `python3 mesh.py watch --follow`
+   Every MESH_MESSAGE / MESH_TASK line it prints is a message arriving now —
+   read it and act on it. If the watcher task dies, restart it.
+2. Substantive content (results, requests, code) travels via the shared repo
+   when there is one: commit + push, then ping:
    `python3 mesh.py send <node|all> "one-line summary — pull"`.
-3. To receive pings instantly, keep `python3 mesh.py watch` running as a
-   BACKGROUND task. When it exits with MESH_MESSAGE, pull the repo, read what
-   changed, act on it, and re-arm the watcher (run `mesh watch` in the
-   background again).
-4. Never put secrets or real content in a ping — topics are capability URLs
-   on a public ntfy server. Pings say "look", the repo says "what".
+3. To delegate work: `mesh ask <node> "do X" --wait 120`. To answer a
+   MESH_TASK line: `mesh reply <task-id> "<result>"`.
+4. `mesh ping <node>` checks a machine is listening (prints RTT; answered
+   automatically — no agent needed on the far side).
+5. Never put secrets in a message: E2E-encrypted, but messages are requests
+   between machines, not a secrets channel.
 
 This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 """
@@ -873,14 +1160,17 @@ def main():
     ap = argparse.ArgumentParser(
         prog="mesh",
         description="Zero-infrastructure messaging between AI agent sessions "
-                    "on different machines (ntfy.sh wake pings + your shared "
-                    "repo as the payload channel).")
+                    "on different machines: E2E-encrypted messages and A2A "
+                    "tasks over an ntfy relay, no server, no open ports.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="create a mesh in the current directory")
     p.add_argument("name", help="short mesh name (letters/digits/dashes)")
-    p.add_argument("--nodes", required=True,
-                   help="comma-separated node names, e.g. laptop,desktop")
+    p.add_argument("--as", dest="as_node", default=None,
+                   help="this machine's node name (default: hostname)")
+    p.add_argument("--nodes", default=None,
+                   help="optional comma-separated seed list of node names "
+                        "(machines can always join later with the code)")
     p.add_argument("--server", default="https://ntfy.sh",
                    help="ntfy server (default: https://ntfy.sh; self-host "
                         "for private traffic)")
@@ -907,10 +1197,14 @@ def main():
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("watch",
-                       help="block until a ping arrives for this node, print "
-                            "it, exit (run as a background task)")
-    p.add_argument("--timeout", type=int, default=10800,
-                   help="max seconds to wait (default 10800 = 3h)")
+                       help="receive messages: --follow streams forever "
+                            "(preferred, run as a background task); without "
+                            "it, print one message and exit")
+    p.add_argument("--follow", action="store_true",
+                   help="keep streaming — print every message as it arrives")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="max seconds to wait (one-shot default 10800 = 3h; "
+                        "--follow default: forever)")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
 
@@ -926,6 +1220,13 @@ def main():
     p = sub.add_parser("status", help="show mesh config and this node")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("ping", help="liveness + round-trip time to a node "
+                                    "(answered automatically by watchers)")
+    p.add_argument("node")
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_ping)
 
     p = sub.add_parser("ask", help="send an A2A task to another node")
     p.add_argument("to")
