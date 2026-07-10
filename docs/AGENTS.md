@@ -12,38 +12,29 @@ mesh reply <task-id> "answer"   # answer a task you received
 Below: how to wire that into specific harnesses.
 
 ## Claude Code (Linux/mac/Windows)
-The native fit — with one rule: `--follow` only wakes the session if it
-runs under the **Monitor tool** (streams each printed line as a
-notification). A plain background Bash task notifies on *exit* only, and a
-`--follow` watcher never exits — the session would go dark. No line-streaming
-facility? Use the one-shot loop: `mesh watch --timeout 5400` in the
-background; on completion, act, re-arm. Add the protocol to CLAUDE.md
-(`mesh claude-setup` prints it). Answer `MESH_TASK` lines with `mesh reply`.
+Install the meshwire plugin. Its asynchronous `Stop` hook waits in the
+background and uses `asyncRewake` to wake the same Claude session when a real
+message arrives. It then re-arms after Claude handles the message. No Monitor
+task or manual watcher is needed.
 
 ## Codex CLI (OpenAI) / "ChatGPT on my MacBook"
-The ChatGPT desktop app can't run persistent shell commands, but **Codex CLI**
-(the same account/models, terminal-based) can. Easiest: install the plugin —
-`codex plugin marketplace add husker/meshwire`, then add "meshwire" from the
-plugin directory; it teaches sessions the same mesh-agent skill Claude Code
-uses. Without the plugin, two options:
-- Interactive: tell Codex "run `python3 mesh.py watch --timeout 300`, act on
-  what arrives, reply with `mesh reply`, repeat."
-- Scripted: wrap it —
-  ```bash
-  while true; do
-    OUT=$(python3 mesh.py watch --timeout 3600 | tail -1) || continue
-    echo "$OUT" | grep -q '"method": "message/send"' || continue
-    TID=$(echo "$OUT" | python3 -c "import json,sys;print(json.load(sys.stdin)['params']['message']['taskId'])")
-    Q=$(echo "$OUT"   | python3 -c "import json,sys;print(json.load(sys.stdin)['params']['message']['parts'][0]['text'])")
-    A=$(codex exec "$Q")            # non-interactive Codex run
-    python3 mesh.py reply "$TID" "$A"
-  done
-  ```
+Install the plugin with `codex plugin marketplace add husker/meshwire`, then
+enable "meshwire". Its `Stop` hook waits for one message and converts a real
+arrival into a continuation prompt in the same Codex task. It never starts a
+new Codex agent.
 
 ## GitHub Copilot CLI (Windows/mac/Linux)
-Same wrapper shape with `copilot -p "$Q"` (or `gh copilot` suggest/explain for
-older versions). On Windows, run it in Git Bash or adapt to PowerShell —
-mesh.py itself is identical on Windows.
+Install the marketplace and plugin:
+
+```bash
+copilot plugin marketplace add husker/meshwire
+copilot plugin install meshwire@meshwire
+```
+
+Its `agentStop` hook waits for one message and forces a continuation in the
+same interactive Copilot CLI session. Both Bash and PowerShell hook commands
+are bundled. Copilot cloud agent is intentionally excluded because it is an
+ephemeral, non-interactive job rather than a persistent local session.
 
 ## Gemini CLI
 Same wrapper with `gemini -p "$Q"`.

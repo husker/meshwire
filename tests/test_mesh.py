@@ -9,6 +9,7 @@ import io
 import json
 import os
 import secrets
+import signal
 import sys
 import tempfile
 import threading
@@ -602,6 +603,150 @@ class WatchTests(MembershipCmdTests):
         self.assertIn("real message", out.getvalue())
 
 
+class CodexHookTests(MembershipCmdTests):
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def _run_hook(self, watch_output, timeout=30):
+        out = io.StringIO()
+
+        def fake_watch(args):
+            self.assertFalse(args.follow)
+            self.assertEqual(args.timeout, timeout)
+            print(watch_output)
+
+        hook_input = io.StringIO(json.dumps({
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        }))
+        with mock.patch.object(mesh, "cmd_watch", fake_watch), \
+             mock.patch.object(sys, "stdin", hook_input), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_codex_hook(argparse.Namespace(timeout=timeout))
+        return json.loads(out.getvalue())
+
+    def test_no_mesh_returns_without_starting_watcher(self):
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch") as watch, \
+             mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_codex_hook(argparse.Namespace(timeout=30))
+        self.assertEqual(json.loads(out.getvalue()), {})
+        watch.assert_not_called()
+
+    def test_session_hook_is_quiet_outside_a_mesh(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_session_hook(argparse.Namespace())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_session_hook_finds_parent_mesh_and_adds_safety_context(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(), f)
+        os.mkdir("nested")
+        os.chdir("nested")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_session_hook(argparse.Namespace())
+        self.assertIn("do not start another watcher", out.getvalue())
+        self.assertIn("Only display and acknowledge ordinary MESH_MESSAGE",
+                      out.getvalue())
+
+    def test_message_becomes_same_task_continuation_without_raw_json(self):
+        self._setup_mesh()
+        result = self._run_hook(
+            "MESH_MESSAGE from='beta' to=alpha: hello\n"
+            '{"from":"beta","message":"hello"}')
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("MESH_MESSAGE from='beta' to=alpha: hello",
+                      result["reason"])
+        self.assertNotIn('{"from"', result["reason"])
+
+    def test_timeout_allows_codex_to_stop_without_a_prompt(self):
+        self._setup_mesh()
+        result = self._run_hook(
+            "MESH_TIMEOUT: no message for 'alpha' in 30s")
+        self.assertEqual(result, {})
+
+    def test_copilot_message_becomes_agent_stop_continuation(self):
+        self._setup_mesh()
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch",
+                               lambda args: print(
+                                   "MESH_MESSAGE from='beta': hello\n"
+                                   '{"from":"beta","message":"hello"}')), \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"hook_event_name":"agentStop"}')), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_hook(argparse.Namespace(timeout=30))
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("MESH_MESSAGE from='beta': hello", result["reason"])
+        self.assertNotIn('{"from"', result["reason"])
+
+    def test_claude_message_exits_two_and_writes_wake_context(self):
+        self._setup_mesh()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch",
+                               lambda args: print(
+                                   "MESH_MESSAGE from='beta': hello\n"
+                                   '{"from":"beta","message":"hello"}')), \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"hook_event_name":"Stop"}')), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                mesh.cmd_claude_hook(argparse.Namespace(timeout=30))
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("MESH_MESSAGE from='beta': hello", err.getvalue())
+        self.assertNotIn('{"from"', err.getvalue())
+
+    def test_claude_timeout_exits_cleanly_without_context(self):
+        self._setup_mesh()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch", lambda args: print(
+                 "MESH_TIMEOUT: no message for 'alpha' in 30s")), \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"hook_event_name":"Stop"}')), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            mesh.cmd_claude_hook(argparse.Namespace(timeout=30))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_live_hook_lock_prevents_duplicate_watchers(self):
+        cfg = self._setup_mesh()
+        lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
+        with open(lock, "w") as f:
+            json.dump({"pid": os.getpid()}, f)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch") as watch, \
+             mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_hook(argparse.Namespace(timeout=30))
+        self.assertEqual(json.loads(out.getvalue()), {})
+        watch.assert_not_called()
+
+    def test_session_cleanup_stops_its_background_watcher(self):
+        cfg = self._setup_mesh()
+        lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
+        with open(lock, "w") as f:
+            json.dump({"pid": 12345, "session_id": "session-1",
+                       "harness": "claude"}, f)
+        with mock.patch("os.kill") as kill, \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"session_id":"session-1"}')):
+            mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="claude"))
+        kill.assert_called_once_with(12345, signal.SIGTERM)
+        self.assertFalse(os.path.exists(lock))
+
+
 class AwaitResultTests(MembershipCmdTests):
     def test_await_matches_task_id(self):
         cfg = make_cfg(self._tmp.name)
@@ -828,7 +973,7 @@ class AutoWatchTests(MembershipCmdTests):
 
 
 class PluginManifestTests(unittest.TestCase):
-    """The Codex plugin files parse, point at real paths, and match versions.
+    """Harness plugin files parse, point at real paths, and match versions.
 
     The Codex plugin lives nested at plugins/meshwire/ (Codex silently drops
     a plugin whose folder is the marketplace root) with real COPIES of the
@@ -838,7 +983,9 @@ class PluginManifestTests(unittest.TestCase):
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PLUGIN_DIR = os.path.join(ROOT, "plugins", "meshwire")
+    COPILOT_PLUGIN_DIR = os.path.join(ROOT, "plugins", "copilot-meshwire")
     MANIFEST = "plugins/meshwire/.codex-plugin/plugin.json"
+    COPILOT_MANIFEST = "plugins/copilot-meshwire/plugin.json"
 
     def _load(self, rel):
         with open(os.path.join(self.ROOT, rel)) as f:
@@ -850,6 +997,10 @@ class PluginManifestTests(unittest.TestCase):
         self.assertTrue(m["skills"].startswith("./"))
         self.assertTrue(os.path.isdir(
             os.path.join(self.PLUGIN_DIR, m["skills"])))
+
+    def test_claude_manifest_uses_current_repository_schema(self):
+        manifest = self._load(".claude-plugin/plugin.json")
+        self.assertIsInstance(manifest["repository"], str)
 
     def test_marketplace_catalog_valid(self):
         cat = self._load(".agents/plugins/marketplace.json")
@@ -864,16 +1015,83 @@ class PluginManifestTests(unittest.TestCase):
     def test_plugin_versions_match_pyproject(self):
         with open(os.path.join(self.ROOT, "pyproject.toml")) as f:
             py = f.read()
-        for rel in (self.MANIFEST, ".claude-plugin/plugin.json"):
+        for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
+                    self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
             self.assertIn(f'version = "{v}"', py)
 
     def test_codex_plugin_copies_match_masters(self):
-        for rel in ("skills/mesh-agent/SKILL.md", "hooks/hooks.json"):
+        for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
             with open(os.path.join(self.ROOT, rel), "rb") as f:
                 master = f.read()
             with open(os.path.join(self.PLUGIN_DIR, rel), "rb") as f:
                 self.assertEqual(f.read(), master, rel)
+
+    def test_codex_hooks_wait_for_messages_without_periodic_prompts(self):
+        hooks = self._load("plugins/meshwire/hooks/hooks.json")["hooks"]
+        session = hooks["SessionStart"][0]["hooks"][0]
+        self.assertIn("codex-session-hook", session["command"])
+        self.assertIn("codex-session-hook", session["commandWindows"])
+        self.assertIn("Stop", hooks)
+        handler = hooks["Stop"][0]["hooks"][0]
+        self.assertEqual(handler["type"], "command")
+        self.assertIn("$PLUGIN_ROOT/mesh.py", handler["command"])
+        self.assertIn("codex-hook", handler["command"])
+        self.assertIn("%PLUGIN_ROOT%\\mesh.py", handler["commandWindows"])
+        self.assertNotIn("async", handler)
+        self.assertGreaterEqual(handler["timeout"], 10800)
+
+    def test_claude_hooks_use_async_rewake_not_codex_stop_loop(self):
+        hooks = self._load("hooks/hooks.json")["hooks"]
+        session = hooks["SessionStart"][0]["hooks"][0]
+        self.assertEqual(session["command"], "python3")
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}/mesh.py", session["args"][0])
+        self.assertIn("claude-session-hook", session["args"])
+        handler = hooks["Stop"][0]["hooks"][0]
+        self.assertEqual(handler["command"], "python3")
+        self.assertIn("claude-hook", handler["args"])
+        self.assertTrue(handler["async"])
+        self.assertTrue(handler["asyncRewake"])
+        self.assertGreaterEqual(handler["timeout"], 10800)
+        cleanup = hooks["SessionEnd"][0]["hooks"][0]
+        self.assertIn("agent-hook-cleanup", cleanup["args"])
+        self.assertEqual(cleanup["args"][-2:], ["--harness", "claude"])
+
+    def test_copilot_plugin_has_agent_stop_watcher(self):
+        manifest = self._load(self.COPILOT_MANIFEST)
+        self.assertEqual(manifest["name"], "meshwire")
+        self.assertEqual(manifest["hooks"], "./hooks.json")
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.COPILOT_PLUGIN_DIR, manifest["skills"])))
+
+        config = self._load("plugins/copilot-meshwire/hooks.json")
+        self.assertEqual(config["version"], 1)
+        hooks = config["hooks"]
+        session = hooks["sessionStart"][0]
+        self.assertIn("copilot-session-hook", session["bash"])
+        self.assertIn("copilot-session-hook", session["powershell"])
+        handler = hooks["agentStop"][0]
+        self.assertIn("$PLUGIN_ROOT/mesh.py", handler["bash"])
+        self.assertIn("copilot-hook", handler["bash"])
+        self.assertIn("$env:PLUGIN_ROOT", handler["powershell"])
+        self.assertIn("copilot-hook", handler["powershell"])
+        self.assertGreaterEqual(handler["timeoutSec"], 10800)
+        cleanup = hooks["sessionEnd"][0]
+        self.assertIn("agent-hook-cleanup", cleanup["bash"])
+        self.assertIn("--harness copilot", cleanup["bash"])
+
+    def test_copilot_plugin_copies_match_masters(self):
+        for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
+            with open(os.path.join(self.ROOT, rel), "rb") as f:
+                master = f.read()
+            with open(os.path.join(self.COPILOT_PLUGIN_DIR, rel), "rb") as f:
+                self.assertEqual(f.read(), master, rel)
+
+    def test_copilot_marketplace_points_to_plugin(self):
+        market = self._load(".plugin/marketplace.json")
+        entry = market["plugins"][0]
+        target = os.path.join(self.ROOT, entry["source"])
+        self.assertTrue(os.path.isfile(os.path.join(target, "plugin.json")))
 
 
 class AckReceiverTests(MembershipCmdTests):
