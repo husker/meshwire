@@ -698,15 +698,18 @@ class AutoWatchTests(MembershipCmdTests):
     def test_init_flows_into_watcher_in_terminal(self):
         calls = []
         out = io.StringIO()
+
+        def fake_watch(a):
+            calls.append((a, os.path.isfile(".meshwire.json")))
+
         with mock.patch.object(mesh, "_interactive", lambda: True), \
-             mock.patch.object(mesh, "cmd_watch",
-                               lambda a: calls.append(a)), \
+             mock.patch.object(mesh, "cmd_watch", fake_watch), \
              contextlib.redirect_stdout(out):
             mesh.cmd_init(self._init_ns())
-        self.assertTrue(os.path.isfile(".meshwire.json"))  # setup first
+        self.assertTrue(calls[0][1])  # config existed when watching began
         self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0].follow)
-        self.assertIsNone(calls[0].timeout)
+        self.assertTrue(calls[0][0].follow)
+        self.assertIsNone(calls[0][0].timeout)
         self.assertIn("Ctrl-C to stop", out.getvalue())
         # a terminal user can't run `mesh invite` anymore — init must
         # print the paste block itself before watching
@@ -748,7 +751,7 @@ class AutoWatchTests(MembershipCmdTests):
         self.assertNotIn("watch --follow", out.getvalue())
         self.assertIn("python3 mesh.py join mesh1-", out.getvalue())
 
-    def test_main_exits_zero_on_ctrl_c(self):
+    def test_main_exits_130_on_ctrl_c(self):
         def boom(a):
             raise KeyboardInterrupt
         out = io.StringIO()
@@ -757,7 +760,7 @@ class AutoWatchTests(MembershipCmdTests):
              contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit) as cm:
                 mesh.main()
-        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(cm.exception.code, 130)
 
 
 if __name__ == "__main__":

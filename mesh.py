@@ -1301,8 +1301,8 @@ def main():
     try:
         args.fn(args)
     except KeyboardInterrupt:
-        print()
-        sys.exit(0)
+        print(file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

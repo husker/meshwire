@@ -15,7 +15,7 @@ pipx install git+https://github.com/husker/meshwire   # or: uv tool install ...
 mesh init home   # prints a block to paste on machine B, then starts listening
 ```
 
-**Machine B** — paste the block `mesh invite` printed. It looks like:
+**Machine B** — paste the block `mesh init` printed. It looks like:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
