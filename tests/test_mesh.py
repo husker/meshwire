@@ -3,6 +3,7 @@
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -62,6 +63,37 @@ class JoinCodeTests(unittest.TestCase):
     def test_garbage_code_exits(self):
         with self.assertRaises(SystemExit):
             mesh.parse_join_code("garbage")
+
+    def test_rejects_internal_fields(self):
+        payload = {
+            "mesh": "home",
+            "id": "i1",
+            "key": "aa" * 32,
+            "server": "https://ntfy.example",
+            "nodes": [],
+            "_path": "victim.json",
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        code = "mesh1-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        with self.assertRaises(SystemExit):
+            mesh.parse_join_code(code)
+
+
+class ConfigPermissionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_config_is_0600_after_create_and_rewrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            old_umask = os.umask(0o022)
+            try:
+                mesh._save_config(cfg)
+                self.assertEqual(os.stat(cfg["_path"]).st_mode & 0o777, 0o600)
+                os.chmod(cfg["_path"], 0o600)
+                cfg["nodes"].append("gamma")
+                mesh._save_config(cfg)
+                self.assertEqual(os.stat(cfg["_path"]).st_mode & 0o777, 0o600)
+            finally:
+                os.umask(old_umask)
 
 
 class EnvelopeTests(unittest.TestCase):
@@ -358,7 +390,7 @@ class SendStatusInviteTests(MembershipCmdTests):
                                lambda *a, **k: sent.append(a) or {"id": "1"}), \
              contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             mesh.cmd_send(argparse.Namespace(to="gamma", message=["hi"],
-                                             as_node=None))
+                                             as_node=None, no_wait=True))
         self.assertEqual(len(sent), 1)
         self.assertIn("never seen 'gamma'", err.getvalue())
 
@@ -366,7 +398,7 @@ class SendStatusInviteTests(MembershipCmdTests):
         self._write_cfg()
         with self.assertRaises(SystemExit):
             mesh.cmd_send(argparse.Namespace(to="alpha", message=["hi"],
-                                             as_node=None))
+                                             as_node=None, no_wait=True))
 
     def test_ask_to_broadcast_errors(self):
         self._write_cfg()
@@ -501,6 +533,7 @@ class WatchTests(MembershipCmdTests):
         evs = [self._msg_event(cfg, "beta", "hello there", "m1", 200)]
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
              contextlib.redirect_stdout(out):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
@@ -511,16 +544,47 @@ class WatchTests(MembershipCmdTests):
 
     def test_follow_delivers_multiple_messages(self):
         cfg = self._setup_mesh()
-        evs = [self._msg_event(cfg, "beta", "one", "m1", 200),
-               self._msg_event(cfg, "beta", "two", "m2", 201)]
+        evs = [self._msg_event(cfg, "beta", "same", "m1", 200),
+               self._msg_event(cfg, "beta", "same", "m2", 201)]
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
              mock.patch("time.sleep"), contextlib.redirect_stdout(out):
             self.assertRaises(_TestDone, mesh.cmd_watch,
                               argparse.Namespace(timeout=None, as_node=None,
                                                  follow=True))
-        self.assertIn("one", out.getvalue())
-        self.assertIn("two", out.getvalue())
+        self.assertEqual(out.getvalue().count("message\": \"same"), 2)
+
+    def test_replayed_ciphertext_is_emitted_once(self):
+        cfg = self._setup_mesh()
+        original = self._msg_event(cfg, "beta", "deploy", "m1", 200)
+        replay = dict(original, id="m2", time=201)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([original, replay])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertEqual(out.getvalue().count("MESH_MESSAGE from='beta'"), 1)
+
+    def test_replay_is_suppressed_after_watcher_restart(self):
+        cfg = self._setup_mesh()
+        original = self._msg_event(cfg, "beta", "deploy", "m1", 200)
+        replay = dict(original, id="m2", time=201)
+        with mock.patch.object(mesh, "http", fake_stream([original])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([replay])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertNotIn("MESH_MESSAGE from='beta'", out.getvalue())
 
     def test_control_message_does_not_consume_one_shot(self):
         cfg = self._setup_mesh()
@@ -810,6 +874,224 @@ class PluginManifestTests(unittest.TestCase):
                 master = f.read()
             with open(os.path.join(self.PLUGIN_DIR, rel), "rb") as f:
                 self.assertEqual(f.read(), master, rel)
+
+
+class AckReceiverTests(MembershipCmdTests):
+    """Watchers ack what they receive; nothing else does."""
+
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def _msg_event(self, cfg, frm, body, eid, t, ctl=None):
+        payload = {"f": frm, "t": "alpha", "b": body}
+        if ctl:
+            payload["c"] = ctl
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(payload))}
+
+    def test_watch_acks_before_emitting(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "hello", "m77", 500)]
+        order = []
+
+        def fake_send(c, s, t, b, title=None, ctl=None):
+            order.append(("ack", ctl))
+            return {"id": "x"}
+
+        def fake_emit(c, me, frm, body, ev):
+            order.append(("emit", ev.get("id")))
+
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw", fake_send), \
+             mock.patch.object(mesh, "_emit_message", fake_emit), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77"}),
+                                 ("emit", "m77")])
+
+    def test_watch_does_not_ack_controls_or_own_echo(self):
+        cfg = self._setup_mesh()
+        pong = self._msg_event(cfg, "beta", "pong", "c1", 500,
+                               ctl={"mw": "pong", "n": "x"})
+        own = self._msg_event(cfg, "alpha", "mine", "c2", 501)
+        real = self._msg_event(cfg, "beta", "real", "c3", 502)
+        sent = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([pong, own, real])), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda c, s, t, b, title=None, ctl=None:
+                               sent.append(ctl) or {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        # exactly one ack — for the real message only
+        self.assertEqual(sent, [{"mw": "ack", "of": "c3"}])
+
+    def test_watch_survives_ack_send_failure(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "hello", "m1", 500)]
+
+        def boom(*a, **k):
+            raise urllib.error.URLError("relay down")
+
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw", boom), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertIn("MESH_MESSAGE from='beta' to=alpha: hello",
+                      out.getvalue())
+
+    def test_peek_does_not_ack(self):
+        cfg = self._setup_mesh()
+        wire = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "hi"}))
+        ev = json.dumps({"event": "message", "id": "p1", "time": 100,
+                         "message": wire, "title": "t"})
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return (ev + "\n").encode()
+
+        sent = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", lambda *a, **k: R()), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: sent.append(1) or {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_peek(argparse.Namespace(node=None, since="all",
+                                             as_node=None))
+        self.assertEqual(sent, [])
+
+    def test_handle_control_ack_notes_peer_silently(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            out = mesh._handle_control(cfg, "alpha", "beta",
+                                       {"mw": "ack", "of": "m1"})
+            self.assertIsNone(out)
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "ack")
+
+    def test_plaintext_mesh_watch_does_not_ack(self):
+        cfg = make_cfg(key=False)
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        ev = {"event": "message", "id": "p1", "time": 500, "message": "hi",
+              "title": "t: beta -> alpha"}
+        sent = []
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream([ev])), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: sent.append(1) or {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertEqual(sent, [])
+
+
+class AckSenderTests(MembershipCmdTests):
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    def _ack_event(self, cfg, frm, of, eid, t):
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(
+                    {"f": frm, "t": "alpha", "b": "ack",
+                     "c": {"mw": "ack", "of": of}}))}
+
+    def test_send_prints_delivered_on_ack(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "msg9", "a1", 600)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msg9"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertRegex(out.getvalue(), r"delivered to beta \(\d+ms\)")
+
+    def test_send_ignores_wrong_of_and_reports_no_ack(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "OTHER", "a1", 600)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msg9"}), \
+             mock.patch.object(mesh, "ACK_WAIT", 0), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("no ack yet", out.getvalue())
+
+    def test_send_no_wait_skips_subscribe(self):
+        self._setup_mesh()
+        out = io.StringIO()
+
+        def no_dial(*a, **k):
+            raise AssertionError("subscribed despite --no-wait")
+
+        with mock.patch.object(mesh, "http", no_dial), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m1"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=True))
+        self.assertIn("sent to beta", out.getvalue())
+        self.assertNotIn("delivered", out.getvalue())
+
+    def test_broadcast_lists_all_ackers(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "msgB", "a1", 600),
+               self._ack_event(cfg, "gamma", "msgB", "a2", 601)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "msgB"}), \
+             mock.patch.object(mesh, "ACK_WAIT", 1), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="all", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("acked by: beta, gamma", out.getvalue())
+
+    def test_plaintext_mesh_sends_like_today(self):
+        cfg = make_cfg(key=False)
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        out = io.StringIO()
+
+        def no_dial(*a, **k):
+            raise AssertionError("plaintext mesh must not subscribe")
+
+        with mock.patch.object(mesh, "http", no_dial), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m1"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             as_node=None, no_wait=False))
+        self.assertIn("sent to beta", out.getvalue())
 
 
 if __name__ == "__main__":
