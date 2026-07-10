@@ -30,7 +30,7 @@ Machine A prints `MESH_NODE_JOINED` the moment B joins.
 
 ```bash
 mesh send all "hello mesh"     # B's watcher prints it about a second later
-mesh ping <b-name>             # → MESH_PONG node=<b-name> rtt=~800ms  <!-- SMOKE -->
+mesh ping <b-name>             # → MESH_PONG node=<b-name> rtt=~600ms
 mesh ask <b-name> "run the tests and summarize failures" --wait 300
 ```
 
@@ -159,7 +159,7 @@ mesh claude-setup              print the CLAUDE.md protocol section
 | | meshwire | shared MCP queue | SSH + headless agent | plain git polling |
 |---|---|---|---|---|
 | Infrastructure | none | server to run | SSH + reachable host | none |
-| Wake latency | ~1 s <!-- SMOKE --> | poll interval | seconds | poll interval |
+| Wake latency | ~1 s | poll interval | seconds | poll interval |
 | Payload channel | message or your repo | the queue | the SSH pipe | your repo |
 | Audit trail | git history | custom | none | git history |
 | N nodes | yes | yes | pairwise | yes |
