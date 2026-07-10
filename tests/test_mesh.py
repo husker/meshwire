@@ -10,6 +10,7 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from unittest import mock
@@ -603,6 +604,55 @@ class AskOrderTests(MembershipCmdTests):
             mesh.cmd_ask(argparse.Namespace(to="beta", text=["hi"], wait=5,
                                             as_node=None))
         self.assertEqual(order, ["open", "send"])
+
+
+class _FakeConn:
+    instances = []
+
+    def __init__(self, netloc, timeout=None):
+        _FakeConn.instances.append(self)
+        self.paths = []
+        self.fail_next = False
+
+    def request(self, method, path, body=None, headers=None):
+        if self.fail_next:
+            self.fail_next = False
+            raise ConnectionError("dropped")
+        self.paths.append(path)
+
+    def getresponse(self):
+        class R:
+            status = 200
+
+            def read(self):
+                return b'{"id": "ok"}'
+        return R()
+
+    def close(self):
+        pass
+
+
+class PostReuseTests(unittest.TestCase):
+    def setUp(self):
+        _FakeConn.instances = []
+        mesh._LOCAL = threading.local()  # fresh per-thread cache
+
+    def test_reuses_one_connection_across_sends(self):
+        cfg = make_cfg()
+        with mock.patch("mesh.HTTPSConnection", _FakeConn):
+            mesh._post(cfg, "tp1", b"a", {})
+            mesh._post(cfg, "tp2", b"b", {})
+        self.assertEqual(len(_FakeConn.instances), 1)
+        self.assertEqual(len(_FakeConn.instances[0].paths), 2)
+
+    def test_retries_once_on_dropped_connection(self):
+        cfg = make_cfg()
+        with mock.patch("mesh.HTTPSConnection", _FakeConn):
+            mesh._post(cfg, "tp1", b"a", {})
+            _FakeConn.instances[0].fail_next = True
+            out = mesh._post(cfg, "tp2", b"b", {})
+        self.assertEqual(out, {"id": "ok"})
+        self.assertEqual(len(_FakeConn.instances), 2)  # reconnected once
 
 
 if __name__ == "__main__":

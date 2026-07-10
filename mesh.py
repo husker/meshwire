@@ -29,8 +29,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".meshwire.json"
@@ -402,12 +404,46 @@ def envelope_summary(env):
             meta.get("from"), text)
 
 
+_LOCAL = threading.local()  # per-thread keep-alive conns (a2a-serve threads)
+
+
 def _post(cfg, tpc, data, headers):
-    """POST a message to the relay. (Transport seam — kept trivial here;
-    connection reuse lands behind this same signature.)"""
-    url = f"{cfg['server']}/{tpc}"
-    with http(url, data=data, headers=headers) as r:
-        return json.load(r)
+    """POST to the relay, reusing one keep-alive connection per server —
+    saves a TLS handshake (~0.3-0.5s) on every send after the first."""
+    u = urllib.parse.urlsplit(cfg["server"])
+    conns = getattr(_LOCAL, "conns", None)
+    if conns is None:
+        conns = _LOCAL.conns = {}
+    key = (u.scheme, u.netloc)
+    err = None
+    for attempt in (1, 2):
+        conn = conns.get(key)
+        if conn is None:
+            cls = (HTTPSConnection if u.scheme == "https"
+                   else HTTPConnection)
+            conn = conns[key] = cls(u.netloc, timeout=15)
+        try:
+            h = dict(headers)
+            h.setdefault("User-Agent", USER_AGENT)
+            conn.request("POST", f"{u.path}/{tpc}", body=data, headers=h)
+            resp = conn.getresponse()
+            out = resp.read()
+            if resp.status >= 400:
+                raise urllib.error.HTTPError(
+                    f"{cfg['server']}/{tpc}", resp.status,
+                    out.decode("utf-8", "replace")[:200], None, None)
+            return json.loads(out)
+        except urllib.error.HTTPError:
+            raise  # a real relay answer — do not retry, do not rewrap
+        except (HTTPException, ConnectionError, socket.timeout,
+                OSError) as e:
+            err = e
+            conns.pop(key, None)
+            try:
+                conn.close()
+            except Exception:
+                pass
+    raise urllib.error.URLError(f"send failed after retry: {err}")
 
 
 def send_raw(cfg, sender, to, body, title=None, ctl=None):
