@@ -620,27 +620,65 @@ class WatchTests(MembershipCmdTests):
         self.assertIn("MESH_MESSAGE from='beta' to=alpha: later message",
                       out.getvalue())
 
-    def test_diagnostic_before_delivery_does_not_override_terminal_marker(self):
-        cfg = self._setup_mesh()
+    def _diagnostic_events(self, cfg):
         env = mesh.make_send_envelope("beta", "alpha", "run tests")
         env["params"]["message"]["taskId"] = "invalid task id"
-        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
-               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        return [
+            self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
+            self._msg_event(cfg, "beta", "ping", "m2", 201,
+                            ctl={"mw": "ping", "n": "n1"}),
+            self._msg_event(cfg, "beta", "future", "m3", 202,
+                            ctl={"mw": "future"}),
+        ]
+
+    def _assert_all_diagnostics_before(self, lines, terminal):
+        terminal_index = lines.index(terminal)
+        for marker in ("MESH_WARN:", "MESH_PING ", "MESH_CTL "):
+            positions = [i for i, line in enumerate(lines)
+                         if line.startswith(marker)]
+            self.assertTrue(positions, (marker, lines))
+            self.assertLess(positions[0], terminal_index, (marker, lines))
+
+    def test_finite_stream_diagnostics_end_in_delivery_only(self):
+        cfg = self._setup_mesh()
+        evs = self._diagnostic_events(cfg)
+        evs.append(self._msg_event(cfg, "beta", "real message", "m4", 203))
         combined = io.StringIO()
-        with mock.patch.object(mesh, "http", fake_stream(evs)), \
-             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "x"}), \
              contextlib.redirect_stdout(combined), \
              contextlib.redirect_stderr(combined):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         lines = combined.getvalue().splitlines()
-        self.assertTrue(lines[0].startswith("MESH_WARN:"), lines)
         terminal = [line for line in lines if line.startswith((
             "MESH_MESSAGE ", "MESH_TASK ", "MESH_TASK_UPDATE ",
             "MESH_NODE_JOINED ", "MESH_TIMEOUT:",
         ))]
         self.assertEqual(terminal,
                          ["MESH_MESSAGE from='beta' to=alpha: real message"])
+        self._assert_all_diagnostics_before(lines, terminal[0])
+
+    def test_finite_stream_diagnostics_end_in_timeout_only(self):
+        cfg = self._setup_mesh()
+        evs = self._diagnostic_events(cfg)
+        combined = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)), \
+             mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(combined), \
+             contextlib.redirect_stderr(combined):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        lines = combined.getvalue().splitlines()
+        terminal = [line for line in lines if line.startswith((
+            "MESH_MESSAGE ", "MESH_TASK ", "MESH_TASK_UPDATE ",
+            "MESH_NODE_JOINED ", "MESH_TIMEOUT:",
+        ))]
+        self.assertEqual(terminal,
+                         ["MESH_TIMEOUT: no message for 'alpha' in 60s"])
+        self._assert_all_diagnostics_before(lines, terminal[0])
 
     def test_replayed_ciphertext_is_emitted_once(self):
         cfg = self._setup_mesh()
@@ -857,7 +895,7 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn('mode="async"', context)
         self.assertIn("detach=false", context)
         self.assertIn("retain the returned shell ID", context)
-        self.assertIn("On exit 0, use the final recognized stdout marker",
+        self.assertIn("On exit 0, select the final recognized stdout marker",
                       context)
         for marker in ("MESH_MESSAGE", "MESH_TASK", "MESH_TASK_UPDATE",
                        "MESH_NODE_JOINED", "MESH_TIMEOUT"):
@@ -869,6 +907,18 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn("Exit 0 with no recognized final marker", context)
         self.assertIn("nonzero process exit", context)
         self.assertIn("report once and stop", context)
+        self.assertIn("first read and fully handle the delivery", context)
+        self.assertIn("including attempting the task reply for MESH_TASK",
+                      context)
+        self.assertIn("only then re-arm exactly one watcher", context)
+        select = context.index("final recognized stdout marker")
+        handle = context.index("first read and fully handle the delivery")
+        reply = context.index("including attempting the task reply for "
+                              "MESH_TASK")
+        rearm = context.index("only then re-arm exactly one watcher")
+        self.assertLess(select, handle)
+        self.assertLess(handle, reply)
+        self.assertLess(reply, rearm)
         command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
         self.assertEqual(
             __import__("shlex").split(command),
@@ -1313,11 +1363,23 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("Exit 0 with no recognized final marker", text)
         self.assertIn("nonzero process exit", text)
         self.assertIn("report once and stop", text)
+        self.assertIn("first read and fully handle the delivery", text)
+        self.assertIn("including attempting the task reply for `MESH_TASK`",
+                      text)
+        self.assertIn("only then re-arm exactly one watcher", text)
+        select = text.index("final recognized stdout marker")
+        handle = text.index("first read and fully handle the delivery")
+        reply = text.index("including attempting the task reply for "
+                           "`MESH_TASK`")
+        rearm = text.index("only then re-arm exactly one watcher")
+        self.assertLess(select, handle)
+        self.assertLess(handle, reply)
+        self.assertLess(reply, rearm)
 
     def test_user_docs_qualify_copilot_rearm_failures(self):
         expected = (
             "Launch denial or a nonzero process exit: report once and stop. "
-            "On exit 0, use the final recognized stdout marker."
+            "On exit 0, select the final recognized stdout marker."
         )
         diagnostics = (
             "Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are "
@@ -1331,6 +1393,18 @@ class PluginManifestTests(unittest.TestCase):
                 self.assertIn(diagnostics, text)
                 self.assertIn("Exit 0 with no recognized final marker: report "
                               "once and stop.", text)
+                self.assertIn("first read and fully handle the delivery", text)
+                self.assertIn("including attempting the task reply for "
+                              "`MESH_TASK`", text)
+                self.assertIn("only then re-arm exactly one watcher", text)
+                select = text.index("final recognized stdout marker")
+                handle = text.index("first read and fully handle the delivery")
+                reply = text.index("including attempting the task reply for "
+                                   "`MESH_TASK`")
+                rearm = text.index("only then re-arm exactly one watcher")
+                self.assertLess(select, handle)
+                self.assertLess(handle, reply)
+                self.assertLess(reply, rearm)
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):

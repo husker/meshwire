@@ -34,10 +34,12 @@ copilot plugin install meshwire@meshwire
 Its short `sessionStart` hook injects the exact bundled watcher command. The
 current Copilot session launches it through the shell tool in async,
 non-detached mode and handles native background-shell completion. Launch denial
-or a nonzero process exit: report once and stop. On exit 0, use the final
-recognized stdout marker. Re-arm for `MESH_MESSAGE`, `MESH_TASK`,
-`MESH_TASK_UPDATE`, `MESH_NODE_JOINED`, or `MESH_TIMEOUT`, silently for
-`MESH_TIMEOUT`. Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are
+or a nonzero process exit: report once and stop. On exit 0, select the final
+recognized stdout marker. For `MESH_MESSAGE`, `MESH_TASK`, `MESH_TASK_UPDATE`,
+or `MESH_NODE_JOINED`, first read and fully handle the delivery under the
+Meshwire skill, including attempting the task reply for `MESH_TASK`; only then
+re-arm exactly one watcher; re-arm silently for `MESH_TIMEOUT`. Earlier
+`MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are
 nonfatal diagnostics and do not override a later terminal marker. Exit 0 with
 no recognized final marker: report once and stop. No synchronous lifecycle hook
 waits for network traffic, and no second Copilot process is started. Copilot
