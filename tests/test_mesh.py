@@ -716,6 +716,32 @@ class WatchTests(MembershipCmdTests):
                    "message": {"not": "text"}}
         self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
 
+    def test_plaintext_non_string_titles_are_dropped_before_untitled_delivery(self):
+        for title in ([": ", " -> "], {": ": True, " -> ": True}, 7,
+                      None):
+            with self.subTest(title=title):
+                cfg = make_cfg(key=False)
+                with open(".meshwire.json", "w") as f:
+                    json.dump(cfg, f)
+                with open(".meshwire.node", "w") as f:
+                    f.write("alpha\n")
+                invalid = {"event": "message", "id": "bad-title",
+                           "time": 200, "message": "hidden",
+                           "title": title}
+                valid = {"event": "message", "id": "valid", "time": 201,
+                         "message": "real message"}
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(
+                        mesh, "_stream_events",
+                        return_value=iter([invalid, valid])), \
+                     contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(err):
+                    mesh.cmd_watch(argparse.Namespace(
+                        timeout=60, as_node=None, follow=False))
+                self.assertNotIn("hidden", out.getvalue())
+                self.assertIn("real message", out.getvalue())
+                self._assert_trusted_watch_done(out.getvalue(), "message")
+
     def test_non_object_relay_event_is_dropped_before_valid_delivery(self):
         cfg = self._setup_mesh()
         self._assert_invalid_event_precedes_valid_delivery(

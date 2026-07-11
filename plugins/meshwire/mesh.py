@@ -385,6 +385,8 @@ def _open_with_fingerprint(ev, cfg):
         return None, "", False, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
+    if "title" in ev and not isinstance(title, str):
+        return None, "", False, None, None
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
