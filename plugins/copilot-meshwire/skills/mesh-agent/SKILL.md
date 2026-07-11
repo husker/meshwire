@@ -25,9 +25,10 @@ if not installed as a command).
    - Claude Code or Codex with the meshwire plugin: do not start another watcher.
      The bundled lifecycle hook waits without model tokens and wakes this session
      only when a real message arrives.
-   - Copilot CLI with the meshwire plugin: do nothing manually. The plugin runs
-     the watcher as an MCP server (`mesh mcp-serve`) that Copilot starts with the
-     session and stops when it ends. When a message arrives it wakes this idle
+   - Copilot CLI with the meshwire plugin: after a one-time `mesh copilot-setup`
+     in the project, do nothing manually. That pins the watcher as an MCP server
+     (`mesh mcp-serve`) that Copilot starts with the session and stops when it
+     ends. When a message arrives it wakes this idle
      session on its own (via MCP sampling) and tells you to call the `mesh_pending`
      tool: read the deliveries, handle each (for a `MESH_TASK` do the work and
      answer with the `mesh_reply` tool; for a `MESH_MESSAGE` note it), and send

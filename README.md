@@ -54,12 +54,14 @@ codex plugin add meshwire@meshwire
 # GitHub Copilot CLI
 copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
+mesh copilot-setup            # once per project — pins the watcher to this node
 ```
 
 Each plugin loads the mesh safety rules at session start. Claude uses
 asynchronous `Stop` with `asyncRewake`; Codex uses `Stop`. Copilot runs the
-watcher as an **MCP server** (`mesh mcp-serve`, declared in the plugin) that
-Copilot starts with the session and stops when it ends — including Ctrl-C and
+watcher as an **MCP server** (`mesh mcp-serve`, wired per project by
+`mesh copilot-setup` — see below) that Copilot starts with the session and
+stops when it ends — including Ctrl-C and
 crash. Because it isn't an agent shell, the session shows no "working" spinner
 while it listens. When a message arrives the server wakes the idle session on
 its own (via MCP sampling) and the session handles it with the `mesh_pending`
@@ -70,7 +72,10 @@ server for sampling; approve it and later wakes run silently.)
 The loop each session runs:
 
 1. With the plugin, follow the harness-specific setup above. Claude and Codex
-   need no manual watcher; Copilot's MCP-server watcher listens and wakes the
+   need no manual watcher; on Copilot, run `mesh copilot-setup` once in the
+   project (Copilot hands a plugin MCP server no project info and there's no
+   portable way to guess it, so this pins the node in a workspace
+   `.github/mcp.json`). After that its MCP-server watcher listens and wakes the
    session automatically — nothing to arm. Handling happens out of band (no
    "working" spinner); the next prompt you send opens with a one-line note of
    anything meshwire handled while you were away.
@@ -84,8 +89,9 @@ broadcasts. `mesh claude-setup` prints a CLAUDE.md section with the same
 protocol for projects that don't use the plugin — **if you use the plugin,
 skip it**. (You still run `mesh init`/`mesh join` once per machine either
 way: the plugin teaches sessions the protocol, it doesn't create the mesh.
-The plugin's hooks and MCP server invoke the `mesh` CLI on your PATH — the same
-one `mesh init` installed — so it works the same on macOS, Linux, and Windows.
+On Copilot you also run `mesh copilot-setup` once per project. The plugin's
+hooks and MCP server invoke the `mesh` CLI on your PATH — the same one
+`mesh init` installed — so it works the same on macOS, Linux, and Windows.
 Keep it current: `pipx upgrade meshwire` (or `uv tool upgrade meshwire`) when
 you update the plugin.)
 

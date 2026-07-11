@@ -693,21 +693,25 @@ def cmd_init(args):
     _watch_if_interactive()
 
 
-def _ensure_gitignore(dirpath):
-    # keep secrets and per-machine files out of version control
-    gi_lines = [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
-                ".meshwire.replay-*", TASKS_NAME, PEERS_NAME]
+def _gitignore_add(dirpath, lines):
+    """Append any of `lines` not already present to dirpath/.gitignore."""
     gi = os.path.join(dirpath, ".gitignore")
     existing = ""
     if os.path.isfile(gi):
         with open(gi, "r", encoding="utf-8") as f:
             existing = f.read()
-    add = [l for l in gi_lines if l not in existing.splitlines()]
+    add = [l for l in lines if l not in existing.splitlines()]
     if add:
         with open(gi, "a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
             f.write("\n".join(add) + "\n")
+
+
+def _ensure_gitignore(dirpath):
+    # keep secrets and per-machine files out of version control
+    _gitignore_add(dirpath, [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
+                             ".meshwire.replay-*", TASKS_NAME, PEERS_NAME])
 
 
 def _write_config_here(cfg):
@@ -1575,29 +1579,13 @@ def _mcp_idle_serve():
     _mcp_stdin_loop(handle)
 
 
-def _parent_working_dir():
-    """Best-effort cwd of our parent process. Copilot spawns plugin MCP servers
-    with cwd=plugin dir and a stripped env, but Copilot itself runs in the
-    project, so its cwd locates the mesh node."""
-    try:
-        import subprocess
-        ppid = os.getppid()
-        out = subprocess.run(
-            ["lsof", "-a", "-p", str(ppid), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, timeout=3).stdout
-        for line in out.splitlines():
-            if line.startswith("n"):
-                d = line[1:].strip()
-                if d and os.path.isdir(d):
-                    return d
-    except Exception:
-        return None
-    return None
-
-
 def _mcp_config_path(args):
     """Locate the mesh node config for the MCP server, in order: an explicit
-    --config, COPILOT_PROJECT_DIR, the parent (Copilot) process cwd, then cwd."""
+    --config (what `mesh copilot-setup` pins in the project's .github/mcp.json),
+    then COPILOT_PROJECT_DIR, then cwd. Copilot hands a plugin MCP server no
+    project info — no MCP roots, a stripped env, and cwd = the plugin dir — and
+    there is no portable (Windows-included) way to read the parent's cwd, so the
+    pinned --config is the reliable cross-platform route."""
     explicit = getattr(args, "config", None)
     if explicit:
         p = os.path.abspath(explicit)
@@ -1607,11 +1595,6 @@ def _mcp_config_path(args):
         p = find_config(env)
         if p:
             return p, "COPILOT_PROJECT_DIR"
-    parent = _parent_working_dir()
-    if parent:
-        p = find_config(parent)
-        if p:
-            return p, f"parent cwd {parent}"
     return find_config(), "cwd"
 
 
@@ -1620,8 +1603,8 @@ def cmd_mcp_serve(args):
     path, how = _mcp_config_path(args)
     if not path:
         print(f"meshwire mcp-serve: no mesh node found (tried {how}; "
-              f"cwd={os.getcwd()} ppid={os.getppid()}); idle",
-              file=sys.stderr)
+              f"cwd={os.getcwd()}); idle. Run `mesh copilot-setup` in your "
+              f"project to pin it.", file=sys.stderr)
         _mcp_idle_serve()
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -1672,6 +1655,51 @@ def cmd_copilot_activity(args):
         "this happened, then answer their prompt."
     )
     print(json.dumps({"additionalContext": context}))
+
+
+def cmd_copilot_setup(args):
+    """Wire the Copilot MCP-server watcher for this project by writing a
+    workspace .github/mcp.json that launches `mesh mcp-serve` with an explicit
+    --config. Copilot passes a plugin MCP server no project info, so we pin the
+    path here — deterministic and identical on macOS, Linux, and Windows. Run
+    once per project (like `mesh init`/`join` are run once per machine)."""
+    cfg_path = find_config(getattr(args, "dir", None))
+    if not cfg_path:
+        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
+                 f"directory. Run `mesh init` or `mesh join` first.")
+    project = os.path.dirname(cfg_path)
+    gh = os.path.join(project, ".github")
+    os.makedirs(gh, exist_ok=True)
+    mcp_path = os.path.join(gh, "mcp.json")
+    data = {}
+    if os.path.isfile(mcp_path):
+        try:
+            with open(mcp_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["meshwire"] = {
+        "type": "local",
+        "command": "mesh",
+        "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)],
+        "tools": ["*"],
+    }
+    data["mcpServers"] = servers
+    with open(mcp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    # the pinned path is machine-specific; keep it out of version control
+    _gitignore_add(project, [".github/mcp.json"])
+    print(f"Wrote {mcp_path}")
+    print(f"  meshwire watcher pinned to {os.path.abspath(cfg_path)}")
+    print("Start a Copilot session in this project to pick it up. The path is "
+          "machine-specific (added to .gitignore); run `mesh copilot-setup` "
+          "again on each machine and whenever the node moves.")
 
 
 def hook_lock_file(cfg, node):
@@ -2346,6 +2374,13 @@ def main():
 
     p = sub.add_parser("copilot-activity", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_copilot_activity)
+
+    p = sub.add_parser("copilot-setup",
+                       help="wire the Copilot watcher for this project "
+                            "(writes .github/mcp.json)")
+    p.add_argument("--dir", default=None,
+                   help="project dir to set up (default: search from cwd)")
+    p.set_defaults(fn=cmd_copilot_setup)
 
     p = sub.add_parser("agent-hook-cleanup", help=argparse.SUPPRESS)
     p.add_argument("--harness", choices=("claude", "copilot"), required=True)

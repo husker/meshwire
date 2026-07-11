@@ -31,7 +31,13 @@ copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
 ```
 
-The plugin declares an **MCP server** (`mesh mcp-serve`) that Copilot starts
+Run `mesh copilot-setup` once per project. Copilot hands a plugin-declared MCP
+server no project information — no MCP roots, a stripped env, and cwd set to the
+plugin dir — and there is no portable (Windows-included) way to read the parent
+process's cwd, so a plugin-level server can't locate the mesh node. Instead,
+`copilot-setup` writes a workspace `.github/mcp.json` that registers an
+**MCP server** (`mesh mcp-serve --config <abs path>`) pinned to this project's
+node. Copilot starts it
 with the session and stops when it ends — clean exit, Ctrl-C, or crash (the
 server exits on stdin EOF). It is not an agent shell, so no "working" spinner
 shows while it listens. The server holds the mesh connection; when a delivery

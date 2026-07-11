@@ -2052,6 +2052,17 @@ class PluginManifestTests(unittest.TestCase):
         target = os.path.join(self.ROOT, entry["source"])
         self.assertTrue(os.path.isfile(os.path.join(target, "plugin.json")))
 
+    def test_copilot_plugin_declares_no_mcp_server(self):
+        # The watcher is pinned per-project by `mesh copilot-setup` (an explicit
+        # --config in .github/mcp.json), NOT a plugin-level MCP server: a plugin
+        # server outranks the workspace one (verified via `copilot mcp get`) and
+        # Copilot hands it no project info, so it can't find the node on
+        # Windows. See issue #10.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.COPILOT_PLUGIN_DIR, ".mcp.json")),
+            "plugin must not declare an MCP server; copilot-setup pins it")
+        self.assertNotIn("mcpServers", self._load(self.COPILOT_MANIFEST))
+
 
 class AckReceiverTests(MembershipCmdTests):
     """Watchers ack what they receive; nothing else does."""
@@ -2469,6 +2480,66 @@ class MCPServeTests(unittest.TestCase):
                      "text": "pulled the fix"})
         with open(os.path.join(self._tmp.name, ".meshwire.activity")) as f:
             self.assertIn("message from mac-codex", f.read())
+
+
+class CopilotSetupTests(unittest.TestCase):
+    """`mesh copilot-setup` pins the watcher via a workspace .github/mcp.json
+    with an explicit --config — the deterministic, cross-platform route now that
+    the plugin declares no MCP server (issue #10)."""
+
+    def _project(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, ".meshwire.json"), "w") as f:
+            json.dump({"mesh": "t", "id": "x", "server": "https://ntfy.example",
+                       "nodes": ["alpha"], "key": "00"}, f)
+        return tmp.name
+
+    def _run(self, project):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_copilot_setup(argparse.Namespace(dir=project))
+
+    def _mcp(self, project):
+        with open(os.path.join(project, ".github", "mcp.json")) as f:
+            return json.load(f)
+
+    def test_writes_server_with_explicit_abs_config(self):
+        project = self._project()
+        self._run(project)
+        srv = self._mcp(project)["mcpServers"]["meshwire"]
+        self.assertEqual(srv["type"], "local")
+        self.assertEqual(srv["command"], "mesh")
+        self.assertEqual(srv["args"][:2], ["mcp-serve", "--config"])
+        cfg_arg = srv["args"][2]
+        self.assertTrue(os.path.isabs(cfg_arg))
+        self.assertEqual(
+            cfg_arg,
+            os.path.abspath(os.path.join(project, ".meshwire.json")))
+        self.assertEqual(srv["tools"], ["*"])
+
+    def test_gitignores_machine_specific_config(self):
+        project = self._project()
+        self._run(project)
+        with open(os.path.join(project, ".gitignore")) as f:
+            self.assertIn(".github/mcp.json", f.read().splitlines())
+
+    def test_merges_existing_servers(self):
+        project = self._project()
+        gh = os.path.join(project, ".github")
+        os.makedirs(gh)
+        with open(os.path.join(gh, "mcp.json"), "w") as f:
+            json.dump({"mcpServers": {"other": {"type": "local",
+                                                "command": "x"}}}, f)
+        self._run(project)
+        servers = self._mcp(project)["mcpServers"]
+        self.assertIn("other", servers)
+        self.assertIn("meshwire", servers)
+
+    def test_no_mesh_node_errors(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with self.assertRaises(SystemExit):
+            self._run(tmp.name)
 
 
 class CopilotActivityTests(MembershipCmdTests):

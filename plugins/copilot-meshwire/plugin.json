@@ -7,6 +7,5 @@
   },
   "license": "MIT",
   "skills": "skills/",
-  "mcpServers": ".mcp.json",
   "hooks": "hooks.json"
 }
