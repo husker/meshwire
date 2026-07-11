@@ -1527,8 +1527,22 @@ class CodexHookTests(MembershipCmdTests):
              mock.patch.object(sys, "stdin", io.StringIO("{}")), \
              contextlib.redirect_stdout(out):
             mesh.cmd_codex_hook(argparse.Namespace(timeout=30))
-        self.assertEqual(json.loads(out.getvalue()), {})
+        # Not a bare `{}`: Codex rejects that as "invalid stop hook JSON output".
+        self.assertEqual(json.loads(out.getvalue()), {"continue": True})
         watch.assert_not_called()
+
+    def test_hook_emits_valid_json_even_when_inner_logic_raises(self):
+        # A crash must not leave stdout empty / a traceback — Codex would call
+        # that "invalid stop hook JSON output". Emit a valid no-op instead.
+        out, err = io.StringIO(), io.StringIO()
+        boom = mock.Mock(side_effect=RuntimeError("boom"))
+        with mock.patch.object(mesh, "_continuation_hook_result", boom), \
+             mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            mesh.cmd_codex_hook(argparse.Namespace(timeout=30))
+        self.assertEqual(json.loads(out.getvalue()), {"continue": True})
+        self.assertIn("boom", err.getvalue())
 
     def test_session_hook_is_quiet_outside_a_mesh(self):
         out = io.StringIO()
@@ -1566,7 +1580,7 @@ class CodexHookTests(MembershipCmdTests):
         self._setup_mesh()
         result = self._run_hook(
             "MESH_TIMEOUT: no message for 'alpha' in 30s")
-        self.assertEqual(result, {})
+        self.assertEqual(result, {"continue": True})
 
     def test_copilot_message_becomes_agent_stop_continuation(self):
         self._setup_mesh()
@@ -1625,7 +1639,7 @@ class CodexHookTests(MembershipCmdTests):
              mock.patch.object(sys, "stdin", io.StringIO("{}")), \
              contextlib.redirect_stdout(out):
             mesh.cmd_copilot_hook(argparse.Namespace(timeout=30))
-        self.assertEqual(json.loads(out.getvalue()), {})
+        self.assertEqual(json.loads(out.getvalue()), {"continue": True})
         watch.assert_not_called()
 
     def test_session_cleanup_stops_its_background_watcher(self):
@@ -1962,7 +1976,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.10.0")
+        self.assertEqual(release, "0.10.1")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
