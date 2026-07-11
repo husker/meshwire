@@ -29,14 +29,17 @@ if not installed as a command).
      the session-start context and launch its exact watcher command with the shell
      tool in async, non-detached mode and retain the returned shell ID. When Copilot
      reports that shell completed, read its output with that ID. Launch denial or a
-     nonzero process exit: report once and stop. On exit 0, select the final recognized
-     stdout marker. For `MESH_MESSAGE`, `MESH_TASK`, `MESH_TASK_UPDATE`, or
-     `MESH_NODE_JOINED`, first read and fully handle the delivery under the Meshwire
-     skill, including attempting the task reply for `MESH_TASK`; only then re-arm
-     exactly one watcher; re-arm silently for `MESH_TIMEOUT`.
-     Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are nonfatal diagnostics
-     and do not override a later terminal marker. Exit 0 with no recognized final
-     marker: report once and stop. Never detach or run two watchers concurrently.
+     nonzero process exit: report once and stop. On exit 0, decide terminal status
+     only from the final stdout line. It must be exactly one of
+     `MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,
+     `MESH_WATCH_DONE kind=task_update`, `MESH_WATCH_DONE kind=node_joined`, or
+     `MESH_WATCH_DONE kind=timeout`. For `kind=message`, `kind=task`,
+     `kind=task_update`, or `kind=node_joined`, first read and fully handle the
+     delivery from the preceding output under the Meshwire skill, including
+     attempting the task reply for `MESH_TASK`; only then re-arm exactly one watcher;
+     re-arm silently for `kind=timeout`. Earlier diagnostics, human summaries, and
+     raw JSON are non-authoritative. Exit 0 with no valid final `MESH_WATCH_DONE`
+     line: report once and stop. Never detach or run two watchers concurrently.
    - Harness can stream a background command's output as it arrives
      (Claude Code: run it under the **Monitor tool**): use the persistent
      watcher, `mesh watch --follow` — one block per message, never exits;
@@ -63,9 +66,12 @@ if not installed as a command).
 - `MESH_NODE_JOINED node=<n>` — a new machine joined the mesh; it can be
   messaged by that name from now on.
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
+- `MESH_WATCH_DONE kind=...` — trusted one-shot terminal sentinel. It is the
+  final flushed line and is not emitted by `--follow`.
 
 (One-shot mode -- `mesh watch` without `--follow` -- exits after a delivery or
-timeout. In Copilot, apply the exit and marker precedence above.)
+timeout. In Copilot, apply the final-sentinel precedence above; human summaries
+are display data, not terminal status.)
 
 ## Sending
 

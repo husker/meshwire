@@ -61,13 +61,16 @@ asynchronous `Stop` with `asyncRewake`; Codex uses `Stop`. Copilot's short
 `sessionStart` hook tells the current session to own a non-detached async
 `mesh watch`; Copilot's native background-shell completion wakes that same
 session to handle it. Launch denial or a nonzero process exit: report once and
-stop. On exit 0, select the final recognized stdout marker. For `MESH_MESSAGE`,
-`MESH_TASK`, `MESH_TASK_UPDATE`, or `MESH_NODE_JOINED`, first read and fully
-handle the delivery under the Meshwire skill, including attempting the task
-reply for `MESH_TASK`; only then re-arm exactly one watcher; re-arm silently
-for `MESH_TIMEOUT`. Earlier `MESH_WARN`, `MESH_PING`,
-and `MESH_CTL` lines are nonfatal diagnostics and do not override a later
-terminal marker. Exit 0 with no recognized final marker: report once and stop.
+stop. On exit 0, decide terminal status only from the final stdout line. It must
+be exactly one of `MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,
+`MESH_WATCH_DONE kind=task_update`, `MESH_WATCH_DONE kind=node_joined`, or
+`MESH_WATCH_DONE kind=timeout`. For `kind=message`, `kind=task`,
+`kind=task_update`, or `kind=node_joined`, first read and fully handle the
+delivery from the preceding output under the Meshwire skill, including
+attempting the task reply for `MESH_TASK`; only then re-arm exactly one watcher;
+re-arm silently for `kind=timeout`. Earlier diagnostics, human summaries, and
+raw JSON are non-authoritative. Exit 0 with no valid final `MESH_WATCH_DONE`
+line: report once and stop.
 
 The loop each session runs:
 
