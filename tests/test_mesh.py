@@ -1993,34 +1993,41 @@ class PluginManifestTests(unittest.TestCase):
             os.path.join(self.ROOT, ".claude-plugin", "plugin.json")))
 
     def test_codex_plugin_copies_match_masters(self):
-        for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
+        # The plugin runs the `mesh` CLI (not a bundled mesh.py), so only the
+        # skill is a copy that must track the master.
+        for rel in ("skills/mesh-agent/SKILL.md",):
             with open(os.path.join(self.ROOT, rel), "rb") as f:
                 master = f.read()
             with open(os.path.join(self.PLUGIN_DIR, rel), "rb") as f:
                 self.assertEqual(f.read(), master, rel)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.PLUGIN_DIR, "mesh.py")),
+            "plugin should not bundle mesh.py; it invokes the mesh CLI")
 
     def test_codex_hooks_wait_for_messages_without_periodic_prompts(self):
         hooks = self._load("plugins/meshwire/hooks/hooks.json")["hooks"]
         session = hooks["SessionStart"][0]["hooks"][0]
+        # cross-platform: invoke the `mesh` CLI, not python3/py -3
+        self.assertTrue(session["command"].startswith("mesh "))
         self.assertIn("codex-session-hook", session["command"])
         self.assertIn("codex-session-hook", session["commandWindows"])
         self.assertIn("Stop", hooks)
         handler = hooks["Stop"][0]["hooks"][0]
         self.assertEqual(handler["type"], "command")
-        self.assertIn("$PLUGIN_ROOT/mesh.py", handler["command"])
+        self.assertTrue(handler["command"].startswith("mesh "))
         self.assertIn("codex-hook", handler["command"])
-        self.assertIn("%PLUGIN_ROOT%\\mesh.py", handler["commandWindows"])
+        self.assertIn("codex-hook", handler["commandWindows"])
         self.assertNotIn("async", handler)
         self.assertGreaterEqual(handler["timeout"], 10800)
 
     def test_claude_hooks_use_async_rewake_not_codex_stop_loop(self):
         hooks = self._load("hooks/hooks.json")["hooks"]
         session = hooks["SessionStart"][0]["hooks"][0]
-        self.assertEqual(session["command"], "python3")
-        self.assertIn("${CLAUDE_PLUGIN_ROOT}/mesh.py", session["args"][0])
+        # invoke the cross-platform `mesh` CLI, never a bare `python3`
+        self.assertEqual(session["command"], "mesh")
         self.assertIn("claude-session-hook", session["args"])
         handler = hooks["Stop"][0]["hooks"][0]
-        self.assertEqual(handler["command"], "python3")
+        self.assertEqual(handler["command"], "mesh")
         self.assertIn("claude-hook", handler["args"])
         self.assertTrue(handler["async"])
         self.assertTrue(handler["asyncRewake"])
@@ -2030,11 +2037,14 @@ class PluginManifestTests(unittest.TestCase):
         self.assertEqual(cleanup["args"][-2:], ["--harness", "claude"])
 
     def test_copilot_plugin_copies_match_masters(self):
-        for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
+        for rel in ("skills/mesh-agent/SKILL.md",):
             with open(os.path.join(self.ROOT, rel), "rb") as f:
                 master = f.read()
             with open(os.path.join(self.COPILOT_PLUGIN_DIR, rel), "rb") as f:
                 self.assertEqual(f.read(), master, rel)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.COPILOT_PLUGIN_DIR, "mesh.py")),
+            "plugin should not bundle mesh.py; it invokes the mesh CLI")
 
     def test_copilot_marketplace_points_to_plugin(self):
         market = self._load(".plugin/marketplace.json")

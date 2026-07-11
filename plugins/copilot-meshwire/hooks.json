@@ -4,8 +4,8 @@
     "userPromptSubmitted": [
       {
         "type": "command",
-        "bash": "python3 \"${PLUGIN_ROOT}/mesh.py\" copilot-activity",
-        "powershell": "py -3 \"${PLUGIN_ROOT}\\mesh.py\" copilot-activity",
+        "bash": "mesh copilot-activity",
+        "powershell": "mesh copilot-activity",
         "timeoutSec": 10
       }
     ]

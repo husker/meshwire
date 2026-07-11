@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/mesh.py\" codex-session-hook",
-            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\mesh.py\" codex-session-hook"
+            "command": "mesh codex-session-hook",
+            "commandWindows": "mesh codex-session-hook"
           }
         ]
       }
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/mesh.py\" codex-hook --timeout 86370",
-            "commandWindows": "py -3 \"%PLUGIN_ROOT%\\mesh.py\" codex-hook --timeout 86370",
+            "command": "mesh codex-hook --timeout 86370",
+            "commandWindows": "mesh codex-hook --timeout 86370",
             "timeout": 86400,
             "statusMessage": "Waiting for Meshwire messages"
           }

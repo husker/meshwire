@@ -83,7 +83,11 @@ Works with any number of nodes; each node has an inbox topic and `all`
 broadcasts. `mesh claude-setup` prints a CLAUDE.md section with the same
 protocol for projects that don't use the plugin — **if you use the plugin,
 skip it**. (You still run `mesh init`/`mesh join` once per machine either
-way: the plugin teaches sessions the protocol, it doesn't create the mesh.)
+way: the plugin teaches sessions the protocol, it doesn't create the mesh.
+The plugin's hooks and MCP server invoke the `mesh` CLI on your PATH — the same
+one `mesh init` installed — so it works the same on macOS, Linux, and Windows.
+Keep it current: `pipx upgrade meshwire` (or `uv tool upgrade meshwire`) when
+you update the plugin.)
 
 ## How it works
 

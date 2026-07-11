@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/mesh.py", "claude-session-hook"]
+            "command": "mesh",
+            "args": ["claude-session-hook"]
           }
         ]
       }
@@ -18,8 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/mesh.py", "claude-hook", "--timeout", "86370"],
+            "command": "mesh",
+            "args": ["claude-hook", "--timeout", "86370"],
             "timeout": 86400,
             "async": true,
             "asyncRewake": true
@@ -33,8 +33,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/mesh.py", "agent-hook-cleanup", "--harness", "claude"],
+            "command": "mesh",
+            "args": ["agent-hook-cleanup", "--harness", "claude"],
             "timeout": 5
           }
         ]
