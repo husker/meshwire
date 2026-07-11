@@ -50,7 +50,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -1320,6 +1320,17 @@ class MeshMCPServer:
              "inputSchema": {"type": "object", "properties": {
                  "to": {"type": "string"}, "message": {"type": "string"}},
                  "required": ["to", "message"]}},
+            {"name": "mesh_ask",
+             "description": "Delegate an A2A task to another node. The answer "
+                            "comes back later as a pending delivery — poll "
+                            "mesh_pending for it.",
+             "inputSchema": {"type": "object", "properties": {
+                 "to": {"type": "string"}, "text": {"type": "string"}},
+                 "required": ["to", "text"]}},
+            {"name": "mesh_list_agents",
+             "description": "List the nodes known in this mesh, with last-seen "
+                            "times.",
+             "inputSchema": {"type": "object", "properties": {}}},
         ]
 
     def _handle_tool_call(self, mid, params):
@@ -1332,6 +1343,10 @@ class MeshMCPServer:
                 text = self._tool_reply(args)
             elif name == "mesh_send":
                 text = self._tool_send(args)
+            elif name == "mesh_ask":
+                text = self._tool_ask(args)
+            elif name == "mesh_list_agents":
+                text = self._tool_list_agents()
             else:
                 raise ValueError(f"unknown tool {name}")
         except Exception as exc:
@@ -1375,6 +1390,39 @@ class MeshMCPServer:
             raise ValueError("refusing to send to self")
         resp = send_raw(self.cfg, self.me, to, message)
         return f"sent to {to} (id {resp.get('id', '?')})"
+
+    def _tool_ask(self, args):
+        to = args.get("to")
+        text = args.get("text", "")
+        if not to:
+            raise ValueError("missing 'to'")
+        if to == self.me:
+            raise ValueError("refusing to ask self")
+        if to == BROADCAST:
+            raise ValueError("tasks go to a single node, not 'all'")
+        env = make_send_envelope(self.me, to, text)
+        task_id = env["params"]["message"]["taskId"]
+        ctx = env["params"]["message"]["contextId"]
+        send_raw(self.cfg, self.me, to, json.dumps(env),
+                 title=f"{self.cfg['mesh']}: a2a {self.me} -> {to}")
+        save_task(self.cfg, task_id, contextId=ctx, state="submitted",
+                  peer=to, direction="outbound", text=text)
+        return (f"asked {to}: task {task_id}. The answer returns later as a "
+                f"pending delivery — poll mesh_pending.")
+
+    def _tool_list_agents(self):
+        peers = load_peers(self.cfg)
+        rows = []
+        for n in self.cfg.get("nodes", []):
+            if n == self.me:
+                continue
+            p = peers.get(n)
+            rows.append({"node": n,
+                         "last_seen": _ago(p["seen"]) if p else "never",
+                         "via": p.get("via") if p else None})
+        if not rows:
+            return "(no other nodes known yet)"
+        return json.dumps(rows, indent=2)
 
     # -- delivery + sampling wake -------------------------------------------
 
@@ -1598,13 +1646,16 @@ def _mcp_config_path(args):
     return find_config(), "cwd"
 
 
-def cmd_mcp_serve(args):
-    """Run the a2acast watcher as a stdio MCP server (for Copilot)."""
+def _run_mcp_server(args, label, idle_hint):
+    """Run the a2acast node as a stdio MCP server. Shared by `mcp-serve` (the
+    Copilot watcher) and the general `mcp` tool server — the same server backs
+    both. Sampling (idle-session wake) only activates if the MCP client
+    advertises the capability; clients that don't (Claude Desktop, Cursor, …)
+    get plain pull-mode tools and pull deliveries via mesh_pending."""
     path, how = _mcp_config_path(args)
     if not path:
-        print(f"a2acast mcp-serve: no mesh node found (tried {how}; "
-              f"cwd={os.getcwd()}); idle. Run `mesh copilot-setup` in your "
-              f"project to pin it.", file=sys.stderr)
+        print(f"a2acast {label}: no mesh node found (tried {how}; "
+              f"cwd={os.getcwd()}); idle.{idle_hint}", file=sys.stderr)
         _mcp_idle_serve()
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -1612,12 +1663,27 @@ def cmd_mcp_serve(args):
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
     me = my_node(cfg, getattr(args, "as_node", None))
-    print(f"a2acast mcp-serve: watching as node '{me}' ({cfg['_dir']}) "
+    print(f"a2acast {label}: serving as node '{me}' ({cfg['_dir']}) "
           f"via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
     threading.Thread(target=server.watch_loop, daemon=True).start()
     _mcp_stdin_loop(server.handle)
     server._stop.set()
+
+
+def cmd_mcp_serve(args):
+    """Copilot watcher: stdio MCP server that wakes the idle session via
+    sampling. Pinned per project by `mesh copilot-setup`."""
+    _run_mcp_server(args, "mcp-serve",
+                    " Run `mesh copilot-setup` in your project to pin it.")
+
+
+def cmd_mcp(args):
+    """General stdio MCP tool server for any MCP client (Claude Desktop,
+    Cursor, …). Exposes mesh_send / mesh_pending / mesh_ask / mesh_reply /
+    mesh_list_agents as tools."""
+    _run_mcp_server(args, "mcp",
+                    " Pass --config <path to .meshwire.json>.")
 
 
 def cmd_copilot_activity(args):
@@ -2307,6 +2373,92 @@ def cmd_claude_setup(args):
     print(CLAUDE_SNIPPET, end="")
 
 
+_INTEGRATE_GUIDE = """\
+# a2acast — connect this machine to the mesh
+
+1. Install the CLI:
+     pipx install git+https://github.com/husker/a2acast   # or: uv tool install ...
+2. Join a mesh:
+     mesh init <name>     # first machine — prints a join code to paste elsewhere
+     mesh join <code>     # every other machine
+3. Wire your agent to listen and act — pick the route for your harness:
+
+   Plugin (recommended — Claude Code, Codex CLI, Copilot CLI):
+     mesh integrate --format codex        # or copilot
+     mesh integrate --format claude       # CLAUDE.md protocol (no plugin)
+   MCP client (Claude Desktop, Cursor, any MCP host):
+     mesh integrate --format mcp          # prints the MCP server config
+   Any other harness (paste into a system prompt / SKILL.md):
+     mesh integrate --format skill
+
+Talk:
+     mesh send <node|all> "message"
+     mesh ask <node> "do X" --wait 120
+     mesh ping <node>
+Docs: https://github.com/husker/a2acast
+"""
+
+
+def _integrate_harness(harness):
+    if harness == "claude":
+        return CLAUDE_SNIPPET
+    if harness == "codex":
+        return (
+            "# a2acast on Codex CLI\n\n"
+            "codex plugin marketplace add husker/a2acast\n"
+            "codex plugin add a2acast@a2acast\n\n"
+            "The plugin's Stop hook waits for messages and wakes the same Codex "
+            "session\nwhen one arrives — no manual watcher.\n")
+    return (
+        "# a2acast on GitHub Copilot CLI\n\n"
+        "copilot plugin marketplace add husker/a2acast\n"
+        "copilot plugin install a2acast@a2acast\n"
+        "mesh copilot-setup            # once per project — pins the watcher\n\n"
+        "The plugin runs the watcher as an MCP server that Copilot starts with "
+        "the\nsession and wakes when a message arrives — no \"working\" "
+        "spinner.\n")
+
+
+def _integrate_mcp():
+    cfg_path = find_config()
+    path = os.path.abspath(cfg_path) if cfg_path else "/ABS/PATH/.meshwire.json"
+    block = {"mcpServers": {"a2acast": {
+        "command": "mesh", "args": ["mcp", "--config", path]}}}
+    note = "" if cfg_path else (
+        "\n# (no .meshwire.json found here — set the --config path, or run this "
+        "from your mesh project)")
+    return (
+        "# a2acast as an MCP tool server (Claude Desktop, Cursor, any MCP "
+        "host).\n# Add to your MCP client config. Tools: mesh_send, "
+        "mesh_pending (receive),\n# mesh_ask (delegate a task), mesh_reply, "
+        "mesh_list_agents." + note + "\n\n"
+        + json.dumps(block, indent=2) + "\n")
+
+
+def _integrate_skill():
+    return (
+        "---\n"
+        "name: a2acast-agent\n"
+        "description: Exchange messages and A2A tasks with agents on other "
+        "machines via a2acast. Use when the project has a .meshwire.json or the "
+        "user mentions the mesh or sending to another machine.\n"
+        "---\n\n" + CLAUDE_SNIPPET)
+
+
+def cmd_integrate(args):
+    """Print onboarding for a chosen route: an overview, a harness plugin,
+    the MCP server config, the CLAUDE.md snippet, or a skill file."""
+    fmt = getattr(args, "format", None)
+    if fmt in ("claude", "codex", "copilot"):
+        print(_integrate_harness(fmt), end="")
+    elif fmt == "mcp":
+        print(_integrate_mcp(), end="")
+    elif fmt == "skill":
+        print(_integrate_skill(), end="")
+    else:
+        print(_INTEGRATE_GUIDE, end="")
+
+
 
 
 def main():
@@ -2386,6 +2538,22 @@ def main():
     p.add_argument("--config", default=None,
                    help="explicit path to the .meshwire.json to watch")
     p.set_defaults(fn=cmd_mcp_serve)
+
+    p = sub.add_parser("mcp", help="run a stdio MCP tool server for any MCP "
+                                   "client (Claude Desktop, Cursor, …)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.add_argument("--config", default=None,
+                   help="path to the .meshwire.json to serve")
+    p.set_defaults(fn=cmd_mcp)
+
+    p = sub.add_parser("integrate",
+                       help="print setup for a harness or route "
+                            "(--format codex|copilot|claude|mcp|skill)")
+    p.add_argument("--format", dest="format", default=None,
+                   choices=("claude", "codex", "copilot", "mcp", "skill"),
+                   help="a harness plugin, MCP config, CLAUDE.md snippet, or "
+                        "skill file (default: overview)")
+    p.set_defaults(fn=cmd_integrate)
 
     p = sub.add_parser("copilot-activity", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_copilot_activity)

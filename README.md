@@ -193,8 +193,20 @@ mesh card [node] [--name N --description D]   A2A agent card
 mesh a2a-serve [--port 4737] [--wait 60]      localhost A2A HTTP bridge
 mesh peek [node] [--since S]   show recent messages without consuming
 mesh status                    mesh, identity, known peers + last seen
+mesh integrate [--format codex|copilot|claude|mcp|skill]   print setup for a harness/route
+mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude Desktop, Cursor, …)
 mesh claude-setup              print the CLAUDE.md protocol section
 ```
+
+**Onboarding & MCP clients.** `mesh integrate` prints the right setup for
+whatever you run — a harness plugin (`--format codex`/`copilot`), a CLAUDE.md
+snippet (`--format claude`), a paste-in skill (`--format skill`), or the MCP
+config (`--format mcp`). For GUI/desktop agents, `mesh mcp` runs a stdio MCP
+**tool** server (add it with `mesh integrate --format mcp`) exposing
+`mesh_send` / `mesh_pending` / `mesh_ask` / `mesh_reply` / `mesh_list_agents`,
+so Claude Desktop, Cursor, or any MCP host can talk to the mesh — no plugin
+needed. (This is the pull-mode tool server; the Copilot plugin's `mcp-serve`
+is the push-mode watcher that wakes an idle session.)
 
 ## How it compares
 

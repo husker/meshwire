@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "a2acast — encrypted, zero-infrastructure messaging between AI agents on different machines",
-    "version": "0.11.0"
+    "version": "0.12.0"
   },
   "plugins": [
     {
       "name": "a2acast",
       "source": "./",
       "description": "Let this Claude Code session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "author": {
         "name": "James Gagan"
       },

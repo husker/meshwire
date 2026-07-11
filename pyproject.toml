@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a2acast"
-version = "0.11.0"
+version = "0.12.0"
 description = "Zero-infrastructure messaging between AI agent sessions on different machines (ntfy.sh wake pings + your shared repo as the payload channel)"
 readme = "README.md"
 license = { text = "MIT" }

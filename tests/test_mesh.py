@@ -1976,7 +1976,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.11.0")
+        self.assertEqual(release, "0.12.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2346,7 +2346,7 @@ class MCPServeTests(unittest.TestCase):
         self._initialize(srv, out)
         srv.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
         names = {t["name"] for t in self._sent(out)[0]["result"]["tools"]}
-        self.assertEqual(names, {"mesh_pending", "mesh_reply", "mesh_send"})
+        self.assertEqual(names, {"mesh_pending", "mesh_reply", "mesh_send", "mesh_ask", "mesh_list_agents"})
 
     def test_mesh_pending_drains_buffer(self):
         srv, out = self._server()
@@ -2494,6 +2494,89 @@ class MCPServeTests(unittest.TestCase):
                      "text": "pulled the fix"})
         with open(os.path.join(self._tmp.name, ".meshwire.activity")) as f:
             self.assertIn("message from mac-codex", f.read())
+
+    def test_mesh_ask_delegates_a2a_task(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        captured = {}
+
+        def fake_send_raw(cfg, sender, to, body, title=None, ctl=None):
+            captured.update(to=to, body=body)
+            return {"id": "m1"}
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            srv.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                        "params": {"name": "mesh_ask",
+                                   "arguments": {"to": "beta",
+                                                 "text": "run tests"}}})
+        self.assertEqual(captured["to"], "beta")
+        tasks = mesh.load_tasks(srv.cfg)
+        self.assertEqual(len(tasks), 1)
+        tid = next(iter(tasks))
+        self.assertEqual(tasks[tid]["peer"], "beta")
+        self.assertEqual(tasks[tid]["direction"], "outbound")
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        self.assertIn("asked beta", text)
+
+    def test_mesh_ask_rejects_self_and_broadcast(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        for bad in ("alpha", "all"):
+            srv.handle({"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                        "params": {"name": "mesh_ask",
+                                   "arguments": {"to": bad, "text": "x"}}})
+            self.assertTrue(self._sent(out)[-1]["result"].get("isError"))
+
+    def test_mesh_list_agents_reports_peers_excluding_self(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        mesh.note_peer(srv.cfg, "beta", via="message")
+        srv.handle({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                    "params": {"name": "mesh_list_agents", "arguments": {}}})
+        rows = json.loads(self._sent(out)[0]["result"]["content"][0]["text"])
+        names = {r["node"] for r in rows}
+        self.assertIn("beta", names)
+        self.assertNotIn("alpha", names)  # excludes self
+
+
+class IntegrateTests(unittest.TestCase):
+    """`mesh integrate` prints onboarding for each route/harness."""
+
+    def _run(self, fmt=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_integrate(argparse.Namespace(format=fmt))
+        return out.getvalue()
+
+    def test_guide_lists_install_and_routes(self):
+        g = self._run(None)
+        self.assertIn("pipx install", g)
+        self.assertIn("mesh integrate --format", g)
+
+    def test_claude_format_is_the_claude_snippet(self):
+        self.assertEqual(self._run("claude"), mesh.CLAUDE_SNIPPET)
+
+    def test_skill_format_has_frontmatter(self):
+        s = self._run("skill")
+        self.assertIn("name: a2acast-agent", s)
+        self.assertTrue(s.startswith("---\n"))
+
+    def test_codex_format_has_plugin_install(self):
+        self.assertIn("codex plugin marketplace add husker/a2acast",
+                      self._run("codex"))
+
+    def test_copilot_format_has_install_and_setup(self):
+        c = self._run("copilot")
+        self.assertIn("copilot plugin install a2acast@a2acast", c)
+        self.assertIn("mesh copilot-setup", c)
+
+    def test_mcp_format_is_valid_config_pointing_at_mesh_mcp(self):
+        m = self._run("mcp")
+        self.assertIn("mesh_ask", m)
+        block = json.loads(m[m.index("{"):])
+        srv = block["mcpServers"]["a2acast"]
+        self.assertEqual(srv["command"], "mesh")
+        self.assertIn("mcp", srv["args"])
 
 
 class CopilotSetupTests(unittest.TestCase):
