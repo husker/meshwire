@@ -693,6 +693,24 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn("MESH_MESSAGE from='beta': hello", result["reason"])
         self.assertNotIn('{"from"', result["reason"])
 
+    def test_copilot_notification_injects_message_into_idle_session(self):
+        self._setup_mesh()
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch",
+                               lambda args: print(
+                                   "MESH_MESSAGE from='beta': hello\n"
+                                   '{"from":"beta","message":"hello"}')), \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"hook_event_name":"Notification",'
+                 '"notification_type":"agent_idle"}')), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_notification_hook(
+                argparse.Namespace(timeout=30))
+        result = json.loads(out.getvalue())
+        self.assertIn("MESH_MESSAGE from='beta': hello",
+                      result["additionalContext"])
+        self.assertNotIn('{"from"', result["additionalContext"])
+
     def test_claude_message_exits_two_and_writes_wake_context(self):
         self._setup_mesh()
         out, err = io.StringIO(), io.StringIO()
@@ -747,6 +765,18 @@ class CodexHookTests(MembershipCmdTests):
              mock.patch.object(sys, "stdin", io.StringIO(
                  '{"session_id":"session-1"}')):
             mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="claude"))
+        kill.assert_called_once_with(12345, signal.SIGTERM)
+
+    def test_copilot_session_cleanup_accepts_camel_case_session_id(self):
+        cfg = self._setup_mesh()
+        lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
+        with open(lock, "w") as f:
+            json.dump({"pid": 12345, "session_id": "session-1",
+                       "harness": "copilot"}, f)
+        with mock.patch("os.kill") as kill, \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"sessionId":"session-1"}')):
+            mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="copilot"))
         kill.assert_called_once_with(12345, signal.SIGTERM)
         self.assertFalse(os.path.exists(lock))
 
@@ -1061,10 +1091,11 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("agent-hook-cleanup", cleanup["args"])
         self.assertEqual(cleanup["args"][-2:], ["--harness", "claude"])
 
-    def test_copilot_plugin_has_agent_stop_watcher(self):
+    def test_copilot_plugin_has_async_idle_notification_watcher(self):
         manifest = self._load(self.COPILOT_MANIFEST)
         self.assertEqual(manifest["name"], "meshwire")
-        self.assertEqual(manifest["hooks"], "./hooks.json")
+        self.assertEqual(manifest["hooks"], "hooks.json")
+        self.assertEqual(manifest["skills"], "skills/")
         self.assertTrue(os.path.isdir(
             os.path.join(self.COPILOT_PLUGIN_DIR, manifest["skills"])))
 
@@ -1074,11 +1105,13 @@ class PluginManifestTests(unittest.TestCase):
         session = hooks["sessionStart"][0]
         self.assertIn("copilot-session-hook", session["bash"])
         self.assertIn("copilot-session-hook", session["powershell"])
-        handler = hooks["agentStop"][0]
+        self.assertNotIn("agentStop", hooks)
+        handler = hooks["notification"][0]
+        self.assertEqual(handler["matcher"], "agent_idle")
         self.assertIn("${PLUGIN_ROOT}/mesh.py", handler["bash"])
-        self.assertIn("copilot-hook", handler["bash"])
+        self.assertIn("copilot-notification-hook", handler["bash"])
         self.assertIn("${PLUGIN_ROOT}\\mesh.py", handler["powershell"])
-        self.assertIn("copilot-hook", handler["powershell"])
+        self.assertIn("copilot-notification-hook", handler["powershell"])
         self.assertGreaterEqual(handler["timeoutSec"], 10800)
         cleanup = hooks["sessionEnd"][0]
         self.assertIn("agent-hook-cleanup", cleanup["bash"])

@@ -9,11 +9,12 @@
         "timeoutSec": 10
       }
     ],
-    "agentStop": [
+    "notification": [
       {
         "type": "command",
-        "bash": "python3 \"${PLUGIN_ROOT}/mesh.py\" copilot-hook --timeout 86370",
-        "powershell": "py -3 \"${PLUGIN_ROOT}\\mesh.py\" copilot-hook --timeout 86370",
+        "matcher": "agent_idle",
+        "bash": "python3 \"${PLUGIN_ROOT}/mesh.py\" copilot-notification-hook --timeout 86370",
+        "powershell": "py -3 \"${PLUGIN_ROOT}\\mesh.py\" copilot-notification-hook --timeout 86370",
         "timeoutSec": 86400
       }
     ],

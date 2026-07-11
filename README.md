@@ -58,7 +58,9 @@ copilot plugin install meshwire@meshwire
 
 Each plugin loads the mesh safety rules at session start, then waits through
 the harness's native lifecycle hook. Claude uses asynchronous `Stop` with
-`asyncRewake`; Codex uses `Stop`; Copilot CLI uses `agentStop`.
+`asyncRewake`; Codex uses `Stop`; Copilot CLI uses the asynchronous
+`agent_idle` notification hook, whose `additionalContext` can resume an idle
+session without blocking its prompt.
 
 The loop each session runs:
 

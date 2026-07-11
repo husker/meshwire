@@ -31,10 +31,11 @@ copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
 ```
 
-Its `agentStop` hook waits for one message and forces a continuation in the
-same interactive Copilot CLI session. Both Bash and PowerShell hook commands
-are bundled. Copilot cloud agent is intentionally excluded because it is an
-ephemeral, non-interactive job rather than a persistent local session.
+Its asynchronous `agent_idle` notification hook waits for one message and
+injects it as `additionalContext`, which can resume the same idle interactive
+Copilot CLI session without blocking its prompt. Both Bash and PowerShell hook
+commands are bundled. Copilot cloud agent is intentionally excluded because
+it does not run notification hooks.
 
 ## Gemini CLI
 Same wrapper with `gemini -p "$Q"`.
