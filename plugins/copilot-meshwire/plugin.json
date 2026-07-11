@@ -1,6 +1,6 @@
 {
   "name": "meshwire",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "description": "Let this Copilot CLI session exchange encrypted messages and A2A tasks with agents on other machines.",
   "author": {
     "name": "James Gagan"

@@ -27,8 +27,10 @@ if not installed as a command).
      only when a real message arrives.
    - Copilot CLI with the meshwire plugin: during the first normal turn, follow
      the session-start context and launch its exact watcher command with the shell
-     tool in async, non-detached mode and retain the returned shell ID. When Copilot
-     reports that shell completed, read its output with that ID. Launch denial or a
+     tool in async, non-detached mode, retain the returned shell ID, then end your
+     turn so the session goes idle — do not block reading it. Copilot's
+     shell-completion notification hook wakes this session when the watcher
+     finishes; only then read its output with that ID. Launch denial or a
      nonzero process exit: report once and stop. On exit 0, decide terminal status
      only from the final stdout line. It must be exactly one of
      `MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,

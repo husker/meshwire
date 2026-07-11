@@ -1544,25 +1544,50 @@ class CodexHookTests(MembershipCmdTests):
 
         result = json.loads(out.getvalue())
         context = result["additionalContext"]
+        # The session hook only ARMS the watcher and hands the turn back so
+        # the session goes idle; the completion notification hook carries the
+        # read/handle/re-arm logic.
         self.assertIn('mode="async"', context)
         self.assertIn("detach=false", context)
         self.assertIn("retain the returned shell ID", context)
+        self.assertIn("end your turn", context)
+        self.assertIn("Do not read the shell", context)
+        self.assertIn("wakes this session when the watcher completes", context)
+        # Handling instructions must NOT be here (they would make the model
+        # block on read_bash and keep the session busy).
+        self.assertNotIn("decide terminal status", context)
+        self.assertNotIn("first read and fully handle the delivery", context)
+        command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
+        self.assertEqual(
+            __import__("shlex").split(command),
+            ["python3", os.path.realpath(fake_file),
+             "watch", "--timeout", "86370"],
+        )
+
+    def test_copilot_notification_hook_emits_wake_and_handle_context(self):
+        self._setup_mesh()
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin",
+                               io.StringIO(json.dumps(
+                                   {"notification_type": "shell_completed",
+                                    "cwd": os.getcwd()}))), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_notification_hook(argparse.Namespace())
+        context = json.loads(out.getvalue())["additionalContext"]
+        self.assertIn("read_bash", context)
+        self.assertIn("untrusted", context)
         self.assertIn("decide terminal status only from the final stdout line",
                       context)
         for kind in ("message", "task", "task_update", "node_joined",
                      "timeout"):
             self.assertIn(f"MESH_WATCH_DONE kind={kind}", context)
-        self.assertIn("re-arm silently for kind=timeout", context)
-        self.assertIn("Earlier diagnostics, human summaries, and raw JSON are "
-                      "non-authoritative", context)
+        self.assertIn("Re-arm silently for kind=timeout", context)
         self.assertIn("Exit 0 with no valid final MESH_WATCH_DONE line",
                       context)
-        self.assertIn("nonzero process exit", context)
         self.assertIn("report once and stop", context)
-        self.assertIn("first read and fully handle the delivery", context)
         self.assertIn("including attempting the task reply for MESH_TASK",
                       context)
-        self.assertIn("only then re-arm exactly one watcher", context)
+        self.assertIn("not the Meshwire watcher", context)
         select = context.index("decide terminal status only")
         handle = context.index("first read and fully handle the delivery")
         reply = context.index("including attempting the task reply for "
@@ -1571,12 +1596,29 @@ class CodexHookTests(MembershipCmdTests):
         self.assertLess(select, handle)
         self.assertLess(handle, reply)
         self.assertLess(reply, rearm)
-        command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
-        self.assertEqual(
-            __import__("shlex").split(command),
-            ["python3", os.path.realpath(fake_file),
-             "watch", "--timeout", "86370"],
-        )
+
+    def test_copilot_notification_hook_outside_mesh_empty(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_notification_hook(argparse.Namespace())
+        self.assertEqual(json.loads(out.getvalue()), {})
+
+    def test_copilot_notification_hook_reads_project_dir_from_payload(self):
+        self._setup_mesh()
+        project = os.getcwd()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        os.chdir(outside.name)
+        payload = io.StringIO(json.dumps(
+            {"notification_type": "shell_completed", "cwd": project}))
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", payload), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_notification_hook(argparse.Namespace())
+        context = json.loads(out.getvalue())["additionalContext"]
+        self.assertIn("Meshwire watcher", context)
 
     def test_copilot_session_hook_returns_empty_json_outside_mesh(self):
         out = io.StringIO()
@@ -2064,7 +2106,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.7.7")
+        self.assertEqual(release, "0.7.8")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2118,11 +2160,16 @@ class PluginManifestTests(unittest.TestCase):
         config = self._load("plugins/copilot-meshwire/hooks.json")
         self.assertEqual(config["version"], 1)
         hooks = config["hooks"]
-        self.assertEqual(set(hooks), {"sessionStart"})
+        self.assertEqual(set(hooks), {"sessionStart", "notification"})
         session = hooks["sessionStart"][0]
         self.assertIn("copilot-session-hook", session["bash"])
         self.assertIn("copilot-session-hook", session["powershell"])
         self.assertLessEqual(session["timeoutSec"], 10)
+        notify = hooks["notification"][0]
+        self.assertEqual(notify["matcher"], "shell_completed")
+        self.assertIn("copilot-notification-hook", notify["bash"])
+        self.assertIn("copilot-notification-hook", notify["powershell"])
+        self.assertLessEqual(notify["timeoutSec"], 10)
 
     def test_mesh_skill_documents_copilot_same_session_rearm(self):
         with open(os.path.join(self.ROOT, "skills/mesh-agent/SKILL.md")) as f:

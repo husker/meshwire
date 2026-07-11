@@ -33,7 +33,8 @@ copilot plugin install meshwire@meshwire
 
 Its short `sessionStart` hook injects the exact bundled watcher command. The
 current Copilot session launches it through the shell tool in async,
-non-detached mode and handles native background-shell completion. Launch denial
+non-detached mode, then goes idle; a notification hook wakes it on
+background-shell completion to read and re-arm. Launch denial
 or a nonzero process exit: report once and stop. On exit 0, decide terminal
 status only from the final stdout line. It must be exactly one of
 `MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,

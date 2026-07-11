@@ -58,9 +58,11 @@ copilot plugin install meshwire@meshwire
 
 Each plugin loads the mesh safety rules at session start. Claude uses
 asynchronous `Stop` with `asyncRewake`; Codex uses `Stop`. Copilot's short
-`sessionStart` hook tells the current session to own a non-detached async
-`mesh watch`; Copilot's native background-shell completion wakes that same
-session to handle it. Launch denial or a nonzero process exit: report once and
+`sessionStart` hook tells the current session to arm one non-detached async
+`mesh watch` and then go idle; a `notification` hook wakes that same session
+when the watcher's shell completes, so it stays idle between messages instead
+of holding a "working" spinner on the watcher. Launch denial or a nonzero
+process exit: report once and
 stop. On exit 0, decide terminal status only from the final stdout line. It must
 be exactly one of `MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,
 `MESH_WATCH_DONE kind=task_update`, `MESH_WATCH_DONE kind=node_joined`, or
@@ -75,8 +77,9 @@ line: report once and stop.
 The loop each session runs:
 
 1. With the plugin, follow the harness-specific setup above. Claude and Codex
-   need no manual watcher; Copilot owns one non-detached async watcher and
-   applies the qualified re-arm behavior above. Copilot arms it on the
+   need no manual watcher; Copilot arms one non-detached async watcher, goes
+   idle while it runs, and re-arms via the completion notification with the
+   qualified behavior above. Copilot arms it on the
    session's first turn — an idle session that never receives a message from
    you never listens. For hands-free listening, run `mesh copilot-autostart`
    once per project: it writes `.github/hooks/meshwire-autostart.json`, and

@@ -8,6 +8,15 @@
         "powershell": "py -3 \"${PLUGIN_ROOT}\\mesh.py\" copilot-session-hook",
         "timeoutSec": 10
       }
+    ],
+    "notification": [
+      {
+        "type": "command",
+        "matcher": "shell_completed",
+        "bash": "python3 \"${PLUGIN_ROOT}/mesh.py\" copilot-notification-hook",
+        "powershell": "py -3 \"${PLUGIN_ROOT}\\mesh.py\" copilot-notification-hook",
+        "timeoutSec": 10
+      }
     ]
   }
 }
