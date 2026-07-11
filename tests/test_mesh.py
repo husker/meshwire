@@ -604,6 +604,44 @@ class WatchTests(MembershipCmdTests):
                                                  follow=True))
         self.assertEqual(out.getvalue().count("message\": \"same"), 2)
 
+    def test_follow_delivers_announce_then_message(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "gamma", "announce", "m1", 200,
+                               ctl={"mw": "announce"}),
+               self._msg_event(cfg, "beta", "later message", "m2", 201)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            self.assertRaises(_TestDone, mesh.cmd_watch,
+                              argparse.Namespace(timeout=None, as_node=None,
+                                                 follow=True))
+        self.assertIn("MESH_NODE_JOINED node=gamma", out.getvalue())
+        self.assertIn("MESH_MESSAGE from='beta' to=alpha: later message",
+                      out.getvalue())
+
+    def test_diagnostic_before_delivery_does_not_override_terminal_marker(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope("beta", "alpha", "run tests")
+        env["params"]["message"]["taskId"] = "invalid task id"
+        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
+               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        combined = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(combined), \
+             contextlib.redirect_stderr(combined):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        lines = combined.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("MESH_WARN:"), lines)
+        terminal = [line for line in lines if line.startswith((
+            "MESH_MESSAGE ", "MESH_TASK ", "MESH_TASK_UPDATE ",
+            "MESH_NODE_JOINED ", "MESH_TIMEOUT:",
+        ))]
+        self.assertEqual(terminal,
+                         ["MESH_MESSAGE from='beta' to=alpha: real message"])
+
     def test_replayed_ciphertext_is_emitted_once(self):
         cfg = self._setup_mesh()
         original = self._msg_event(cfg, "beta", "deploy", "m1", 200)
@@ -819,11 +857,18 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn('mode="async"', context)
         self.assertIn("detach=false", context)
         self.assertIn("retain the returned shell ID", context)
-        self.assertIn("recognized MESH_* delivery", context)
-        self.assertIn("MESH_TIMEOUT means re-arm silently", context)
-        self.assertIn("nonzero exit", context)
-        self.assertIn("unrecognized error output", context)
-        self.assertIn("report it once and stop without re-arming", context)
+        self.assertIn("On exit 0, use the final recognized stdout marker",
+                      context)
+        for marker in ("MESH_MESSAGE", "MESH_TASK", "MESH_TASK_UPDATE",
+                       "MESH_NODE_JOINED", "MESH_TIMEOUT"):
+            self.assertIn(marker, context)
+        self.assertIn("re-arm silently for MESH_TIMEOUT", context)
+        self.assertIn("Earlier MESH_WARN, MESH_PING, and MESH_CTL lines are "
+                      "nonfatal diagnostics", context)
+        self.assertIn("do not override a later terminal marker", context)
+        self.assertIn("Exit 0 with no recognized final marker", context)
+        self.assertIn("nonzero process exit", context)
+        self.assertIn("report once and stop", context)
         command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
         self.assertEqual(
             __import__("shlex").split(command),
@@ -1251,27 +1296,41 @@ class PluginManifestTests(unittest.TestCase):
 
     def test_mesh_skill_documents_copilot_same_session_rearm(self):
         with open(os.path.join(self.ROOT, "skills/mesh-agent/SKILL.md")) as f:
-            text = f.read()
+            text = " ".join(f.read().split())
         self.assertIn("Copilot CLI", text)
         self.assertIn("async, non-detached", text)
         self.assertIn("retain the returned shell ID", text)
         self.assertIn("re-arm", text)
-        self.assertIn("recognized `MESH_*` delivery", text)
-        self.assertIn("re-arm silently", text)
-        self.assertIn("nonzero exit", text)
-        self.assertIn("unrecognized error output", text)
-        self.assertIn("report it once and stop without re-arming", text)
+        self.assertIn("final recognized stdout marker", text)
+        for marker in ("`MESH_MESSAGE`", "`MESH_TASK`",
+                       "`MESH_TASK_UPDATE`", "`MESH_NODE_JOINED`",
+                       "`MESH_TIMEOUT`"):
+            self.assertIn(marker, text)
+        self.assertIn("silently for `MESH_TIMEOUT`", text)
+        self.assertIn("Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines "
+                      "are nonfatal diagnostics", text)
+        self.assertIn("do not override a later terminal marker", text)
+        self.assertIn("Exit 0 with no recognized final marker", text)
+        self.assertIn("nonzero process exit", text)
+        self.assertIn("report once and stop", text)
 
     def test_user_docs_qualify_copilot_rearm_failures(self):
         expected = (
-            "Copilot re-arms only after a recognized `MESH_*` delivery or "
-            "`MESH_TIMEOUT`; on launch denial, nonzero exit, or unrecognized "
-            "output, it reports once and stops."
+            "Launch denial or a nonzero process exit: report once and stop. "
+            "On exit 0, use the final recognized stdout marker."
+        )
+        diagnostics = (
+            "Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are "
+            "nonfatal diagnostics and do not override a later terminal marker."
         )
         for rel in ("README.md", "docs/AGENTS.md"):
             with self.subTest(rel=rel), \
                  open(os.path.join(self.ROOT, rel)) as f:
-                self.assertIn(expected, " ".join(f.read().split()))
+                text = " ".join(f.read().split())
+                self.assertIn(expected, text)
+                self.assertIn(diagnostics, text)
+                self.assertIn("Exit 0 with no recognized final marker: report "
+                              "once and stop.", text)
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):

@@ -28,11 +28,13 @@ if not installed as a command).
    - Copilot CLI with the meshwire plugin: during the first normal turn, follow
      the session-start context and launch its exact watcher command with the shell
      tool in async, non-detached mode and retain the returned shell ID. When Copilot
-     reports that shell completed, read its output with that ID. Re-arm one watcher
-     only after handling a recognized `MESH_*` delivery; re-arm silently on
-     `MESH_TIMEOUT`. If launch is denied, the watcher has a nonzero exit, or it
-     prints unrecognized error output, report it once and stop without re-arming.
-     Never detach it or run two watchers concurrently.
+     reports that shell completed, read its output with that ID. Launch denial or a
+     nonzero process exit: report once and stop. On exit 0, use the final recognized
+     stdout marker. Re-arm for `MESH_MESSAGE`, `MESH_TASK`, `MESH_TASK_UPDATE`,
+     `MESH_NODE_JOINED`, or `MESH_TIMEOUT`; re-arm silently for `MESH_TIMEOUT`.
+     Earlier `MESH_WARN`, `MESH_PING`, and `MESH_CTL` lines are nonfatal diagnostics
+     and do not override a later terminal marker. Exit 0 with no recognized final
+     marker: report once and stop. Never detach or run two watchers concurrently.
    - Harness can stream a background command's output as it arrives
      (Claude Code: run it under the **Monitor tool**): use the persistent
      watcher, `mesh watch --follow` — one block per message, never exits;
@@ -60,11 +62,8 @@ if not installed as a command).
   messaged by that name from now on.
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
 
-(One-shot mode -- `mesh watch` without `--follow` -- prints one message and
-exits. Re-arm only after handling one of the recognized `MESH_*` deliveries
-above, or after `MESH_TIMEOUT`, which requires a silent re-arm and no user-facing
-response. On launch denial, nonzero exit, or unrecognized error output, report
-it once and stop without re-arming.)
+(One-shot mode -- `mesh watch` without `--follow` -- exits after a delivery or
+timeout. In Copilot, apply the exit and marker precedence above.)
 
 ## Sending
 
