@@ -2402,6 +2402,21 @@ class MCPServeTests(unittest.TestCase):
         srv.handle({"jsonrpc": "2.0", "id": 99, "method": "no/such"})
         self.assertIn("error", self._sent(out)[0])
 
+    def test_mcp_config_path_uses_explicit_config(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfgfile = os.path.join(tmp.name, ".meshwire.json")
+        with open(cfgfile, "w") as f:
+            f.write("{}")
+        path, how = mesh._mcp_config_path(argparse.Namespace(config=cfgfile))
+        self.assertEqual(path, cfgfile)
+        self.assertIn("--config", how)
+
+    def test_mcp_config_path_missing_explicit_is_none(self):
+        path, _ = mesh._mcp_config_path(
+            argparse.Namespace(config="/no/such/.meshwire.json"))
+        self.assertIsNone(path)
+
 
 if __name__ == "__main__":
     unittest.main()

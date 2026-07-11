@@ -1537,13 +1537,53 @@ def _mcp_idle_serve():
     _mcp_stdin_loop(handle)
 
 
+def _parent_working_dir():
+    """Best-effort cwd of our parent process. Copilot spawns plugin MCP servers
+    with cwd=plugin dir and a stripped env, but Copilot itself runs in the
+    project, so its cwd locates the mesh node."""
+    try:
+        import subprocess
+        ppid = os.getppid()
+        out = subprocess.run(
+            ["lsof", "-a", "-p", str(ppid), "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if line.startswith("n"):
+                d = line[1:].strip()
+                if d and os.path.isdir(d):
+                    return d
+    except Exception:
+        return None
+    return None
+
+
+def _mcp_config_path(args):
+    """Locate the mesh node config for the MCP server, in order: an explicit
+    --config, COPILOT_PROJECT_DIR, the parent (Copilot) process cwd, then cwd."""
+    explicit = getattr(args, "config", None)
+    if explicit:
+        p = os.path.abspath(explicit)
+        return (p if os.path.isfile(p) else None), f"--config {explicit}"
+    env = os.environ.get("COPILOT_PROJECT_DIR")
+    if env:
+        p = find_config(env)
+        if p:
+            return p, "COPILOT_PROJECT_DIR"
+    parent = _parent_working_dir()
+    if parent:
+        p = find_config(parent)
+        if p:
+            return p, f"parent cwd {parent}"
+    return find_config(), "cwd"
+
+
 def cmd_mcp_serve(args):
     """Run the meshwire watcher as a stdio MCP server (for Copilot)."""
-    start = os.environ.get("COPILOT_PROJECT_DIR") or None
-    path = find_config(start)
+    path, how = _mcp_config_path(args)
     if not path:
-        print(f"meshwire mcp-serve: no mesh node at "
-              f"{start or os.getcwd()}; idle", file=sys.stderr)
+        print(f"meshwire mcp-serve: no mesh node found (tried {how}; "
+              f"cwd={os.getcwd()} ppid={os.getppid()}); idle",
+              file=sys.stderr)
         _mcp_idle_serve()
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -1551,8 +1591,8 @@ def cmd_mcp_serve(args):
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
     me = my_node(cfg, getattr(args, "as_node", None))
-    print(f"meshwire mcp-serve: watching as node '{me}' "
-          f"({cfg['_dir']})", file=sys.stderr)
+    print(f"meshwire mcp-serve: watching as node '{me}' ({cfg['_dir']}) "
+          f"via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
     threading.Thread(target=server.watch_loop, daemon=True).start()
     _mcp_stdin_loop(server.handle)
@@ -2225,6 +2265,8 @@ def main():
 
     p = sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     p.add_argument("--as", dest="as_node", default=None)
+    p.add_argument("--config", default=None,
+                   help="explicit path to the .meshwire.json to watch")
     p.set_defaults(fn=cmd_mcp_serve)
 
     p = sub.add_parser("agent-hook-cleanup", help=argparse.SUPPRESS)
