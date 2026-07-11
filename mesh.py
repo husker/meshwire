@@ -1182,9 +1182,24 @@ def _copilot_watch_command(platform=None):
     return shlex.join(argv)
 
 
+def _copilot_hook_project_dir():
+    """Copilot spawns plugin hooks with cwd inside the installed plugin dir,
+    not the project; the session's directory arrives in the stdin payload
+    (`cwd`) and in COPILOT_PROJECT_DIR."""
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        interactive = False
+    payload = {} if interactive else _read_hook_input()
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        return cwd
+    return os.environ.get("COPILOT_PROJECT_DIR") or None
+
+
 def cmd_copilot_session_hook(args):
     """Tell Copilot to own one async watcher in this interactive session."""
-    if not find_config():
+    if not find_config(_copilot_hook_project_dir()):
         print("{}")
         return
     context = (

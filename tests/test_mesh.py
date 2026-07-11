@@ -1580,7 +1580,56 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_copilot_session_hook_returns_empty_json_outside_mesh(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_session_hook(argparse.Namespace())
+        self.assertEqual(json.loads(out.getvalue()), {})
+
+    def test_copilot_session_hook_reads_project_dir_from_stdin_payload(self):
+        # Copilot spawns plugin hooks with cwd inside the installed plugin
+        # directory; the session's project dir arrives in the sessionStart
+        # stdin payload as "cwd".
+        self._setup_mesh()
+        project = os.getcwd()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        os.chdir(outside.name)
+        payload = io.StringIO(json.dumps(
+            {"sessionId": "s1", "cwd": project, "source": "new"}))
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", payload), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_session_hook(argparse.Namespace())
+        context = json.loads(out.getvalue())["additionalContext"]
+        self.assertIn("This project is a Meshwire node", context)
+        self.assertIn("MESHWIRE_WATCH_COMMAND: ", context)
+
+    def test_copilot_session_hook_falls_back_to_env_project_dir(self):
+        self._setup_mesh()
+        project = os.getcwd()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        os.chdir(outside.name)
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("")), \
+             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": project}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_session_hook(argparse.Namespace())
+        context = json.loads(out.getvalue())["additionalContext"]
+        self.assertIn("MESHWIRE_WATCH_COMMAND: ", context)
+
+    def test_copilot_session_hook_payload_cwd_outside_mesh_is_empty(self):
+        # A payload cwd that is not a mesh node must not fall back to the
+        # process cwd (which is the plugin install dir under Copilot).
+        self._setup_mesh()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        payload = io.StringIO(json.dumps({"cwd": outside.name}))
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", payload), \
+             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
+             contextlib.redirect_stdout(out):
             mesh.cmd_copilot_session_hook(argparse.Namespace())
         self.assertEqual(json.loads(out.getvalue()), {})
 
@@ -1973,7 +2022,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.7.5")
+        self.assertEqual(release, "0.7.6")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
