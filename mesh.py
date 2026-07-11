@@ -50,6 +50,9 @@ BROADCAST = "all"
 USER_AGENT = "meshwire/0.7"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
+# ntfy message times are Unix seconds. 2100-01-01 is far beyond the supported
+# release horizon while bounding attacker-controlled integer conversions.
+MAX_RELAY_TIME = 4_102_444_800
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "meshwire-agent-hook-"
 
@@ -355,15 +358,15 @@ def _unwrap(ev, cfg):
     return message
 
 
-def _open(ev, cfg):
+def _open(ev, cfg, me=None):
     """Unwrap + decrypt + unpack a message event.
     Returns (sender_or_None, body_text, trusted: bool, ctl_or_None).
     trusted=True only for messages that authenticated under the mesh key;
     ctl is the control payload ("c" field) for announce/ping/pong messages."""
-    return _open_with_fingerprint(ev, cfg)[:4]
+    return _open_with_fingerprint(ev, cfg, me)[:4]
 
 
-def _open_with_fingerprint(ev, cfg):
+def _open_with_fingerprint(ev, cfg, me=None):
     """Like _open, plus a stable fingerprint of authenticated ciphertext."""
     body = _unwrap(ev, cfg)
     if not isinstance(body, str):
@@ -372,12 +375,14 @@ def _open_with_fingerprint(ev, cfg):
     if pt is not None:
         try:
             wrapper = json.loads(pt)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             return None, "", False, None, None
         if (not isinstance(wrapper, dict) or
                 not isinstance(wrapper.get("f"), str) or
+                not isinstance(wrapper.get("t"), str) or
                 not isinstance(wrapper.get("b"), str) or
-                ("c" in wrapper and not isinstance(wrapper["c"], dict))):
+                ("c" in wrapper and not isinstance(wrapper["c"], dict)) or
+                (me is not None and wrapper["t"] not in (me, BROADCAST))):
             return None, "", False, None, None
         fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
         return (wrapper["f"], wrapper["b"], True,
@@ -732,18 +737,26 @@ def cmd_send(args):
 
 
 def _relay_time(value):
-    """Return a relay timestamp as an int, or None for unsafe forms."""
+    """Return bounded Unix seconds as an int, or None for unsafe forms."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    if isinstance(value, float):
+        relay_time = value
+    elif isinstance(value, float):
         if not math.isfinite(value) or not value.is_integer():
             return None
-        return int(value)
-    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value):
-        return int(value)
-    return None
+        if value < 0 or value > MAX_RELAY_TIME:
+            return None
+        relay_time = int(value)
+    elif isinstance(value, str):
+        digits = value[1:] if value.startswith("+") else value
+        if (not digits or len(digits) > len(str(MAX_RELAY_TIME)) or
+                not digits.isascii() or not digits.isdigit()):
+            return None
+        relay_time = int(digits)
+    else:
+        return None
+    return relay_time if 0 <= relay_time <= MAX_RELAY_TIME else None
 
 
 def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
@@ -769,7 +782,8 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                 for raw in r:
                     try:
                         ev = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                    except (UnicodeDecodeError, json.JSONDecodeError,
+                            ValueError):
                         continue
                     if not isinstance(ev, dict):
                         continue
@@ -780,7 +794,7 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                         continue
                     if not isinstance(ev.get("id"), str):
                         continue
-                    relay_time = _relay_time(ev.get("time", since))
+                    relay_time = _relay_time(ev.get("time"))
                     if relay_time is None:
                         continue
                     backoff = 1
@@ -940,7 +954,7 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
     try:
         for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5),
                                  deadline, first=first):
-            frm, body, trusted, ctl = _open(ev, cfg)
+            frm, body, trusted, ctl = _open(ev, cfg, me)
             if not trusted or not ctl or ctl.get("mw") != "ack":
                 continue
             if ctl.get("of") != msg_id or not frm:
@@ -967,28 +981,31 @@ def cmd_watch(args):
     timeout = args.timeout or (None if args.follow else 10800)
     deadline = (time.time() + timeout) if timeout else None
 
-    def save_cursor(ev, t):
+    def save_cursor(ev):
         # resume from this message's second; remember ids seen in that second
         # so re-delivery on the boundary is filtered, not re-consumed
         nonlocal since, seen
+        t = _relay_time(ev.get("time"))
+        if t is None:
+            return False
         seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
         since = t
         with open(cf, "w", encoding="utf-8") as f:
             json.dump({"since": t, "seen": seen[-50:]}, f)
+        return True
 
     delivered = False
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
         if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
             continue
-        relay_time = _relay_time(ev.get("time", int(time.time())))
-        if relay_time is None:
-            continue
-        frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(ev, cfg)
-        save_cursor(ev, relay_time)
+        frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(
+            ev, cfg, me)
         if not trusted:
             if body != "":
                 print(f"MESH_WARN: dropped unauthenticated message "
                       f"id={_single_line(ev.get('id'))}", file=sys.stderr)
+            continue
+        if not save_cursor(ev):
             continue
         if fingerprint in replay_seen:
             if frm != me and not ctl:
@@ -1274,7 +1291,7 @@ def cmd_peek(args):
         print(f"(no messages for '{node}' since {args.since})")
     for m in msgs:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
-        frm, text, trusted, ctl = _open(m, cfg)
+        frm, text, trusted, ctl = _open(m, cfg, node)
         if trusted and frm:
             note_peer(cfg, frm, "message")
         mark = "" if trusted else " [UNVERIFIED]"
@@ -1334,7 +1351,7 @@ def cmd_ping(args):
     deadline = time.time() + args.timeout
     for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
                              first=first):
-        frm, body, trusted, ctl = _open(ev, cfg)
+        frm, body, trusted, ctl = _open(ev, cfg, me)
         if not trusted or not ctl:
             continue
         if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
@@ -1354,7 +1371,7 @@ def _await_result(cfg, me, task_id, timeout, first=None):
     deadline = time.time() + timeout
     for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
                              first=first):
-        frm, body, trusted, ctl = _open(ev, cfg)
+        frm, body, trusted, ctl = _open(ev, cfg, me)
         if not trusted or ctl:
             continue
         note_peer(cfg, frm, "message")

@@ -337,6 +337,38 @@ class OpenControlTests(unittest.TestCase):
         frm, body, trusted, ctl = mesh._open({"message": wire}, make_cfg())
         self.assertEqual((body, trusted, ctl), ("", False, None))
 
+    def test_open_rejects_missing_and_non_string_recipients(self):
+        cfg = make_cfg()
+        for recipient in (..., None, 7, ["alpha"]):
+            with self.subTest(recipient=recipient):
+                payload = {"f": "beta", "b": "hidden"}
+                if recipient is not ...:
+                    payload["t"] = recipient
+                wire = mesh.encrypt(cfg, json.dumps(payload))
+                self.assertEqual(
+                    mesh._open({"message": wire}, cfg),
+                    (None, "", False, None),
+                )
+
+    def test_open_rejects_conversion_limit_recipient_without_raising(self):
+        cfg = make_cfg()
+        plaintext = ('{"f":"beta","t":' + "9" * 5000 +
+                     ',"b":"hidden"}')
+        wire = mesh.encrypt(cfg, plaintext)
+        self.assertEqual(mesh._open({"message": wire}, cfg),
+                         (None, "", False, None))
+
+    def test_open_accepts_only_current_or_broadcast_recipient_when_known(self):
+        cfg = make_cfg()
+        for recipient, trusted in (("alpha", True), ("all", True),
+                                   ("beta", False)):
+            with self.subTest(recipient=recipient):
+                wire = mesh.encrypt(cfg, json.dumps(
+                    {"f": "gamma", "t": recipient, "b": "hello"}))
+                opened = mesh._open({"message": wire}, cfg, me="alpha")
+                self.assertEqual(opened[2], trusted)
+                self.assertEqual(opened[1], "hello" if trusted else "")
+
 
 class SendRawTests(unittest.TestCase):
     def test_ctl_rides_inside_ciphertext(self):
@@ -577,6 +609,31 @@ class StreamEventsTests(unittest.TestCase):
             gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=None)
             self.assertEqual(next(gen), valid)
 
+    def test_unbounded_and_missing_relay_times_are_dropped_before_valid(self):
+        huge_digits = b"9" * 5000
+        lines = [
+            (b'{"event":"message","id":"huge-literal","time":' +
+             huge_digits + b',"message":"hidden"}\n'),
+            json.dumps({"event": "message", "id": "huge-string",
+                        "time": "9" * 5000,
+                        "message": "hidden"}).encode() + b"\n",
+            json.dumps({"event": "message", "id": "missing",
+                        "message": "hidden"}).encode() + b"\n",
+        ]
+        valid = {"event": "message", "id": "valid", "time": 101,
+                 "message": "real"}
+        lines.append(json.dumps(valid).encode() + b"\n")
+        with mock.patch.object(mesh, "http", fake_raw_stream(lines)):
+            gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=None)
+            self.assertEqual(next(gen), valid)
+
+    def test_relay_time_is_total_and_bounded(self):
+        self.assertEqual(mesh._relay_time(1_800_000_000), 1_800_000_000)
+        for value in (-1, mesh.MAX_RELAY_TIME + 1, 10 ** 5000,
+                      float("inf"), 1e100, "9" * 5000, None, True):
+            with self.subTest(value=type(value).__name__):
+                self.assertIsNone(mesh._relay_time(value))
+
     def test_integral_numeric_and_string_relay_times_are_accepted(self):
         events = [
             {"event": "message", "id": "integer", "time": 100,
@@ -705,9 +762,14 @@ class WatchTests(MembershipCmdTests):
 
     def test_direct_watch_drops_invalid_times_before_valid_delivery(self):
         cfg = self._setup_mesh()
-        invalid_times = [float("inf"), True, 200.5, "not-a-time"]
+        invalid_times = [float("inf"), True, 200.5, "not-a-time", -1,
+                         mesh.MAX_RELAY_TIME + 1, 10 ** 5000, 1e100,
+                         "9" * 5000]
         invalid = [self._msg_event(cfg, "beta", "hidden", f"bad-{i}", t)
                    for i, t in enumerate(invalid_times)]
+        missing = self._msg_event(cfg, "beta", "hidden", "bad-missing", 200)
+        del missing["time"]
+        invalid.append(missing)
         valid = self._msg_event(cfg, "beta", "real message", "valid", 201)
         out = io.StringIO()
         with mock.patch.object(mesh, "_stream_events",
@@ -721,6 +783,35 @@ class WatchTests(MembershipCmdTests):
         self._assert_trusted_watch_done(out.getvalue(), "message")
         with open(".meshwire.cursor-alpha") as f:
             self.assertEqual(json.load(f), {"since": 201, "seen": ["valid"]})
+
+    def test_invalid_recipient_ciphertexts_are_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid_payloads = [
+            {"f": "beta", "b": "hidden-missing"},
+            {"f": "beta", "t": 7, "b": "hidden-non-string"},
+            # Ciphertext captured from beta's topic and replayed to alpha.
+            {"f": "beta", "t": "beta", "b": "hidden-wrong-node"},
+        ]
+        invalid = [self._wrapper_event(cfg, payload, f"invalid-{i}", 200)
+                   for i, payload in enumerate(invalid_payloads)]
+        valid = self._msg_event(cfg, "beta", "real message", "valid", 201)
+        out, posts = io.StringIO(), []
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter(invalid + [valid])), \
+             mock.patch.object(
+                 mesh, "_post",
+                 lambda *a, **k: posts.append(a) or {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("hidden", out.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self._assert_trusted_watch_done(out.getvalue(), "message")
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f), {"since": 201, "seen": ["valid"]})
+        self.assertEqual(len(mesh.load_replays(mesh.load_config(), "alpha")),
+                         1)
+        self.assertEqual(len(posts), 1)
 
     def test_one_shot_message_escapes_forged_markers_and_ends_with_kind(self):
         cfg = self._setup_mesh()
