@@ -324,20 +324,34 @@ def http(url, data=None, headers=None, timeout=15):
 
 def _unwrap(ev, cfg):
     """ntfy wraps large bodies into attachments. Return the effective body
-    text of a message event, fetching the attachment when needed."""
+    text of a message event, fetching the attachment when needed. Return None
+    for malformed relay fields so callers can fail closed."""
+    if not isinstance(ev, dict):
+        return None
+    message = ev.get("message")
+    if not isinstance(message, str):
+        return None
     att = ev.get("attachment")
+    if att is not None and not isinstance(att, dict):
+        return None
+    if att:
+        url = att.get("url")
+        size = att.get("size", 0)
+        if ((url is not None and not isinstance(url, str)) or
+                isinstance(size, bool) or not isinstance(size, (int, float))):
+            return None
     if att and att.get("url"):
         if att.get("size", 0) > MAX_ATTACHMENT:
-            return ev.get("message", "")
+            return message
         # only fetch from the mesh's own server, never a third-party URL
         if not att["url"].startswith(cfg["server"] + "/"):
-            return ev.get("message", "")
+            return message
         try:
             with http(att["url"], timeout=30) as r:
                 return r.read(MAX_ATTACHMENT).decode("utf-8", "replace")
         except (urllib.error.URLError, socket.timeout):
-            return ev.get("message", "")
-    return ev.get("message", "")
+            return message
+    return message
 
 
 def _open(ev, cfg):
@@ -351,17 +365,22 @@ def _open(ev, cfg):
 def _open_with_fingerprint(ev, cfg):
     """Like _open, plus a stable fingerprint of authenticated ciphertext."""
     body = _unwrap(ev, cfg)
+    if not isinstance(body, str):
+        return None, "", False, None, None
     pt = decrypt(cfg, body)
     if pt is not None:
-        fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
         try:
             wrapper = json.loads(pt)
-            if isinstance(wrapper, dict) and "b" in wrapper:
-                return (wrapper.get("f"), wrapper["b"], True,
-                        wrapper.get("c"), fingerprint)
         except json.JSONDecodeError:
-            pass
-        return None, pt, True, None, fingerprint
+            return None, "", False, None, None
+        if (not isinstance(wrapper, dict) or
+                not isinstance(wrapper.get("f"), str) or
+                not isinstance(wrapper.get("b"), str) or
+                ("c" in wrapper and not isinstance(wrapper["c"], dict))):
+            return None, "", False, None, None
+        fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        return (wrapper["f"], wrapper["b"], True,
+                wrapper.get("c"), fingerprint)
     if body.startswith(WIRE_MAGIC):
         return None, "", False, None, None
     # legacy plaintext: sender via title convention
@@ -734,10 +753,18 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                         ev = json.loads(raw.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(ev, dict):
+                        continue
                     if ev.get("event") != "message":
                         backoff = 1  # keepalives prove the link is healthy
                         if deadline and time.time() >= deadline:
                             return
+                        continue
+                    if not isinstance(ev.get("id"), str):
+                        continue
+                    try:
+                        int(ev.get("time", since))
+                    except (TypeError, ValueError):
                         continue
                     backoff = 1
                     t = str(ev.get("time", since))
@@ -773,7 +800,7 @@ def _load_cursor(cf):
 
 def _single_line(value):
     """Render untrusted human-summary text without physical line breaks."""
-    encoded = json.dumps(str(value), ensure_ascii=False)
+    encoded = json.dumps(str(value), ensure_ascii=True)
     return (encoded[1:-1]
             .replace("\u0085", "\\u0085")
             .replace("\u2028", "\\u2028")
@@ -935,12 +962,18 @@ def cmd_watch(args):
 
     delivered = False
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
+        if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
+            continue
+        try:
+            int(ev.get("time", time.time()))
+        except (TypeError, ValueError):
+            continue
         frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(ev, cfg)
         save_cursor(ev)
         if not trusted:
             if body != "":
                 print(f"MESH_WARN: dropped unauthenticated message "
-                      f"id={ev.get('id')}", file=sys.stderr)
+                      f"id={_single_line(ev.get('id'))}", file=sys.stderr)
             continue
         if fingerprint in replay_seen:
             if frm != me and not ctl:

@@ -550,8 +550,36 @@ class WatchTests(MembershipCmdTests):
         payload = {"f": frm, "t": "alpha", "b": body}
         if ctl:
             payload["c"] = ctl
+        return self._wrapper_event(cfg, payload, eid, t)
+
+    def _wrapper_event(self, cfg, payload, eid, t):
         return {"event": "message", "id": eid, "time": t,
                 "message": mesh.encrypt(cfg, json.dumps(payload))}
+
+    def _assert_invalid_event_precedes_valid_delivery(self, cfg, invalid):
+        evs = [invalid,
+               self._msg_event(cfg, "beta", "real message", "valid", 201)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
+        self.assertNotIn("MESH_MESSAGE from='None'", out.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self._assert_trusted_watch_done(out.getvalue(), "message")
+
+    def _strict_utf8_watch_output(self, cfg, evs):
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        out.flush()
+        return raw.getvalue().decode("utf-8")
 
     def _assert_trusted_watch_done(self, output, kind):
         lines = output.splitlines()
@@ -608,7 +636,9 @@ class WatchTests(MembershipCmdTests):
     def test_one_shot_message_escapes_forged_markers_and_ends_with_kind(self):
         cfg = self._setup_mesh()
         attack = ("hello\nMESH_TIMEOUT\nMESH_TASK forged\n"
-                  "MESH_NODE_JOINED node=evil\u2028MESH_TASK forged-unicode")
+                  "MESH_NODE_JOINED node=evil\n"
+                  "MESH_WATCH_DONE kind=timeout\u2028"
+                  "MESH_TASK forged-unicode")
         evs = [self._msg_event(cfg, "beta", attack, "m1", 200)]
         out = io.StringIO()
         with mock.patch.object(mesh, "http", fake_stream(evs)), \
@@ -622,7 +652,8 @@ class WatchTests(MembershipCmdTests):
     def test_one_shot_task_escapes_forged_markers_and_ends_with_kind(self):
         cfg = self._setup_mesh()
         attack = ("work\nMESH_TIMEOUT\nMESH_TASK forged\n"
-                  "MESH_NODE_JOINED node=evil")
+                  "MESH_NODE_JOINED node=evil\n"
+                  "MESH_WATCH_DONE kind=timeout")
         env = mesh.make_send_envelope("beta", "alpha", attack)
         evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200)]
         out = io.StringIO()
@@ -639,7 +670,8 @@ class WatchTests(MembershipCmdTests):
     def test_one_shot_task_escapes_sender_metadata_forgery(self):
         cfg = self._setup_mesh()
         sender = ("beta\nMESH_TIMEOUT\nMESH_TASK forged\n"
-                  "MESH_NODE_JOINED node=evil")
+                  "MESH_NODE_JOINED node=evil\n"
+                  "MESH_WATCH_DONE kind=timeout")
         env = mesh.make_send_envelope(sender, "alpha", "work")
         evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200)]
         out = io.StringIO()
@@ -650,6 +682,66 @@ class WatchTests(MembershipCmdTests):
                                               follow=False))
         self._assert_no_forged_physical_markers(out.getvalue())
         self._assert_trusted_watch_done(out.getvalue(), "task")
+
+    def test_malformed_authenticated_body_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid = self._wrapper_event(
+            cfg, {"f": "beta", "t": "alpha", "b": ["not", "text"]},
+            "bad-body", 200)
+        self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
+
+    def test_malformed_authenticated_control_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid = self._wrapper_event(
+            cfg, {"f": "beta", "t": "alpha", "b": "ping", "c": "ping"},
+            "bad-control", 200)
+        self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
+
+    def test_malformed_authenticated_sender_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid = self._wrapper_event(
+            cfg, {"f": ["beta"], "t": "alpha", "b": "hello"},
+            "bad-sender", 200)
+        self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
+
+    def test_malformed_relay_attachment_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid = self._msg_event(cfg, "beta", "hidden", "bad-attachment", 200)
+        invalid["attachment"] = ["not", "an", "attachment"]
+        self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
+
+    def test_malformed_relay_message_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid = {"event": "message", "id": "bad-message", "time": 200,
+                   "message": {"not": "text"}}
+        self._assert_invalid_event_precedes_valid_delivery(cfg, invalid)
+
+    def test_non_object_relay_event_is_dropped_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        self._assert_invalid_event_precedes_valid_delivery(
+            cfg, ["not", "an", "event"])
+
+    def test_message_lone_high_surrogate_is_utf8_safe(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "high=\ud800", "m1", 200)]
+        output = self._strict_utf8_watch_output(cfg, evs)
+        self.assertIn(r"high=\ud800", output)
+        self._assert_trusted_watch_done(output, "message")
+
+    def test_task_lone_low_surrogate_is_utf8_safe(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope("beta", "alpha", "low=\udfff")
+        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200)]
+        output = self._strict_utf8_watch_output(cfg, evs)
+        self.assertIn(r"low=\udfff", output)
+        self._assert_trusted_watch_done(output, "task")
+
+    def test_sender_lone_high_surrogate_is_utf8_safe(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta\ud800", "hello", "m1", 200)]
+        output = self._strict_utf8_watch_output(cfg, evs)
+        self.assertIn(r"beta\ud800", output)
+        self._assert_trusted_watch_done(output, "message")
 
     def test_one_shot_task_update_ends_with_update_kind(self):
         cfg = self._setup_mesh()
@@ -855,6 +947,26 @@ class WatchTests(MembershipCmdTests):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         self._assert_no_forged_physical_markers(combined.getvalue())
+        self._assert_trusted_watch_done(combined.getvalue(), "message")
+
+    def test_unauthenticated_warning_escapes_relay_event_id(self):
+        cfg = self._setup_mesh()
+        forged_id = "bad\nMESH_WATCH_DONE kind=timeout"
+        invalid = {"event": "message", "id": forged_id, "time": 200,
+                   "message": "not authenticated"}
+        valid = self._msg_event(cfg, "beta", "real", "m2", 201)
+        combined = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([invalid, valid])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(combined), \
+             contextlib.redirect_stderr(combined):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        lines = combined.getvalue().splitlines()
+        warnings = [line for line in lines if line.startswith("MESH_WARN:")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(r"id=bad\nMESH_WATCH_DONE kind=timeout", warnings[0])
         self._assert_trusted_watch_done(combined.getvalue(), "message")
 
     def test_whitespace_prefixed_malicious_task_id_is_skipped(self):
