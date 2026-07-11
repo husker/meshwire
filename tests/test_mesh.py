@@ -1970,6 +1970,10 @@ class PluginManifestTests(unittest.TestCase):
         marketplace = self._load(".plugin/marketplace.json")
         self.assertEqual(marketplace["metadata"]["version"], release)
         self.assertEqual(marketplace["plugins"][0]["version"], release)
+        # in-code version strings must not drift from pyproject either
+        self.assertEqual(mesh.VERSION, release)
+        self.assertEqual(mesh.USER_AGENT, f"meshwire/{release}")
+        self.assertEqual(mesh.MESH_MCP_VERSION, release)
 
     def test_codex_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):

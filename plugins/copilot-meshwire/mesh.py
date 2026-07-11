@@ -47,7 +47,11 @@ TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
 BROADCAST = "all"
-USER_AGENT = "meshwire/0.7"
+# Single source of truth for the running client's version. Must match
+# pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
+# that reports a version derives from this so labels can't drift.
+VERSION = "0.8.1"
+USER_AGENT = f"meshwire/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
 # Relay clocks may lead the local clock briefly, but a wider window would let
@@ -1197,7 +1201,7 @@ cmd_claude_session_hook = cmd_agent_session_hook
 # tool access — so a MESH_TASK gets handled, not just acknowledged.
 
 MESH_MCP_PROTOCOL = "2025-06-18"
-MESH_MCP_VERSION = "0.8.0"
+MESH_MCP_VERSION = VERSION
 # gpt-5-mini (Copilot's sampling model) is a reasoning model: a small budget is
 # consumed by reasoning before any answer, yielding an empty/incomplete stream.
 MESH_MCP_SAMPLING_MAX_TOKENS = 8192
