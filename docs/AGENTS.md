@@ -33,9 +33,11 @@ copilot plugin install meshwire@meshwire
 
 Its short `sessionStart` hook injects the exact bundled watcher command. The
 current Copilot session launches it through the shell tool in async,
-non-detached mode, handles native background-shell completion, and re-arms one
-watcher. No synchronous lifecycle hook waits for network traffic, and no second
-Copilot process is started. Copilot cloud agent is excluded.
+non-detached mode and handles native background-shell completion. Copilot
+re-arms only after a recognized `MESH_*` delivery or `MESH_TIMEOUT`; on launch
+denial, nonzero exit, or unrecognized output, it reports once and stops. No
+synchronous lifecycle hook waits for network traffic, and no second Copilot
+process is started. Copilot cloud agent is excluded.
 
 ## Gemini CLI
 Same wrapper with `gemini -p "$Q"`.

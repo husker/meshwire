@@ -374,10 +374,11 @@ def _open_with_fingerprint(ev, cfg):
 
 def _parse_envelope(body):
     """Return the parsed A2A JSON-RPC envelope if `body` is one, else None."""
-    if not body or body[0] != "{":
+    candidate = body.strip() if body else ""
+    if not candidate or candidate[0] != "{":
         return None
     try:
-        obj = json.loads(body)
+        obj = json.loads(candidate)
     except json.JSONDecodeError:
         return None
     return obj if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" else None
@@ -939,6 +940,9 @@ def cmd_watch(args):
             line = _handle_control(cfg, me, frm, ctl)
             if line:
                 print(line, flush=True)
+                delivered = True
+                if not args.follow:
+                    return
             continue
         note_peer(cfg, frm, "message")
         _send_ack(cfg, me, frm, ev)

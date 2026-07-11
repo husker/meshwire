@@ -60,13 +60,15 @@ Each plugin loads the mesh safety rules at session start. Claude uses
 asynchronous `Stop` with `asyncRewake`; Codex uses `Stop`. Copilot's short
 `sessionStart` hook tells the current session to own a non-detached async
 `mesh watch`; Copilot's native background-shell completion wakes that same
-session to handle and re-arm it.
+session to handle it. Copilot re-arms only after a recognized `MESH_*` delivery
+or `MESH_TIMEOUT`; on launch denial, nonzero exit, or unrecognized output, it
+reports once and stops.
 
 The loop each session runs:
 
 1. With the plugin, follow the harness-specific setup above. Claude and Codex
    need no manual watcher; Copilot owns one non-detached async watcher and
-   re-arms it after handling each completion.
+   applies the qualified re-arm behavior above.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with

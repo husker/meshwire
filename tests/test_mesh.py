@@ -553,6 +553,30 @@ class WatchTests(MembershipCmdTests):
         return {"event": "message", "id": eid, "time": t,
                 "message": mesh.encrypt(cfg, json.dumps(payload))}
 
+    def _assert_whitespace_prefixed_invalid_task_id_is_skipped(self,
+                                                                task_id):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope("beta", "alpha", "run tests")
+        if task_id is ...:
+            del env["params"]["message"]["taskId"]
+        else:
+            env["params"]["message"]["taskId"] = task_id
+        invalid_body = " \n\t" + json.dumps(env)
+        evs = [self._msg_event(cfg, "beta", invalid_body, "m1", 200),
+               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("MESH_TASK", out.getvalue())
+        self.assertNotIn("mesh reply", out.getvalue())
+        self.assertNotIn('"jsonrpc": "2.0"', out.getvalue())
+        self.assertIn("dropped invalid A2A envelope", err.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self.assertFalse(os.path.exists(mesh.TASKS_NAME))
+
     def test_one_shot_delivers_message_and_saves_cursor(self):
         cfg = self._setup_mesh()
         evs = [self._msg_event(cfg, "beta", "hello there", "m1", 200)]
@@ -625,6 +649,32 @@ class WatchTests(MembershipCmdTests):
         self.assertNotIn("MESH_MESSAGE from='beta' to=alpha: ping",
                          out.getvalue())
         self.assertIn("real message", out.getvalue())
+
+    def test_announce_completes_one_shot_without_consuming_later_event(self):
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "gamma", "announce", "m1", 200,
+                               ctl={"mw": "announce"}),
+               self._msg_event(cfg, "beta", "later message", "m2", 201)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertIn("MESH_NODE_JOINED node=gamma", out.getvalue())
+        self.assertNotIn("later message", out.getvalue())
+        self.assertNotIn("MESH_TIMEOUT", out.getvalue())
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f)["since"], 200)
+
+    def test_whitespace_prefixed_malicious_task_id_is_skipped(self):
+        self._assert_whitespace_prefixed_invalid_task_id_is_skipped(
+            "safe; touch /tmp/meshwire-pwned")
+
+    def test_whitespace_prefixed_missing_task_id_is_skipped(self):
+        self._assert_whitespace_prefixed_invalid_task_id_is_skipped(...)
+
+    def test_whitespace_prefixed_non_string_task_id_is_skipped(self):
+        self._assert_whitespace_prefixed_invalid_task_id_is_skipped(7)
 
     def test_malicious_a2a_task_id_is_dropped_without_consuming_one_shot(self):
         cfg = self._setup_mesh()
@@ -1211,6 +1261,17 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("nonzero exit", text)
         self.assertIn("unrecognized error output", text)
         self.assertIn("report it once and stop without re-arming", text)
+
+    def test_user_docs_qualify_copilot_rearm_failures(self):
+        expected = (
+            "Copilot re-arms only after a recognized `MESH_*` delivery or "
+            "`MESH_TIMEOUT`; on launch denial, nonzero exit, or unrecognized "
+            "output, it reports once and stops."
+        )
+        for rel in ("README.md", "docs/AGENTS.md"):
+            with self.subTest(rel=rel), \
+                 open(os.path.join(self.ROOT, rel)) as f:
+                self.assertIn(expected, " ".join(f.read().split()))
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
