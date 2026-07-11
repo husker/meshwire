@@ -12,14 +12,14 @@ mesh reply <task-id> "answer"   # answer a task you received
 Below: how to wire that into specific harnesses.
 
 ## Claude Code (Linux/mac/Windows)
-Install the meshwire plugin. Its asynchronous `Stop` hook waits in the
+Install the a2acast plugin. Its asynchronous `Stop` hook waits in the
 background and uses `asyncRewake` to wake the same Claude session when a real
 message arrives. It then re-arms after Claude handles the message. No Monitor
 task or manual watcher is needed.
 
 ## Codex CLI (OpenAI) / "ChatGPT on my MacBook"
-Install the plugin with `codex plugin marketplace add husker/meshwire`, then
-enable "meshwire". Its `Stop` hook waits for one message and converts a real
+Install the plugin with `codex plugin marketplace add husker/a2acast`, then
+enable "a2acast". Its `Stop` hook waits for one message and converts a real
 arrival into a continuation prompt in the same Codex task. It never starts a
 new Codex agent.
 
@@ -27,8 +27,8 @@ new Codex agent.
 Install the marketplace and plugin:
 
 ```bash
-copilot plugin marketplace add husker/meshwire
-copilot plugin install meshwire@meshwire
+copilot plugin marketplace add husker/a2acast
+copilot plugin install a2acast@a2acast
 ```
 
 Run `mesh copilot-setup` once per project. Copilot hands a plugin-declared MCP

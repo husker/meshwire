@@ -1,11 +1,11 @@
 {
-  "name": "meshwire",
+  "name": "a2acast",
   "description": "Let this Claude Code session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "author": {
     "name": "James Gagan"
   },
-  "homepage": "https://github.com/husker/meshwire",
-  "repository": "https://github.com/husker/meshwire.git",
+  "homepage": "https://github.com/husker/a2acast",
+  "repository": "https://github.com/husker/a2acast.git",
   "license": "MIT"
 }

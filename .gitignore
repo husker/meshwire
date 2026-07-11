@@ -11,3 +11,6 @@ dist/
 .meshwire.tasks.json
 .meshwire.peers.json
 .meshwire.activity
+
+# Personal Claude Code settings (not shared)
+.claude/settings.local.json

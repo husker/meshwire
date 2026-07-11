@@ -1,4 +1,4 @@
-# meshwire
+# a2acast
 
 **Messaging between AI agents on different machines — no server, no
 accounts, no open ports.** One stdlib-only Python file. End-to-end
@@ -11,14 +11,14 @@ Copilot on a Windows PC — all exchanging messages and
 **Machine A** — create the mesh:
 
 ```bash
-pipx install git+https://github.com/husker/meshwire   # or: uv tool install ...
+pipx install git+https://github.com/husker/a2acast   # or: uv tool install ...
 mesh init home   # prints a block to paste on machine B, then starts listening
 ```
 
 **Machine B** — paste the block `mesh init` printed. It looks like:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/husker/meshwire/main/mesh.py
+curl -fsSLO https://raw.githubusercontent.com/husker/a2acast/main/mesh.py
 python3 mesh.py join mesh1-XXXX...
 ```
 
@@ -44,16 +44,16 @@ when a project is a mesh node):
 
 ```
 # Claude Code
-/plugin marketplace add husker/meshwire
-/plugin install meshwire
+/plugin marketplace add husker/a2acast
+/plugin install a2acast
 
 # Codex CLI / ChatGPT desktop
-codex plugin marketplace add husker/meshwire
-codex plugin add meshwire@meshwire
+codex plugin marketplace add husker/a2acast
+codex plugin add a2acast@a2acast
 
 # GitHub Copilot CLI
-copilot plugin marketplace add husker/meshwire
-copilot plugin install meshwire@meshwire
+copilot plugin marketplace add husker/a2acast
+copilot plugin install a2acast@a2acast
 mesh copilot-setup            # once per project — pins the watcher to this node
 ```
 
@@ -78,7 +78,7 @@ The loop each session runs:
    `.github/mcp.json`). After that its MCP-server watcher listens and wakes the
    session automatically — nothing to arm. Handling happens out of band (no
    "working" spinner); the next prompt you send opens with a one-line note of
-   anything meshwire handled while you were away.
+   anything a2acast handled while you were away.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with
@@ -92,7 +92,7 @@ way: the plugin teaches sessions the protocol, it doesn't create the mesh.
 On Copilot you also run `mesh copilot-setup` once per project. The plugin's
 hooks and MCP server invoke the `mesh` CLI on your PATH — the same one
 `mesh init` installed — so it works the same on macOS, Linux, and Windows.
-Keep it current: `pipx upgrade meshwire` (or `uv tool upgrade meshwire`) when
+Keep it current: `pipx upgrade a2acast` (or `uv tool upgrade a2acast`) when
 you update the plugin.)
 
 ## How it works
@@ -164,14 +164,14 @@ What you still must do:
   mesh*, not intent: any agent (or person) holding the key can send tasks.
   Receiving agents should apply their normal permission rules.
 - Sender names prove a shared-key member made the assertion, not which member:
-  every node holds the same group key. Meshwire rejects A2A metadata that
+  every node holds the same group key. a2acast rejects A2A metadata that
   disagrees with its authenticated outer route, but a compromised member can
   still choose another member's sender name in that outer route.
 - Someone who learns a topic id (but not the key) can't read or forge
   messages, but can post garbage that your watcher silently drops.
   Self-hosting ntfy with auth (`mesh init --server https://ntfy.example`)
   closes even that.
-- Upgrade all machines together when moving to a new meshwire version —
+- Upgrade all machines together when moving to a new a2acast version —
   it's one file. (v0.4 meshes interoperate; v0.4 clients just render the
   new join/ping control messages as odd one-off messages.)
 
@@ -198,7 +198,7 @@ mesh claude-setup              print the CLAUDE.md protocol section
 
 ## How it compares
 
-| | meshwire | shared MCP queue | SSH + headless agent | plain git polling |
+| | a2acast | shared MCP queue | SSH + headless agent | plain git polling |
 |---|---|---|---|---|
 | Infrastructure | none | server to run | SSH + reachable host | none |
 | Wake latency | ~1 s | poll interval | seconds | poll interval |

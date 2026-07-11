@@ -1,13 +1,13 @@
 {
-  "name": "meshwire",
-  "version": "0.10.1",
+  "name": "a2acast",
+  "version": "0.11.0",
   "description": "Let this session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
   "skills": "./skills/",
   "interface": {
-    "displayName": "meshwire",
+    "displayName": "a2acast",
     "shortDescription": "Zero-infrastructure E2E-encrypted messaging between AI agents on different machines.",
     "developerName": "James Gagan",
     "category": "Productivity",
-    "websiteURL": "https://github.com/husker/meshwire"
+    "websiteURL": "https://github.com/husker/a2acast"
   }
 }

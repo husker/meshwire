@@ -20,7 +20,7 @@
             "command": "mesh codex-hook --timeout 86370",
             "commandWindows": "mesh codex-hook --timeout 86370",
             "timeout": 86400,
-            "statusMessage": "Waiting for Meshwire messages"
+            "statusMessage": "Waiting for a2acast messages"
           }
         ]
       }

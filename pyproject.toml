@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meshwire"
-version = "0.10.1"
+name = "a2acast"
+version = "0.11.0"
 description = "Zero-infrastructure messaging between AI agent sessions on different machines (ntfy.sh wake pings + your shared repo as the payload channel)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,11 +19,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/husker/meshwire"
+Homepage = "https://github.com/husker/a2acast"
 
 [project.scripts]
 mesh = "mesh:main"
-meshwire = "mesh:main"
+a2acast = "mesh:main"
 
 [tool.setuptools]
 py-modules = ["mesh"]

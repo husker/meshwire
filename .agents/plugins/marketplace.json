@@ -1,18 +1,18 @@
 {
-  "name": "meshwire",
+  "name": "a2acast",
   "plugins": [
     {
-      "name": "meshwire",
+      "name": "a2acast",
       "source": {
         "source": "local",
-        "path": "./plugins/meshwire"
+        "path": "./plugins/a2acast"
       },
       "policy": {
         "installation": "AVAILABLE"
       },
       "category": "Productivity",
       "interface": {
-        "displayName": "meshwire"
+        "displayName": "a2acast"
       }
     }
   ]

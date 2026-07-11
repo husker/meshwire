@@ -1,18 +1,18 @@
 {
-  "name": "meshwire",
+  "name": "a2acast",
   "owner": {
     "name": "James Gagan"
   },
   "metadata": {
-    "description": "Meshwire plugins for cross-machine agent messaging",
-    "version": "0.10.1"
+    "description": "a2acast plugins for cross-machine agent messaging",
+    "version": "0.11.0"
   },
   "plugins": [
     {
-      "name": "meshwire",
+      "name": "a2acast",
       "description": "Encrypted messaging and A2A tasks between agent sessions on different machines.",
-      "version": "0.10.1",
-      "source": "./plugins/copilot-meshwire",
+      "version": "0.11.0",
+      "source": "./plugins/copilot-a2acast",
       "author": {
         "name": "James Gagan"
       },

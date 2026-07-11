@@ -1,22 +1,22 @@
 {
-  "name": "meshwire",
+  "name": "a2acast",
   "owner": {
     "name": "James Gagan"
   },
   "metadata": {
-    "description": "Meshwire — encrypted, zero-infrastructure messaging between AI agents on different machines",
-    "version": "0.10.1"
+    "description": "a2acast — encrypted, zero-infrastructure messaging between AI agents on different machines",
+    "version": "0.11.0"
   },
   "plugins": [
     {
-      "name": "meshwire",
+      "name": "a2acast",
       "source": "./",
       "description": "Let this Claude Code session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
-      "version": "0.10.1",
+      "version": "0.11.0",
       "author": {
         "name": "James Gagan"
       },
-      "homepage": "https://github.com/husker/meshwire",
+      "homepage": "https://github.com/husker/a2acast",
       "license": "MIT",
       "category": "Productivity"
     }

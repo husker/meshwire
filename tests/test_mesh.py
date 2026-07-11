@@ -200,7 +200,7 @@ class MembershipCmdTests(unittest.TestCase):
     """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
 
     def setUp(self):
-        self._env = os.environ.pop("MESHWIRE_NODE", None)
+        self._env = os.environ.pop("a2acast_NODE", None)
         self._tmp = tempfile.TemporaryDirectory()
         self._old = os.getcwd()
         os.chdir(self._tmp.name)
@@ -209,7 +209,7 @@ class MembershipCmdTests(unittest.TestCase):
         os.chdir(self._old)
         self._tmp.cleanup()
         if self._env is not None:
-            os.environ["MESHWIRE_NODE"] = self._env
+            os.environ["a2acast_NODE"] = self._env
 
     def test_init_without_nodes_uses_hostname(self):
         ns = argparse.Namespace(name="home", nodes=None,
@@ -521,7 +521,7 @@ class SendStatusInviteTests(MembershipCmdTests):
             mesh.cmd_invite(argparse.Namespace())
         text = out.getvalue()
         self.assertIn("curl -fsSLO https://raw.githubusercontent.com/husker/"
-                      "meshwire/main/mesh.py", text)
+                      "a2acast/main/mesh.py", text)
         self.assertIn("python3 mesh.py join mesh1-", text)
 
 
@@ -1447,7 +1447,7 @@ class WatchTests(MembershipCmdTests):
 
     def test_whitespace_prefixed_malicious_task_id_is_skipped(self):
         self._assert_whitespace_prefixed_invalid_task_id_is_skipped(
-            "safe; touch /tmp/meshwire-pwned")
+            "safe; touch /tmp/a2acast-pwned")
 
     def test_whitespace_prefixed_missing_task_id_is_skipped(self):
         self._assert_whitespace_prefixed_invalid_task_id_is_skipped(...)
@@ -1458,7 +1458,7 @@ class WatchTests(MembershipCmdTests):
     def test_malicious_a2a_task_id_is_dropped_without_consuming_one_shot(self):
         cfg = self._setup_mesh()
         env = mesh.make_send_envelope("beta", "alpha", "run tests")
-        malicious_id = "safe; touch /tmp/meshwire-pwned"
+        malicious_id = "safe; touch /tmp/a2acast-pwned"
         env["params"]["message"]["taskId"] = malicious_id
         evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
                self._msg_event(cfg, "beta", "real message", "m2", 201)]
@@ -1563,7 +1563,7 @@ class CodexHookTests(MembershipCmdTests):
                       out.getvalue())
         self.assertIn("send its result with mesh reply without asking",
                       out.getvalue())
-        self.assertIn("external side effects beyond the Meshwire reply",
+        self.assertIn("external side effects beyond the a2acast reply",
                       out.getvalue())
 
     def test_message_becomes_same_task_continuation_without_raw_json(self):
@@ -1933,17 +1933,17 @@ class AutoWatchTests(MembershipCmdTests):
 class PluginManifestTests(unittest.TestCase):
     """Harness plugin files parse, point at real paths, and match versions.
 
-    The Codex plugin lives nested at plugins/meshwire/ (Codex silently drops
+    The Codex plugin lives nested at plugins/a2acast/ (Codex silently drops
     a plugin whose folder is the marketplace root) with real COPIES of the
     shared skill/hook (its installer skips symlinks) — the byte-identity
     test below is what makes that duplication safe.
     """
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    PLUGIN_DIR = os.path.join(ROOT, "plugins", "meshwire")
-    COPILOT_PLUGIN_DIR = os.path.join(ROOT, "plugins", "copilot-meshwire")
-    MANIFEST = "plugins/meshwire/.codex-plugin/plugin.json"
-    COPILOT_MANIFEST = "plugins/copilot-meshwire/plugin.json"
+    PLUGIN_DIR = os.path.join(ROOT, "plugins", "a2acast")
+    COPILOT_PLUGIN_DIR = os.path.join(ROOT, "plugins", "copilot-a2acast")
+    MANIFEST = "plugins/a2acast/.codex-plugin/plugin.json"
+    COPILOT_MANIFEST = "plugins/copilot-a2acast/plugin.json"
 
     def _load(self, rel):
         with open(os.path.join(self.ROOT, rel)) as f:
@@ -1976,7 +1976,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.10.1")
+        self.assertEqual(release, "0.11.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -1989,7 +1989,7 @@ class PluginManifestTests(unittest.TestCase):
         self.assertEqual(claude_market["plugins"][0]["version"], release)
         # in-code version strings must not drift from pyproject either
         self.assertEqual(mesh.VERSION, release)
-        self.assertEqual(mesh.USER_AGENT, f"meshwire/{release}")
+        self.assertEqual(mesh.USER_AGENT, f"a2acast/{release}")
         self.assertEqual(mesh.MESH_MCP_VERSION, release)
 
     def test_claude_marketplace_publishes_root_plugin(self):
@@ -1997,10 +1997,10 @@ class PluginManifestTests(unittest.TestCase):
         # .claude-plugin/marketplace.json; a missing file is the "Marketplace
         # file not found" install error.
         market = self._load(".claude-plugin/marketplace.json")
-        self.assertEqual(market["name"], "meshwire")
+        self.assertEqual(market["name"], "a2acast")
         self.assertIn("name", market["owner"])
         entry = market["plugins"][0]
-        self.assertEqual(entry["name"], "meshwire")
+        self.assertEqual(entry["name"], "a2acast")
         # root-as-plugin: source "./" must point at a dir with plugin.json
         self.assertEqual(entry["source"], "./")
         self.assertTrue(os.path.isfile(
@@ -2019,7 +2019,7 @@ class PluginManifestTests(unittest.TestCase):
             "plugin should not bundle mesh.py; it invokes the mesh CLI")
 
     def test_codex_hooks_wait_for_messages_without_periodic_prompts(self):
-        hooks = self._load("plugins/meshwire/hooks/hooks.json")["hooks"]
+        hooks = self._load("plugins/a2acast/hooks/hooks.json")["hooks"]
         session = hooks["SessionStart"][0]["hooks"][0]
         # cross-platform: invoke the `mesh` CLI, not python3/py -3
         self.assertTrue(session["command"].startswith("mesh "))
@@ -2333,7 +2333,7 @@ class MCPServeTests(unittest.TestCase):
         resp = self._initialize(srv, out, sampling=True)
         self.assertEqual(resp["id"], 1)
         self.assertIn("tools", resp["result"]["capabilities"])
-        self.assertEqual(resp["result"]["serverInfo"]["name"], "meshwire")
+        self.assertEqual(resp["result"]["serverInfo"]["name"], "a2acast")
         self.assertTrue(srv._client_sampling)
 
     def test_initialize_without_sampling_capability(self):
@@ -2520,7 +2520,7 @@ class CopilotSetupTests(unittest.TestCase):
     def test_writes_server_with_explicit_abs_config(self):
         project = self._project()
         self._run(project)
-        srv = self._mcp(project)["mcpServers"]["meshwire"]
+        srv = self._mcp(project)["mcpServers"]["a2acast"]
         self.assertEqual(srv["type"], "local")
         self.assertEqual(srv["command"], "mesh")
         self.assertEqual(srv["args"][:2], ["mcp-serve", "--config"])
@@ -2547,7 +2547,7 @@ class CopilotSetupTests(unittest.TestCase):
         self._run(project)
         servers = self._mcp(project)["mcpServers"]
         self.assertIn("other", servers)
-        self.assertIn("meshwire", servers)
+        self.assertIn("a2acast", servers)
 
     def test_no_mesh_node_errors(self):
         tmp = tempfile.TemporaryDirectory()
@@ -2580,7 +2580,7 @@ class CopilotActivityTests(MembershipCmdTests):
             f.write("message from mac-codex: hi\ntask from laptop: run\n")
         result = self._run({"cwd": os.getcwd(), "prompt": "hello"})
         ctx = result["additionalContext"]
-        self.assertIn("Meshwire", ctx)
+        self.assertIn("a2acast", ctx)
         self.assertIn("mac-codex", ctx)
         self.assertIn("laptop", ctx)
         # cleared so the next prompt doesn't repeat it
