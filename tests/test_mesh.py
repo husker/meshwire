@@ -488,6 +488,19 @@ def fake_stream(events):
     return _http
 
 
+def fake_raw_stream(lines):
+    """A mesh.http replacement for byte-exact relay response lines."""
+    state = {"calls": 0}
+
+    def _http(url, data=None, headers=None, timeout=15):
+        state["calls"] += 1
+        if state["calls"] > 1:
+            raise _TestDone()
+        return _FakeResp(lines)
+
+    return _http
+
+
 class StreamEventsTests(unittest.TestCase):
     def test_yields_messages_dedupes_and_survives_noise(self):
         cfg = make_cfg()
@@ -533,6 +546,50 @@ class StreamEventsTests(unittest.TestCase):
             self.assertEqual(next(gen)["id"], "m2")
             self.assertEqual(next(gen)["id"], "m3")
         self.assertEqual(skip, {"m3"})
+
+    def test_malformed_utf8_line_is_dropped_before_valid_message(self):
+        valid = {"event": "message", "id": "valid", "time": 101,
+                 "message": "real"}
+        lines = [b'{"event":"message","id":"bad","time":100,'
+                 b'"message":"\xff"}\n',
+                 json.dumps(valid).encode() + b"\n"]
+        with mock.patch.object(mesh, "http", fake_raw_stream(lines)):
+            gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=None)
+            self.assertEqual(next(gen), valid)
+
+    def test_invalid_relay_times_are_dropped_before_valid_message(self):
+        invalid_lines = [
+            b'{"event":"message","id":"infinite","time":1e999,'
+            b'"message":"hidden"}\n',
+            json.dumps({"event": "message", "id": "boolean", "time": True,
+                        "message": "hidden"}).encode() + b"\n",
+            json.dumps({"event": "message", "id": "fractional",
+                        "time": 100.5,
+                        "message": "hidden"}).encode() + b"\n",
+            json.dumps({"event": "message", "id": "malformed",
+                        "time": "not-a-time",
+                        "message": "hidden"}).encode() + b"\n",
+        ]
+        valid = {"event": "message", "id": "valid", "time": 101,
+                 "message": "real"}
+        lines = invalid_lines + [json.dumps(valid).encode() + b"\n"]
+        with mock.patch.object(mesh, "http", fake_raw_stream(lines)):
+            gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=None)
+            self.assertEqual(next(gen), valid)
+
+    def test_integral_numeric_and_string_relay_times_are_accepted(self):
+        events = [
+            {"event": "message", "id": "integer", "time": 100,
+             "message": "one"},
+            {"event": "message", "id": "float", "time": 101.0,
+             "message": "two"},
+            {"event": "message", "id": "string", "time": "102",
+             "message": "three"},
+        ]
+        with mock.patch.object(mesh, "http", fake_stream(events)):
+            gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=None)
+            self.assertEqual([next(gen)["id"] for _ in events],
+                             ["integer", "float", "string"])
 
 
 class WatchTests(MembershipCmdTests):
@@ -632,6 +689,38 @@ class WatchTests(MembershipCmdTests):
                       out.getvalue())
         with open(".meshwire.cursor-alpha") as f:
             self.assertEqual(json.load(f)["since"], 200)
+
+    def test_malformed_utf8_stream_precedes_valid_delivery_and_sentinel(self):
+        cfg = self._setup_mesh()
+        valid = self._msg_event(cfg, "beta", "real message", "valid", 201)
+        lines = [b"\xff\xfe\n", json.dumps(valid).encode() + b"\n"]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_raw_stream(lines)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertIn("real message", out.getvalue())
+        self._assert_trusted_watch_done(out.getvalue(), "message")
+
+    def test_direct_watch_drops_invalid_times_before_valid_delivery(self):
+        cfg = self._setup_mesh()
+        invalid_times = [float("inf"), True, 200.5, "not-a-time"]
+        invalid = [self._msg_event(cfg, "beta", "hidden", f"bad-{i}", t)
+                   for i, t in enumerate(invalid_times)]
+        valid = self._msg_event(cfg, "beta", "real message", "valid", 201)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter(invalid + [valid])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("hidden", out.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self._assert_trusted_watch_done(out.getvalue(), "message")
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f), {"since": 201, "seen": ["valid"]})
 
     def test_one_shot_message_escapes_forged_markers_and_ends_with_kind(self):
         cfg = self._setup_mesh()

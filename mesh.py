@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -730,6 +731,21 @@ def cmd_send(args):
               "the message)")
 
 
+def _relay_time(value):
+    """Return a relay timestamp as an int, or None for unsafe forms."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value):
+        return int(value)
+    return None
+
+
 def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
     """Yield ntfy message events from `tpc` until `deadline` (None = forever).
 
@@ -753,7 +769,7 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                 for raw in r:
                     try:
                         ev = json.loads(raw.decode("utf-8"))
-                    except json.JSONDecodeError:
+                    except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
                     if not isinstance(ev, dict):
                         continue
@@ -764,12 +780,11 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                         continue
                     if not isinstance(ev.get("id"), str):
                         continue
-                    try:
-                        int(ev.get("time", since))
-                    except (TypeError, ValueError):
+                    relay_time = _relay_time(ev.get("time", since))
+                    if relay_time is None:
                         continue
                     backoff = 1
-                    t = str(ev.get("time", since))
+                    t = str(relay_time)
                     if t != since:
                         skip.clear()  # new second — older ids can't replay
                         since = t
@@ -952,11 +967,10 @@ def cmd_watch(args):
     timeout = args.timeout or (None if args.follow else 10800)
     deadline = (time.time() + timeout) if timeout else None
 
-    def save_cursor(ev):
+    def save_cursor(ev, t):
         # resume from this message's second; remember ids seen in that second
         # so re-delivery on the boundary is filtered, not re-consumed
         nonlocal since, seen
-        t = int(ev.get("time", time.time()))
         seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
         since = t
         with open(cf, "w", encoding="utf-8") as f:
@@ -966,12 +980,11 @@ def cmd_watch(args):
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
         if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
             continue
-        try:
-            int(ev.get("time", time.time()))
-        except (TypeError, ValueError):
+        relay_time = _relay_time(ev.get("time", int(time.time())))
+        if relay_time is None:
             continue
         frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(ev, cfg)
-        save_cursor(ev)
+        save_cursor(ev, relay_time)
         if not trusted:
             if body != "":
                 print(f"MESH_WARN: dropped unauthenticated message "
