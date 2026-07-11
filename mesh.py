@@ -898,8 +898,12 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                     yield ev
                     if deadline and time.time() >= deadline:
                         return
-        except (urllib.error.URLError, socket.timeout, TimeoutError,
-                ConnectionError):
+        except (urllib.error.URLError, HTTPException, OSError):
+            # Any transient network/TLS/stream failure on this long-lived
+            # connection (URLError, ssl.SSLError, http IncompleteRead, socket
+            # timeouts and resets — all OSError or HTTPException) must trigger
+            # a reconnect, never crash the watcher process. Exiting nonzero
+            # here makes a Copilot session stop re-arming its watcher.
             pass
         if time.time() - started < 5:
             time.sleep(min(backoff, 30))

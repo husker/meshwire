@@ -5,12 +5,14 @@ Run from the repo root:  python3 -m unittest discover -s tests -v
 import argparse
 import base64
 import contextlib
+import http.client
 import io
 import json
 import os
 import re
 import secrets
 import signal
+import ssl
 import sys
 import tempfile
 import threading
@@ -569,7 +571,56 @@ def fake_raw_stream(lines):
     return _http
 
 
+def fake_stream_raises(exc):
+    """A mesh.http replacement whose first response drops mid-iteration by
+    raising `exc`; the reconnect dial raises _TestDone so a resilient loop
+    escapes the test, while a crashing loop surfaces the raw `exc`."""
+    state = {"calls": 0}
+
+    class _Raiser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise exc
+
+        def close(self):
+            pass
+
+    def _http(url, data=None, headers=None, timeout=15):
+        state["calls"] += 1
+        if state["calls"] > 1:
+            raise _TestDone()
+        return _Raiser()
+
+    return _http
+
+
 class StreamEventsTests(unittest.TestCase):
+    def test_reconnects_on_dropped_stream_errors(self):
+        # A long-lived TLS stream to the relay drops with these mid-read; the
+        # watcher must reconnect (our fake redial raises _TestDone), not crash
+        # the process with an uncaught exception (exit 1).
+        cfg = make_cfg()
+        drops = [
+            ssl.SSLError("record layer failure"),
+            ssl.SSLEOFError("unexpected eof"),
+            http.client.IncompleteRead(b"partial"),
+            OSError("generic socket failure"),
+        ]
+        for exc in drops:
+            with self.subTest(exc=type(exc).__name__), \
+                 mock.patch.object(mesh, "http", fake_stream_raises(exc)), \
+                 mock.patch("time.sleep"):
+                gen = mesh._stream_events(cfg, "tp", "0", deadline=None)
+                self.assertRaises(_TestDone, next, gen)
+
     def test_yields_messages_dedupes_and_survives_noise(self):
         cfg = make_cfg()
         evs = [
@@ -2106,7 +2157,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.7.8")
+        self.assertEqual(release, "0.7.9")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
