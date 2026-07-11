@@ -50,8 +50,11 @@ BROADCAST = "all"
 USER_AGENT = "meshwire/0.7"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
-# ntfy message times are Unix seconds. 2100-01-01 is far beyond the supported
-# release horizon while bounding attacker-controlled integer conversions.
+# Relay clocks may lead the local clock briefly, but a wider window would let
+# a replay move a subscriber cursor past legitimate messages.
+RELAY_FUTURE_SKEW = 300
+# A fixed syntax bound prevents pathological integer conversion before the
+# tighter current-time check is applied.
 MAX_RELAY_TIME = 4_102_444_800
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "meshwire-agent-hook-"
@@ -347,13 +350,25 @@ def _unwrap(ev, cfg):
     if att and att.get("url"):
         if att.get("size", 0) > MAX_ATTACHMENT:
             return message
-        # only fetch from the mesh's own server, never a third-party URL
-        if not att["url"].startswith(cfg["server"] + "/"):
+        # Only fetch from the mesh's exact relay origin and configured path.
+        # urlsplit normalizes control whitespace, so reject it beforehand.
+        url = att["url"]
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
             return message
         try:
-            with http(att["url"], timeout=30) as r:
+            relay = urllib.parse.urlsplit(cfg["server"])
+            target = urllib.parse.urlsplit(url)
+            relay_path = relay.path.rstrip("/") + "/"
+            if (target.scheme.lower() != relay.scheme.lower() or
+                    target.netloc.lower() != relay.netloc.lower() or
+                    target.username is not None or
+                    target.password is not None or
+                    not target.path.startswith(relay_path) or target.fragment):
+                return message
+            with http(url, timeout=30) as r:
                 return r.read(MAX_ATTACHMENT).decode("utf-8", "replace")
-        except (urllib.error.URLError, socket.timeout):
+        except (urllib.error.URLError, socket.timeout, TimeoutError,
+                HTTPException, ValueError, OSError):
             return message
     return message
 
@@ -363,40 +378,47 @@ def _open(ev, cfg, me=None):
     Returns (sender_or_None, body_text, trusted: bool, ctl_or_None).
     trusted=True only for messages that authenticated under the mesh key;
     ctl is the control payload ("c" field) for announce/ping/pong messages."""
-    return _open_with_fingerprint(ev, cfg, me)[:4]
+    opened = _open_details(ev, cfg, me)
+    return opened[0], opened[2], opened[3], opened[4]
 
 
 def _open_with_fingerprint(ev, cfg, me=None):
     """Like _open, plus a stable fingerprint of authenticated ciphertext."""
+    opened = _open_details(ev, cfg, me)
+    return opened[0], opened[2], opened[3], opened[4], opened[5]
+
+
+def _open_details(ev, cfg, me=None):
+    """Open a relay event, retaining the authenticated wrapper recipient."""
     body = _unwrap(ev, cfg)
     if not isinstance(body, str):
-        return None, "", False, None, None
+        return None, None, "", False, None, None
     pt = decrypt(cfg, body)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
         except (json.JSONDecodeError, ValueError):
-            return None, "", False, None, None
+            return None, None, "", False, None, None
         if (not isinstance(wrapper, dict) or
                 not isinstance(wrapper.get("f"), str) or
                 not isinstance(wrapper.get("t"), str) or
                 not isinstance(wrapper.get("b"), str) or
                 ("c" in wrapper and not isinstance(wrapper["c"], dict)) or
                 (me is not None and wrapper["t"] not in (me, BROADCAST))):
-            return None, "", False, None, None
+            return None, None, "", False, None, None
         fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        return (wrapper["f"], wrapper["b"], True,
+        return (wrapper["f"], wrapper["t"], wrapper["b"], True,
                 wrapper.get("c"), fingerprint)
     if body.startswith(WIRE_MAGIC):
-        return None, "", False, None, None
+        return None, None, "", False, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     if "title" in ev and not isinstance(title, str):
-        return None, "", False, None, None
+        return None, None, "", False, None, None
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, body, not cfg.get("key"), None, None
+    return frm, None, body, not cfg.get("key"), None, None
 
 
 def _parse_envelope(body):
@@ -406,7 +428,7 @@ def _parse_envelope(body):
         return None
     try:
         obj = json.loads(candidate)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None
     return obj if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" else None
 
@@ -443,8 +465,13 @@ def save_task(cfg, task_id, **fields):
 
 
 def _text_of(message_or_artifact):
-    return "\n".join(p.get("text", "") for p in
-                     message_or_artifact.get("parts", []) if "text" in p)
+    if not isinstance(message_or_artifact, dict):
+        return ""
+    parts = message_or_artifact.get("parts", [])
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(p["text"] for p in parts
+                     if isinstance(p, dict) and isinstance(p.get("text"), str))
 
 
 def make_send_envelope(sender, to, text, task_id=None, context_id=None):
@@ -493,23 +520,78 @@ def make_result_envelope(sender, to, task_id, context_id, state, text,
             "result": task}
 
 
-def envelope_summary(env):
-    """(kind, task_id, context_id, state, from_node, text) for any envelope."""
-    if "method" in env:  # request: message/send
-        msg = env.get("params", {}).get("message", {})
-        meta = env.get("params", {}).get("metadata", {}).get("mesh", {})
+def _envelope_details(env):
+    """Return a total, validated A2A summary including both route names."""
+    if not isinstance(env, dict) or env.get("jsonrpc") != "2.0":
+        return None
+    if "method" in env:
+        params = env.get("params")
+        if env.get("method") != "message/send" or not isinstance(params, dict):
+            return None
+        msg = params.get("message")
+        metadata = params.get("metadata")
+        if not isinstance(msg, dict) or not isinstance(metadata, dict):
+            return None
+        meta = metadata.get("mesh")
+        if not isinstance(meta, dict):
+            return None
+        frm, to = meta.get("from"), meta.get("to")
+        if not isinstance(frm, str) or not isinstance(to, str):
+            return None
         return ("request", msg.get("taskId"), msg.get("contextId"),
-                "submitted", meta.get("from"), _text_of(msg))
-    task = env.get("result", {})  # response: task status/result
-    meta = task.get("metadata", {}).get("mesh", {})
-    state = task.get("status", {}).get("state", "?")
-    text = ""
-    for a in task.get("artifacts", []) or []:
-        text += _text_of(a)
-    if not text and task.get("status", {}).get("message"):
-        text = _text_of(task["status"]["message"])
+                "submitted", frm, to, _text_of(msg))
+    task = env.get("result")
+    if not isinstance(task, dict):
+        return None
+    metadata, status = task.get("metadata"), task.get("status")
+    if not isinstance(metadata, dict) or not isinstance(status, dict):
+        return None
+    meta = metadata.get("mesh")
+    if not isinstance(meta, dict):
+        return None
+    frm, to, state = meta.get("from"), meta.get("to"), status.get("state")
+    if (not isinstance(frm, str) or not isinstance(to, str) or
+            not isinstance(state, str)):
+        return None
+    artifacts = task.get("artifacts", [])
+    if artifacts is None:
+        artifacts = []
+    if not isinstance(artifacts, list) or not all(
+            isinstance(artifact, dict) for artifact in artifacts):
+        return None
+    text = "".join(_text_of(artifact) for artifact in artifacts)
+    message = status.get("message")
+    if message is not None and not isinstance(message, dict):
+        return None
+    if not text and message:
+        text = _text_of(message)
     return ("result", task.get("id"), task.get("contextId"), state,
-            meta.get("from"), text)
+            frm, to, text)
+
+
+def envelope_summary(env):
+    """(kind, task_id, context_id, state, from_node, text), or None."""
+    details = _envelope_details(env)
+    if details is None:
+        return None
+    return details[:5] + (details[6],)
+
+
+def _a2a_candidate(body):
+    candidate = body.strip() if isinstance(body, str) else ""
+    return candidate.startswith("{") and '"jsonrpc"' in candidate
+
+
+def _valid_a2a_route(body, frm, recipient):
+    """Bind inner A2A routing metadata to authenticated wrapper routing."""
+    env = _parse_envelope(body)
+    if env is None:
+        return not _a2a_candidate(body)
+    details = _envelope_details(env)
+    if details is None or not _valid_task_id(details[1]):
+        return False
+    return (recipient is None or
+            (details[4] == frm and details[5] == recipient))
 
 
 _LOCAL = threading.local()  # per-thread keep-alive conns (a2a-serve threads)
@@ -736,8 +818,8 @@ def cmd_send(args):
               "the message)")
 
 
-def _relay_time(value):
-    """Return bounded Unix seconds as an int, or None for unsafe forms."""
+def _relay_time(value, now=None):
+    """Return plausible Unix seconds, allowing only narrow future skew."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -756,7 +838,10 @@ def _relay_time(value):
         relay_time = int(digits)
     else:
         return None
-    return relay_time if 0 <= relay_time <= MAX_RELAY_TIME else None
+    if not 0 <= relay_time <= MAX_RELAY_TIME:
+        return None
+    current = int(time.time() if now is None else now)
+    return relay_time if relay_time <= current + RELAY_FUTURE_SKEW else None
 
 
 def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
@@ -767,6 +852,11 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
     die fast (<5s). `first` is an optional already-open response consumed
     before dialing — callers can subscribe before triggering traffic."""
     skip = skip if skip is not None else set()
+    current_since = _relay_time(since)
+    if current_since is None:
+        current_since = max(0, int(time.time()) - 5)
+        skip.clear()
+    since = str(current_since)
     backoff = 1
     while deadline is None or time.time() < deadline:
         chunk = (300 if deadline is None
@@ -795,15 +885,15 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
                     if not isinstance(ev.get("id"), str):
                         continue
                     relay_time = _relay_time(ev.get("time"))
-                    if relay_time is None:
+                    if relay_time is None or relay_time < current_since:
                         continue
                     backoff = 1
-                    t = str(relay_time)
-                    if t != since:
-                        skip.clear()  # new second — older ids can't replay
-                        since = t
                     if ev.get("id") in skip:
                         continue
+                    if relay_time > current_since:
+                        skip.clear()
+                        current_since = relay_time
+                        since = str(relay_time)
                     skip.add(ev.get("id"))
                     yield ev
                     if deadline and time.time() >= deadline:
@@ -822,8 +912,13 @@ def _load_cursor(cf):
     try:
         with open(cf, "r", encoding="utf-8") as f:
             c = json.load(f)
-        return int(c["since"]), c.get("seen", [])
-    except (OSError, ValueError, KeyError):
+        since = _relay_time(c["since"])
+        seen = c.get("seen", [])
+        if since is None or not isinstance(seen, list) or not all(
+                isinstance(event_id, str) for event_id in seen):
+            raise ValueError("invalid cursor")
+        return since, seen
+    except (OSError, ValueError, KeyError, TypeError):
         # fresh cursor: include a small grace window so a ping sent moments
         # before the first watch isn't silently skipped
         return int(time.time()) - 5, []
@@ -838,19 +933,20 @@ def _single_line(value):
             .replace("\u2029", "\\u2029"))
 
 
-def _emit_message(cfg, me, frm, body, ev):
+def _emit_message(cfg, me, frm, body, ev, recipient=None):
     """Print one inbound message or task; return its local delivery kind."""
     env = _parse_envelope(body)
     if env:
-        try:
-            kind, task_id, ctx, state, efrm, text = envelope_summary(env)
-        except (AttributeError, TypeError):
+        details = _envelope_details(env)
+        if details is None:
             print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             return False
-        if not _valid_task_id(task_id):
+        kind, task_id, ctx, state, efrm, eto, text = details
+        authority_to = me if recipient is None else recipient
+        if (not _valid_task_id(task_id) or efrm != frm or
+                eto != authority_to):
             print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             return False
-        frm = efrm or frm
         save_task(cfg, task_id, contextId=ctx, state=state,
                   peer=frm, direction="inbound", text=text,
                   rpcId=env.get("id"))
@@ -865,6 +961,9 @@ def _emit_message(cfg, me, frm, body, ev):
                   f"state={_single_line(state)}: {_single_line(text)}")
             delivery_kind = "task_update"
         print(json.dumps(env), flush=True)
+    elif _a2a_candidate(body):
+        print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
+        return False
     else:
         print(f"MESH_MESSAGE from={_single_line(frm)!r} "
               f"to={_single_line(me)}: {_single_line(body)}")
@@ -986,9 +1085,15 @@ def cmd_watch(args):
         # so re-delivery on the boundary is filtered, not re-consumed
         nonlocal since, seen
         t = _relay_time(ev.get("time"))
-        if t is None:
+        if t is None or t < since:
             return False
-        seen = ([i for i in seen if i] if t == since else []) + [ev.get("id")]
+        if t == since:
+            seen = [i for i in seen if i]
+            if ev.get("id") in seen:
+                return False
+            seen.append(ev.get("id"))
+        else:
+            seen = [ev.get("id")]
         since = t
         with open(cf, "w", encoding="utf-8") as f:
             json.dump({"since": t, "seen": seen[-50:]}, f)
@@ -998,18 +1103,23 @@ def cmd_watch(args):
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
         if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
             continue
-        frm, body, trusted, ctl, fingerprint = _open_with_fingerprint(
+        event_time = _relay_time(ev.get("time"))
+        if (event_time is None or event_time < since or
+                (event_time == since and ev.get("id") in seen)):
+            continue
+        frm, recipient, body, trusted, ctl, fingerprint = _open_details(
             ev, cfg, me)
         if not trusted:
             if body != "":
                 print(f"MESH_WARN: dropped unauthenticated message "
                       f"id={_single_line(ev.get('id'))}", file=sys.stderr)
             continue
-        if not save_cursor(ev):
+        if not ctl and not _valid_a2a_route(body, frm, recipient):
+            print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             continue
         if fingerprint in replay_seen:
-            if frm != me and not ctl:
-                _send_ack(cfg, me, frm, ev)
+            continue
+        if not save_cursor(ev):
             continue
         if fingerprint:
             replay_seen.add(fingerprint)
@@ -1027,7 +1137,8 @@ def cmd_watch(args):
             continue
         note_peer(cfg, frm, "message")
         _send_ack(cfg, me, frm, ev)
-        delivery_kind = _emit_message(cfg, me, frm, body, ev)
+        delivery_kind = _emit_message(cfg, me, frm, body, ev,
+                                      recipient=recipient)
         if delivery_kind is not False:
             delivered = True
             if not args.follow:
@@ -1282,15 +1393,32 @@ def cmd_peek(args):
     url = f"{cfg['server']}/{topic(cfg, node)}/json?poll=1&since={args.since}"
     try:
         with http(url, timeout=15) as r:
-            body = r.read().decode("utf-8")
-    except (urllib.error.URLError, socket.timeout) as e:
+            body = r.read()
+    except (urllib.error.URLError, socket.timeout, TimeoutError,
+            HTTPException, ValueError, OSError) as e:
         sys.exit(f"error: peek failed: {e}")
-    msgs = [json.loads(l) for l in body.splitlines() if l.strip()]
-    msgs = [m for m in msgs if m.get("event") == "message"]
+    msgs = []
+    for raw in body.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
+                TypeError):
+            continue
+        if (not isinstance(event, dict) or event.get("event") != "message" or
+                not isinstance(event.get("id"), str) or
+                _relay_time(event.get("time")) is None or
+                not isinstance(event.get("message"), str)):
+            continue
+        msgs.append(event)
     if not msgs:
         print(f"(no messages for '{node}' since {args.since})")
     for m in msgs:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["time"]))
+        relay_time = _relay_time(m["time"])
+        ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                           time.localtime(relay_time))
         frm, text, trusted, ctl = _open(m, cfg, node)
         if trusted and frm:
             note_peer(cfg, frm, "message")
@@ -1371,14 +1499,19 @@ def _await_result(cfg, me, task_id, timeout, first=None):
     deadline = time.time() + timeout
     for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
                              first=first):
-        frm, body, trusted, ctl = _open(ev, cfg, me)
+        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
         if not trusted or ctl:
             continue
-        note_peer(cfg, frm, "message")
         env = _parse_envelope(body)
         if not env:
             continue
-        kind, tid, ctx, state, efrm, text = envelope_summary(env)
+        details = _envelope_details(env)
+        if details is None:
+            continue
+        kind, tid, ctx, state, efrm, eto, text = details
+        if recipient is not None and (efrm != frm or eto != recipient):
+            continue
+        note_peer(cfg, frm, "message")
         if tid == task_id and kind == "result":
             save_task(cfg, tid, contextId=ctx, state=state,
                       peer=efrm or frm, direction="outbound", result=text)

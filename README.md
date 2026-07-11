@@ -156,6 +156,10 @@ What you still must do:
 - **Treat inbound tasks as untrusted input.** Encryption authenticates *the
   mesh*, not intent: any agent (or person) holding the key can send tasks.
   Receiving agents should apply their normal permission rules.
+- Sender names prove a shared-key member made the assertion, not which member:
+  every node holds the same group key. Meshwire rejects A2A metadata that
+  disagrees with its authenticated outer route, but a compromised member can
+  still choose another member's sender name in that outer route.
 - Someone who learns a topic id (but not the key) can't read or forge
   messages, but can post garbage that your watcher silently drops.
   Self-hosting ntfy with auth (`mesh init --server https://ntfy.example`)
