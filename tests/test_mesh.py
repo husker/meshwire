@@ -1574,7 +1574,7 @@ class CodexHookTests(MembershipCmdTests):
         command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
         self.assertEqual(
             __import__("shlex").split(command),
-            [sys.executable, os.path.realpath(fake_file),
+            ["python3", os.path.realpath(fake_file),
              "watch", "--timeout", "86370"],
         )
 
@@ -1640,8 +1640,50 @@ class CodexHookTests(MembershipCmdTests):
             command = mesh._copilot_watch_command(platform="nt")
         self.assertEqual(
             command,
-            "& '" + sys.executable.replace("'", "''") + "' "
+            "& 'py' '-3' "
             "'C:\\plugin root & literal\\mesh.py' 'watch' '--timeout' '86370'",
+        )
+
+    def test_copilot_autostart_writes_repo_prompt_hook(self):
+        # Copilot drops prompt-type sessionStart entries shipped by plugins;
+        # only repo-level .github/hooks files auto-submit a first turn, which
+        # is what arms the watcher in an otherwise idle session.
+        self._setup_mesh()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_autostart(argparse.Namespace())
+        path = os.path.join(".github", "hooks", "meshwire-autostart.json")
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["version"], 1)
+        entries = cfg["hooks"]["sessionStart"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["type"], "prompt")
+        self.assertIn("MESHWIRE_WATCH_COMMAND", entries[0]["prompt"])
+        self.assertIn("meshwire-autostart.json", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_copilot_autostart(argparse.Namespace())
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(cfg, json.load(f))
+
+    def test_copilot_autostart_outside_mesh_exits(self):
+        with self.assertRaises(SystemExit):
+            mesh.cmd_copilot_autostart(argparse.Namespace())
+
+    def test_copilot_watch_command_uses_plain_python3_on_posix(self):
+        # Copilot matches persisted shell approvals by command identifier;
+        # sys.executable resolves to names like python3.14 that never match,
+        # so every watcher launch re-prompts. Use the same interpreter name
+        # the hooks manifest itself invokes.
+        fake_file = "/plugin root $(literal)/mesh.py"
+        with mock.patch.object(mesh, "__file__", fake_file), \
+             mock.patch.object(mesh.os.path, "realpath",
+                               return_value=fake_file):
+            command = mesh._copilot_watch_command(platform="posix")
+        self.assertEqual(
+            command,
+            "python3 '/plugin root $(literal)/mesh.py' watch "
+            "--timeout 86370",
         )
 
     def test_claude_message_exits_two_and_writes_wake_context(self):
@@ -2022,7 +2064,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.7.6")
+        self.assertEqual(release, "0.7.7")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]

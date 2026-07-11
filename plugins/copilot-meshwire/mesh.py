@@ -1174,11 +1174,17 @@ cmd_claude_session_hook = cmd_agent_session_hook
 
 
 def _copilot_watch_command(platform=None):
-    argv = [sys.executable, os.path.realpath(__file__),
-            "watch", "--timeout", "86370"]
+    # Copilot matches persisted shell approvals by command identifier;
+    # sys.executable resolves to names like python3.14 that never match a
+    # user's `python3` approval, so every launch would re-prompt. Use the
+    # same interpreter name the hooks manifest invokes.
     if (platform or os.name) == "nt":
+        argv = ["py", "-3", os.path.realpath(__file__),
+                "watch", "--timeout", "86370"]
         quoted = ["'" + value.replace("'", "''") + "'" for value in argv]
         return "& " + " ".join(quoted)
+    argv = ["python3", os.path.realpath(__file__),
+            "watch", "--timeout", "86370"]
     return shlex.join(argv)
 
 
@@ -1817,6 +1823,36 @@ def cmd_claude_setup(args):
     print(CLAUDE_SNIPPET, end="")
 
 
+COPILOT_AUTOSTART_PROMPT = (
+    "Meshwire session start. If your context contains "
+    "MESHWIRE_WATCH_COMMAND, arm the watcher now exactly as instructed "
+    "there, then reply 'mesh: watching'. Otherwise reply 'ok'."
+)
+
+
+def cmd_copilot_autostart(args):
+    """Write a repo-level Copilot prompt hook that arms the watcher when a
+    new interactive session opens. Copilot drops prompt-type sessionStart
+    entries shipped by plugins, so this must live in the project."""
+    cfg = load_config()
+    hooks_dir = os.path.join(cfg["_dir"], ".github", "hooks")
+    os.makedirs(hooks_dir, exist_ok=True)
+    path = os.path.join(hooks_dir, "meshwire-autostart.json")
+    doc = {
+        "version": 1,
+        "hooks": {
+            "sessionStart": [
+                {"type": "prompt", "prompt": COPILOT_AUTOSTART_PROMPT}
+            ]
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    print(f"wrote {path}\nnew interactive Copilot sessions in this project "
+          "now arm the mesh watcher on open")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="mesh",
@@ -1961,6 +1997,11 @@ def main():
                        help="print a CLAUDE.md section teaching an agent "
                             "session the protocol")
     p.set_defaults(fn=cmd_claude_setup)
+
+    p = sub.add_parser("copilot-autostart",
+                       help="write a repo-level Copilot hook that arms the "
+                            "watcher when a session opens")
+    p.set_defaults(fn=cmd_copilot_autostart)
 
     args = ap.parse_args()
     try:

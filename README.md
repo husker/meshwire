@@ -76,7 +76,13 @@ The loop each session runs:
 
 1. With the plugin, follow the harness-specific setup above. Claude and Codex
    need no manual watcher; Copilot owns one non-detached async watcher and
-   applies the qualified re-arm behavior above.
+   applies the qualified re-arm behavior above. Copilot arms it on the
+   session's first turn — an idle session that never receives a message from
+   you never listens. For hands-free listening, run `mesh copilot-autostart`
+   once per project: it writes `.github/hooks/meshwire-autostart.json`, and
+   every new interactive Copilot session there auto-submits a first turn that
+   arms the watcher. (Copilot ignores prompt hooks shipped inside plugins,
+   which is why this file lives in the repo.)
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with
