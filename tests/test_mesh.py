@@ -693,23 +693,43 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn("MESH_MESSAGE from='beta': hello", result["reason"])
         self.assertNotIn('{"from"', result["reason"])
 
-    def test_copilot_notification_injects_message_into_idle_session(self):
+    def test_copilot_session_hook_emits_async_watch_context_json(self):
         self._setup_mesh()
         out = io.StringIO()
-        with mock.patch.object(mesh, "cmd_watch",
-                               lambda args: print(
-                                   "MESH_MESSAGE from='beta': hello\n"
-                                   '{"from":"beta","message":"hello"}')), \
-             mock.patch.object(sys, "stdin", io.StringIO(
-                 '{"hook_event_name":"Notification",'
-                 '"notification_type":"agent_idle"}')), \
+        fake_file = os.path.join(self._tmp.name,
+                                 "plugin root $(literal)", "mesh.py")
+        with mock.patch.object(mesh, "__file__", fake_file), \
              contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_notification_hook(
-                argparse.Namespace(timeout=30))
+            mesh.cmd_copilot_session_hook(argparse.Namespace())
+
         result = json.loads(out.getvalue())
-        self.assertIn("MESH_MESSAGE from='beta': hello",
-                      result["additionalContext"])
-        self.assertNotIn('{"from"', result["additionalContext"])
+        context = result["additionalContext"]
+        self.assertIn('mode="async"', context)
+        self.assertIn("detach=false", context)
+        self.assertIn("retain the returned shell ID", context)
+        command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
+        self.assertEqual(
+            __import__("shlex").split(command),
+            [sys.executable, os.path.realpath(fake_file),
+             "watch", "--timeout", "86370"],
+        )
+
+    def test_copilot_session_hook_returns_empty_json_outside_mesh(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_session_hook(argparse.Namespace())
+        self.assertEqual(json.loads(out.getvalue()), {})
+
+    def test_copilot_watch_command_quotes_powershell_metacharacters(self):
+        fake_file = r"C:\plugin root & literal\mesh.py"
+        with mock.patch.object(mesh, "__file__", fake_file), \
+             mock.patch.object(mesh.os.path, "realpath", return_value=fake_file):
+            command = mesh._copilot_watch_command(platform="nt")
+        self.assertEqual(
+            command,
+            "& '" + sys.executable.replace("'", "''") + "' "
+            "'C:\\plugin root & literal\\mesh.py' 'watch' '--timeout' '86370'",
+        )
 
     def test_claude_message_exits_two_and_writes_wake_context(self):
         self._setup_mesh()
