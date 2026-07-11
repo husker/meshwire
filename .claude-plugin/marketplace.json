@@ -1,0 +1,24 @@
+{
+  "name": "meshwire",
+  "owner": {
+    "name": "James Gagan"
+  },
+  "metadata": {
+    "description": "Meshwire — encrypted, zero-infrastructure messaging between AI agents on different machines",
+    "version": "0.9.0"
+  },
+  "plugins": [
+    {
+      "name": "meshwire",
+      "source": "./",
+      "description": "Let this Claude Code session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
+      "version": "0.9.0",
+      "author": {
+        "name": "James Gagan"
+      },
+      "homepage": "https://github.com/husker/meshwire",
+      "license": "MIT",
+      "category": "Productivity"
+    }
+  ]
+}

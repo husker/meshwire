@@ -1970,10 +1970,27 @@ class PluginManifestTests(unittest.TestCase):
         marketplace = self._load(".plugin/marketplace.json")
         self.assertEqual(marketplace["metadata"]["version"], release)
         self.assertEqual(marketplace["plugins"][0]["version"], release)
+        claude_market = self._load(".claude-plugin/marketplace.json")
+        self.assertEqual(claude_market["metadata"]["version"], release)
+        self.assertEqual(claude_market["plugins"][0]["version"], release)
         # in-code version strings must not drift from pyproject either
         self.assertEqual(mesh.VERSION, release)
         self.assertEqual(mesh.USER_AGENT, f"meshwire/{release}")
         self.assertEqual(mesh.MESH_MCP_VERSION, release)
+
+    def test_claude_marketplace_publishes_root_plugin(self):
+        # Claude Code's `/plugin marketplace add` reads
+        # .claude-plugin/marketplace.json; a missing file is the "Marketplace
+        # file not found" install error.
+        market = self._load(".claude-plugin/marketplace.json")
+        self.assertEqual(market["name"], "meshwire")
+        self.assertIn("name", market["owner"])
+        entry = market["plugins"][0]
+        self.assertEqual(entry["name"], "meshwire")
+        # root-as-plugin: source "./" must point at a dir with plugin.json
+        self.assertEqual(entry["source"], "./")
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.ROOT, ".claude-plugin", "plugin.json")))
 
     def test_codex_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
