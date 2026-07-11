@@ -28,9 +28,11 @@ if not installed as a command).
    - Copilot CLI with the meshwire plugin: during the first normal turn, follow
      the session-start context and launch its exact watcher command with the shell
      tool in async, non-detached mode and retain the returned shell ID. When Copilot
-     reports that shell completed, read its output with that ID, handle the
-     delivery, and re-arm one watcher only after handling. Never detach it or run
-     two watchers concurrently.
+     reports that shell completed, read its output with that ID. Re-arm one watcher
+     only after handling a recognized `MESH_*` delivery; re-arm silently on
+     `MESH_TIMEOUT`. If launch is denied, the watcher has a nonzero exit, or it
+     prints unrecognized error output, report it once and stop without re-arming.
+     Never detach it or run two watchers concurrently.
    - Harness can stream a background command's output as it arrives
      (Claude Code: run it under the **Monitor tool**): use the persistent
      watcher, `mesh watch --follow` — one block per message, never exits;
@@ -59,8 +61,10 @@ if not installed as a command).
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
 
 (One-shot mode -- `mesh watch` without `--follow` -- prints one message and
-exits. Always handle its output before re-arming; `MESH_TIMEOUT` requires a
-silent re-arm and no user-facing response.)
+exits. Re-arm only after handling one of the recognized `MESH_*` deliveries
+above, or after `MESH_TIMEOUT`, which requires a silent re-arm and no user-facing
+response. On launch denial, nonzero exit, or unrecognized error output, report
+it once and stop without re-arming.)
 
 ## Sending
 

@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import secrets
 import signal
 import sys
@@ -98,6 +99,29 @@ class ConfigPermissionTests(unittest.TestCase):
 
 
 class EnvelopeTests(unittest.TestCase):
+    def test_task_emission_accepts_safe_ids_and_rejects_unsafe_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            ev = {"id": "m1", "time": 1}
+            for task_id in (str(__import__("uuid").uuid4()),
+                            "task_01.alpha:beta"):
+                with self.subTest(valid=task_id):
+                    env = mesh.make_send_envelope("alpha", "beta", "work")
+                    env["params"]["message"]["taskId"] = task_id
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertTrue(mesh._emit_message(
+                            cfg, "beta", "alpha", json.dumps(env), ev))
+            for task_id in (None, "", 7, "two words", "--state", "a/b", "x;y"):
+                with self.subTest(invalid=task_id):
+                    env = mesh.make_send_envelope("alpha", "beta", "work")
+                    env["params"]["message"]["taskId"] = task_id
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        self.assertFalse(mesh._emit_message(
+                            cfg, "beta", "alpha", json.dumps(env), ev))
+                    self.assertNotIn("MESH_TASK", out.getvalue())
+
     def test_send_envelope_roundtrip(self):
         env = mesh.make_send_envelope("alpha", "beta", "do the thing")
         parsed = mesh._parse_envelope(json.dumps(env))
@@ -602,6 +626,44 @@ class WatchTests(MembershipCmdTests):
                          out.getvalue())
         self.assertIn("real message", out.getvalue())
 
+    def test_malicious_a2a_task_id_is_dropped_without_consuming_one_shot(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope("beta", "alpha", "run tests")
+        malicious_id = "safe; touch /tmp/meshwire-pwned"
+        env["params"]["message"]["taskId"] = malicious_id
+        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
+               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("MESH_TASK", out.getvalue())
+        self.assertNotIn("mesh reply", out.getvalue())
+        self.assertNotIn(malicious_id, out.getvalue() + err.getvalue())
+        self.assertIn("dropped invalid A2A envelope", err.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self.assertFalse(os.path.exists(mesh.TASKS_NAME))
+
+    def test_missing_a2a_task_id_is_dropped_without_consuming_one_shot(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope("beta", "alpha", "run tests")
+        del env["params"]["message"]["taskId"]
+        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200),
+               self._msg_event(cfg, "beta", "real message", "m2", 201)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("MESH_TASK", out.getvalue())
+        self.assertNotIn("mesh reply", out.getvalue())
+        self.assertIn("dropped invalid A2A envelope", err.getvalue())
+        self.assertIn("real message", out.getvalue())
+        self.assertFalse(os.path.exists(mesh.TASKS_NAME))
+
 
 class CodexHookTests(MembershipCmdTests):
     def _setup_mesh(self):
@@ -707,6 +769,11 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn('mode="async"', context)
         self.assertIn("detach=false", context)
         self.assertIn("retain the returned shell ID", context)
+        self.assertIn("recognized MESH_* delivery", context)
+        self.assertIn("MESH_TIMEOUT means re-arm silently", context)
+        self.assertIn("nonzero exit", context)
+        self.assertIn("unrecognized error output", context)
+        self.assertIn("report it once and stop without re-arming", context)
         command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
         self.assertEqual(
             __import__("shlex").split(command),
@@ -1069,11 +1136,17 @@ class PluginManifestTests(unittest.TestCase):
     def test_plugin_versions_match_pyproject(self):
         with open(os.path.join(self.ROOT, "pyproject.toml")) as f:
             py = f.read()
-        self.assertIn('version = "0.7.5"', py)
+        release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
+        self.assertIsNotNone(release)
+        release = release.group(1)
+        self.assertEqual(release, "0.7.5")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
-            self.assertIn(f'version = "{v}"', py)
+            self.assertEqual(v, release)
+        marketplace = self._load(".plugin/marketplace.json")
+        self.assertEqual(marketplace["metadata"]["version"], release)
+        self.assertEqual(marketplace["plugins"][0]["version"], release)
 
     def test_codex_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
@@ -1133,6 +1206,11 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("async, non-detached", text)
         self.assertIn("retain the returned shell ID", text)
         self.assertIn("re-arm", text)
+        self.assertIn("recognized `MESH_*` delivery", text)
+        self.assertIn("re-arm silently", text)
+        self.assertIn("nonzero exit", text)
+        self.assertIn("unrecognized error output", text)
+        self.assertIn("report it once and stop without re-arming", text)
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
