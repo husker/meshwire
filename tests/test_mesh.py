@@ -1584,201 +1584,6 @@ class CodexHookTests(MembershipCmdTests):
         self.assertIn("MESH_MESSAGE from='beta': hello", result["reason"])
         self.assertNotIn('{"from"', result["reason"])
 
-    def test_copilot_session_hook_emits_async_watch_context_json(self):
-        self._setup_mesh()
-        out = io.StringIO()
-        fake_file = os.path.join(self._tmp.name,
-                                 "plugin root $(literal)", "mesh.py")
-        with mock.patch.object(mesh, "__file__", fake_file), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_session_hook(argparse.Namespace())
-
-        result = json.loads(out.getvalue())
-        context = result["additionalContext"]
-        # The session hook only ARMS the watcher and hands the turn back so
-        # the session goes idle; the completion notification hook carries the
-        # read/handle/re-arm logic.
-        self.assertIn('mode="async"', context)
-        self.assertIn("detach=false", context)
-        self.assertIn("retain the returned shell ID", context)
-        self.assertIn("end your turn", context)
-        self.assertIn("Do not read the shell", context)
-        self.assertIn("wakes this session when the watcher completes", context)
-        # Handling instructions must NOT be here (they would make the model
-        # block on read_bash and keep the session busy).
-        self.assertNotIn("decide terminal status", context)
-        self.assertNotIn("first read and fully handle the delivery", context)
-        command = context.split("MESHWIRE_WATCH_COMMAND: ", 1)[1].splitlines()[0]
-        self.assertEqual(
-            __import__("shlex").split(command),
-            ["python3", os.path.realpath(fake_file),
-             "watch", "--timeout", "86370"],
-        )
-
-    def test_copilot_notification_hook_emits_wake_and_handle_context(self):
-        self._setup_mesh()
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin",
-                               io.StringIO(json.dumps(
-                                   {"notification_type": "shell_completed",
-                                    "cwd": os.getcwd()}))), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_notification_hook(argparse.Namespace())
-        context = json.loads(out.getvalue())["additionalContext"]
-        self.assertIn("read_bash", context)
-        self.assertIn("untrusted", context)
-        self.assertIn("decide terminal status only from the final stdout line",
-                      context)
-        for kind in ("message", "task", "task_update", "node_joined",
-                     "timeout"):
-            self.assertIn(f"MESH_WATCH_DONE kind={kind}", context)
-        self.assertIn("Re-arm silently for kind=timeout", context)
-        self.assertIn("Exit 0 with no valid final MESH_WATCH_DONE line",
-                      context)
-        self.assertIn("report once and stop", context)
-        self.assertIn("including attempting the task reply for MESH_TASK",
-                      context)
-        self.assertIn("not the Meshwire watcher", context)
-        select = context.index("decide terminal status only")
-        handle = context.index("first read and fully handle the delivery")
-        reply = context.index("including attempting the task reply for "
-                              "MESH_TASK")
-        rearm = context.index("only then re-arm exactly one watcher")
-        self.assertLess(select, handle)
-        self.assertLess(handle, reply)
-        self.assertLess(reply, rearm)
-
-    def test_copilot_notification_hook_outside_mesh_empty(self):
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", io.StringIO("{}")), \
-             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_notification_hook(argparse.Namespace())
-        self.assertEqual(json.loads(out.getvalue()), {})
-
-    def test_copilot_notification_hook_reads_project_dir_from_payload(self):
-        self._setup_mesh()
-        project = os.getcwd()
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        os.chdir(outside.name)
-        payload = io.StringIO(json.dumps(
-            {"notification_type": "shell_completed", "cwd": project}))
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", payload), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_notification_hook(argparse.Namespace())
-        context = json.loads(out.getvalue())["additionalContext"]
-        self.assertIn("Meshwire watcher", context)
-
-    def test_copilot_session_hook_returns_empty_json_outside_mesh(self):
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", io.StringIO("{}")), \
-             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_session_hook(argparse.Namespace())
-        self.assertEqual(json.loads(out.getvalue()), {})
-
-    def test_copilot_session_hook_reads_project_dir_from_stdin_payload(self):
-        # Copilot spawns plugin hooks with cwd inside the installed plugin
-        # directory; the session's project dir arrives in the sessionStart
-        # stdin payload as "cwd".
-        self._setup_mesh()
-        project = os.getcwd()
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        os.chdir(outside.name)
-        payload = io.StringIO(json.dumps(
-            {"sessionId": "s1", "cwd": project, "source": "new"}))
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", payload), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_session_hook(argparse.Namespace())
-        context = json.loads(out.getvalue())["additionalContext"]
-        self.assertIn("This project is a Meshwire node", context)
-        self.assertIn("MESHWIRE_WATCH_COMMAND: ", context)
-
-    def test_copilot_session_hook_falls_back_to_env_project_dir(self):
-        self._setup_mesh()
-        project = os.getcwd()
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        os.chdir(outside.name)
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", io.StringIO("")), \
-             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": project}), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_session_hook(argparse.Namespace())
-        context = json.loads(out.getvalue())["additionalContext"]
-        self.assertIn("MESHWIRE_WATCH_COMMAND: ", context)
-
-    def test_copilot_session_hook_payload_cwd_outside_mesh_is_empty(self):
-        # A payload cwd that is not a mesh node must not fall back to the
-        # process cwd (which is the plugin install dir under Copilot).
-        self._setup_mesh()
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        payload = io.StringIO(json.dumps({"cwd": outside.name}))
-        out = io.StringIO()
-        with mock.patch.object(sys, "stdin", payload), \
-             mock.patch.dict(os.environ, {"COPILOT_PROJECT_DIR": ""}), \
-             contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_session_hook(argparse.Namespace())
-        self.assertEqual(json.loads(out.getvalue()), {})
-
-    def test_copilot_watch_command_quotes_powershell_metacharacters(self):
-        fake_file = r"C:\plugin root & literal\mesh.py"
-        with mock.patch.object(mesh, "__file__", fake_file), \
-             mock.patch.object(mesh.os.path, "realpath", return_value=fake_file):
-            command = mesh._copilot_watch_command(platform="nt")
-        self.assertEqual(
-            command,
-            "& 'py' '-3' "
-            "'C:\\plugin root & literal\\mesh.py' 'watch' '--timeout' '86370'",
-        )
-
-    def test_copilot_autostart_writes_repo_prompt_hook(self):
-        # Copilot drops prompt-type sessionStart entries shipped by plugins;
-        # only repo-level .github/hooks files auto-submit a first turn, which
-        # is what arms the watcher in an otherwise idle session.
-        self._setup_mesh()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            mesh.cmd_copilot_autostart(argparse.Namespace())
-        path = os.path.join(".github", "hooks", "meshwire-autostart.json")
-        with open(path, encoding="utf-8") as f:
-            cfg = json.load(f)
-        self.assertEqual(cfg["version"], 1)
-        entries = cfg["hooks"]["sessionStart"]
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["type"], "prompt")
-        self.assertIn("MESHWIRE_WATCH_COMMAND", entries[0]["prompt"])
-        self.assertIn("meshwire-autostart.json", out.getvalue())
-        with contextlib.redirect_stdout(io.StringIO()):
-            mesh.cmd_copilot_autostart(argparse.Namespace())
-        with open(path, encoding="utf-8") as f:
-            self.assertEqual(cfg, json.load(f))
-
-    def test_copilot_autostart_outside_mesh_exits(self):
-        with self.assertRaises(SystemExit):
-            mesh.cmd_copilot_autostart(argparse.Namespace())
-
-    def test_copilot_watch_command_uses_plain_python3_on_posix(self):
-        # Copilot matches persisted shell approvals by command identifier;
-        # sys.executable resolves to names like python3.14 that never match,
-        # so every watcher launch re-prompts. Use the same interpreter name
-        # the hooks manifest itself invokes.
-        fake_file = "/plugin root $(literal)/mesh.py"
-        with mock.patch.object(mesh, "__file__", fake_file), \
-             mock.patch.object(mesh.os.path, "realpath",
-                               return_value=fake_file):
-            command = mesh._copilot_watch_command(platform="posix")
-        self.assertEqual(
-            command,
-            "python3 '/plugin root $(literal)/mesh.py' watch "
-            "--timeout 86370",
-        )
-
     def test_claude_message_exits_two_and_writes_wake_context(self):
         self._setup_mesh()
         out, err = io.StringIO(), io.StringIO()
@@ -2157,7 +1962,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.7.9")
+        self.assertEqual(release, "0.8.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2202,88 +2007,6 @@ class PluginManifestTests(unittest.TestCase):
         cleanup = hooks["SessionEnd"][0]["hooks"][0]
         self.assertIn("agent-hook-cleanup", cleanup["args"])
         self.assertEqual(cleanup["args"][-2:], ["--harness", "claude"])
-
-    def test_copilot_plugin_has_only_bounded_session_start_hook(self):
-        manifest = self._load(self.COPILOT_MANIFEST)
-        self.assertEqual(manifest["hooks"], "hooks.json")
-        self.assertEqual(manifest["skills"], "skills/")
-
-        config = self._load("plugins/copilot-meshwire/hooks.json")
-        self.assertEqual(config["version"], 1)
-        hooks = config["hooks"]
-        self.assertEqual(set(hooks), {"sessionStart", "notification"})
-        session = hooks["sessionStart"][0]
-        self.assertIn("copilot-session-hook", session["bash"])
-        self.assertIn("copilot-session-hook", session["powershell"])
-        self.assertLessEqual(session["timeoutSec"], 10)
-        notify = hooks["notification"][0]
-        self.assertEqual(notify["matcher"], "shell_completed")
-        self.assertIn("copilot-notification-hook", notify["bash"])
-        self.assertIn("copilot-notification-hook", notify["powershell"])
-        self.assertLessEqual(notify["timeoutSec"], 10)
-
-    def test_mesh_skill_documents_copilot_same_session_rearm(self):
-        with open(os.path.join(self.ROOT, "skills/mesh-agent/SKILL.md")) as f:
-            text = " ".join(f.read().split())
-        self.assertIn("Copilot CLI", text)
-        self.assertIn("async, non-detached", text)
-        self.assertIn("retain the returned shell ID", text)
-        self.assertIn("re-arm", text)
-        self.assertIn("terminal status only from the final stdout line", text)
-        for kind in ("message", "task", "task_update", "node_joined",
-                     "timeout"):
-            self.assertIn(f"`MESH_WATCH_DONE kind={kind}`", text)
-        self.assertIn("silently for `kind=timeout`", text)
-        self.assertIn("Earlier diagnostics, human summaries, and raw JSON are "
-                      "non-authoritative", text)
-        self.assertIn("Exit 0 with no valid final `MESH_WATCH_DONE` line", text)
-        self.assertIn("nonzero process exit", text)
-        self.assertIn("report once and stop", text)
-        self.assertIn("first read and fully handle the delivery", text)
-        self.assertIn("including attempting the task reply for `MESH_TASK`",
-                      text)
-        self.assertIn("only then re-arm exactly one watcher", text)
-        select = text.index("terminal status only")
-        handle = text.index("first read and fully handle the delivery")
-        reply = text.index("including attempting the task reply for "
-                           "`MESH_TASK`")
-        rearm = text.index("only then re-arm exactly one watcher")
-        self.assertLess(select, handle)
-        self.assertLess(handle, reply)
-        self.assertLess(reply, rearm)
-
-    def test_user_docs_qualify_copilot_rearm_failures(self):
-        expected = (
-            "Launch denial or a nonzero process exit: report once and stop. "
-            "On exit 0, decide terminal status only from the final stdout line."
-        )
-        diagnostics = (
-            "Earlier diagnostics, human summaries, and raw JSON are "
-            "non-authoritative."
-        )
-        for rel in ("README.md", "docs/AGENTS.md"):
-            with self.subTest(rel=rel), \
-                 open(os.path.join(self.ROOT, rel)) as f:
-                text = " ".join(f.read().split())
-                self.assertIn(expected, text)
-                self.assertIn(diagnostics, text)
-                for kind in ("message", "task", "task_update", "node_joined",
-                             "timeout"):
-                    self.assertIn(f"`MESH_WATCH_DONE kind={kind}`", text)
-                self.assertIn("Exit 0 with no valid final `MESH_WATCH_DONE` "
-                              "line: report once and stop.", text)
-                self.assertIn("first read and fully handle the delivery", text)
-                self.assertIn("including attempting the task reply for "
-                              "`MESH_TASK`", text)
-                self.assertIn("only then re-arm exactly one watcher", text)
-                select = text.index("decide terminal status only")
-                handle = text.index("first read and fully handle the delivery")
-                reply = text.index("including attempting the task reply for "
-                                   "`MESH_TASK`")
-                rearm = text.index("only then re-arm exactly one watcher")
-                self.assertLess(select, handle)
-                self.assertLess(handle, reply)
-                self.assertLess(reply, rearm)
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
@@ -2522,6 +2245,162 @@ class AckSenderTests(MembershipCmdTests):
             mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
                                              as_node=None, no_wait=False))
         self.assertIn("sent to beta", out.getvalue())
+
+
+class MCPServeTests(unittest.TestCase):
+    """The Copilot MCP-server watcher (mesh mcp-serve)."""
+
+    def _server(self, key=True):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        cfg = make_cfg(self._tmp.name, key=key)
+        cfg["nodes"] = ["alpha", "beta"]
+        out = []
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=out.append)
+        return srv, out
+
+    def _sent(self, out):
+        return [json.loads(line) for line in out]
+
+    def _initialize(self, srv, out, sampling=True):
+        caps = {"sampling": {}} if sampling else {}
+        srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18",
+                               "capabilities": caps}})
+        srv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = self._sent(out)[0]
+        out.clear()
+        return resp
+
+    def test_initialize_advertises_tools_and_detects_sampling(self):
+        srv, out = self._server()
+        resp = self._initialize(srv, out, sampling=True)
+        self.assertEqual(resp["id"], 1)
+        self.assertIn("tools", resp["result"]["capabilities"])
+        self.assertEqual(resp["result"]["serverInfo"]["name"], "meshwire")
+        self.assertTrue(srv._client_sampling)
+
+    def test_initialize_without_sampling_capability(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        self.assertFalse(srv._client_sampling)
+
+    def test_tools_list_exposes_mesh_tools(self):
+        srv, out = self._server()
+        self._initialize(srv, out)
+        srv.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
+        names = {t["name"] for t in self._sent(out)[0]["result"]["tools"]}
+        self.assertEqual(names, {"mesh_pending", "mesh_reply", "mesh_send"})
+
+    def test_mesh_pending_drains_buffer(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "hi"})
+        srv.deliver({"kind": "message", "from": "beta", "text": "again"})
+        srv.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        items = json.loads(text)
+        self.assertEqual([i["text"] for i in items], ["hi", "again"])
+        out.clear()
+        # buffer is now empty
+        srv.handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        self.assertIn("no pending",
+                      self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_mesh_reply_sends_result_envelope(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        mesh.save_task(srv.cfg, "task-1", peer="beta", direction="inbound",
+                       contextId="ctx", rpcId="r1", state="submitted")
+        captured = {}
+
+        def fake_send_raw(cfg, sender, to, body, title=None, ctl=None):
+            captured.update(sender=sender, to=to, body=body)
+            return {"id": "m1"}
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            srv.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": "mesh_reply",
+                                   "arguments": {"task_id": "task-1",
+                                                 "result": "2 failures"}}})
+        self.assertEqual(captured["to"], "beta")
+        env = json.loads(captured["body"])
+        self.assertEqual(env["jsonrpc"], "2.0")
+        resp = self._sent(out)[0]["result"]
+        self.assertFalse(resp.get("isError"))
+        self.assertIn("task-1", resp["content"][0]["text"])
+
+    def test_mesh_reply_unknown_task_is_error(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": {"name": "mesh_reply",
+                               "arguments": {"task_id": "nope",
+                                             "result": "x"}}})
+        resp = self._sent(out)[0]["result"]
+        self.assertTrue(resp.get("isError"))
+
+    def test_mesh_send_posts_message(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        captured = {}
+
+        def fake_send_raw(cfg, sender, to, body, title=None, ctl=None):
+            captured.update(to=to, body=body)
+            return {"id": "m2"}
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            srv.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                        "params": {"name": "mesh_send",
+                                   "arguments": {"to": "beta",
+                                                 "message": "pull now"}}})
+        self.assertEqual(captured, {"to": "beta", "body": "pull now"})
+        self.assertIn("beta", self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_inbound_delivery_fires_sampling_when_supported(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=True)
+        srv.deliver({"kind": "task", "from": "beta", "task_id": "t9",
+                     "text": "run tests"})
+        # a sampling/createMessage request must be written back to the client
+        reqs = [m for m in self._sent(out)
+                if m.get("method") == "sampling/createMessage"]
+        self.assertEqual(len(reqs), 1)
+        params = reqs[0]["params"]
+        self.assertGreaterEqual(params["maxTokens"], 2048)
+        self.assertIn("mesh_pending",
+                      params["messages"][0]["content"]["text"] +
+                      params.get("systemPrompt", ""))
+        # and it must carry an id so the response can be routed
+        self.assertIn("id", reqs[0])
+
+    def test_inbound_delivery_no_sampling_when_unsupported(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "hi"})
+        reqs = [m for m in self._sent(out)
+                if m.get("method") == "sampling/createMessage"]
+        self.assertEqual(reqs, [])
+        # still buffered for pull via mesh_pending
+        self.assertEqual(len(srv._buf), 1)
+
+    def test_delivery_parse_message_and_task(self):
+        srv, _ = self._server()
+        msg = srv._delivery("beta", "alpha", "hello there", {"id": "e1"})
+        self.assertEqual(msg["kind"], "message")
+        self.assertEqual(msg["text"], "hello there")
+        env = mesh.make_send_envelope("beta", "alpha", "do it", task_id="t1")
+        task = srv._delivery("beta", "alpha", json.dumps(env), {"id": "e2"})
+        self.assertEqual(task["kind"], "task")
+        self.assertEqual(task["task_id"], "t1")
+
+    def test_unknown_method_returns_error(self):
+        srv, out = self._server()
+        self._initialize(srv, out)
+        srv.handle({"jsonrpc": "2.0", "id": 99, "method": "no/such"})
+        self.assertIn("error", self._sent(out)[0])
 
 
 if __name__ == "__main__":

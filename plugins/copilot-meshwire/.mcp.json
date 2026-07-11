@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "meshwire": {
+      "type": "local",
+      "command": "python3",
+      "args": ["${PLUGIN_ROOT}/mesh.py", "mcp-serve"],
+      "tools": ["*"]
+    }
+  }
+}

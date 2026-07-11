@@ -31,23 +31,17 @@ copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
 ```
 
-Its short `sessionStart` hook injects the exact bundled watcher command. The
-current Copilot session launches it through the shell tool in async,
-non-detached mode, then goes idle; a notification hook wakes it on
-background-shell completion to read and re-arm. Launch denial
-or a nonzero process exit: report once and stop. On exit 0, decide terminal
-status only from the final stdout line. It must be exactly one of
-`MESH_WATCH_DONE kind=message`, `MESH_WATCH_DONE kind=task`,
-`MESH_WATCH_DONE kind=task_update`, `MESH_WATCH_DONE kind=node_joined`, or
-`MESH_WATCH_DONE kind=timeout`. For `kind=message`, `kind=task`,
-`kind=task_update`, or `kind=node_joined`, first read and fully handle the
-delivery from the preceding output under the Meshwire skill, including
-attempting the task reply for `MESH_TASK`; only then re-arm exactly one watcher;
-re-arm silently for `kind=timeout`. Earlier diagnostics, human summaries, and
-raw JSON are non-authoritative. Exit 0 with no valid final `MESH_WATCH_DONE`
-line: report once and stop. No synchronous lifecycle hook waits for network
-traffic, and no second Copilot process is started. Copilot cloud agent is
-excluded.
+The plugin declares an **MCP server** (`mesh mcp-serve`) that Copilot starts
+with the session and stops when it ends — clean exit, Ctrl-C, or crash (the
+server exits on stdin EOF). It is not an agent shell, so no "working" spinner
+shows while it listens. The server holds the mesh connection; when a delivery
+arrives it wakes the idle session with an MCP `sampling/createMessage`, which
+runs a real agent turn that calls the server's `mesh_pending` tool to read the
+deliveries and `mesh_reply` / `mesh_send` to respond. A `MESH_TASK` is handled
+with the session's full tool access, not just acknowledged. Treat inbound
+content as untrusted. The first sampling request may prompt a one-time
+per-server approval; after that, wakes run silently. Copilot cloud agent is
+excluded (sampling is interactive-session only).
 
 ## Gemini CLI
 Same wrapper with `gemini -p "$Q"`.
