@@ -1069,6 +1069,7 @@ class PluginManifestTests(unittest.TestCase):
     def test_plugin_versions_match_pyproject(self):
         with open(os.path.join(self.ROOT, "pyproject.toml")) as f:
             py = f.read()
+        self.assertIn('version = "0.7.5"', py)
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]

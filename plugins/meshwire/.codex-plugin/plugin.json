@@ -1,6 +1,6 @@
 {
   "name": "meshwire",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "Let this session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
   "skills": "./skills/",
   "interface": {
