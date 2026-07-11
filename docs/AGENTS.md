@@ -31,11 +31,11 @@ copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
 ```
 
-Its asynchronous `agent_idle` notification hook waits for one message and
-injects it as `additionalContext`, which can resume the same idle interactive
-Copilot CLI session without blocking its prompt. Both Bash and PowerShell hook
-commands are bundled. Copilot cloud agent is intentionally excluded because
-it does not run notification hooks.
+Its short `sessionStart` hook injects the exact bundled watcher command. The
+current Copilot session launches it through the shell tool in async,
+non-detached mode, handles native background-shell completion, and re-arms one
+watcher. No synchronous lifecycle hook waits for network traffic, and no second
+Copilot process is started. Copilot cloud agent is excluded.
 
 ## Gemini CLI
 Same wrapper with `gemini -p "$Q"`.

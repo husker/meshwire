@@ -49,23 +49,24 @@ when a project is a mesh node):
 
 # Codex CLI / ChatGPT desktop
 codex plugin marketplace add husker/meshwire
-#   then install "meshwire" from the plugin directory picker
+codex plugin add meshwire@meshwire
 
 # GitHub Copilot CLI
 copilot plugin marketplace add husker/meshwire
 copilot plugin install meshwire@meshwire
 ```
 
-Each plugin loads the mesh safety rules at session start, then waits through
-the harness's native lifecycle hook. Claude uses asynchronous `Stop` with
-`asyncRewake`; Codex uses `Stop`; Copilot CLI uses the asynchronous
-`agent_idle` notification hook, whose `additionalContext` can resume an idle
-session without blocking its prompt.
+Each plugin loads the mesh safety rules at session start. Claude uses
+asynchronous `Stop` with `asyncRewake`; Codex uses `Stop`. Copilot's short
+`sessionStart` hook tells the current session to own a non-detached async
+`mesh watch`; Copilot's native background-shell completion wakes that same
+session to handle and re-arm it.
 
 The loop each session runs:
 
-1. With the plugin, no manual watcher is needed. Waiting spends no model
-   tokens and automatically re-arms after every delivered message.
+1. With the plugin, follow the harness-specific setup above. Claude and Codex
+   need no manual watcher; Copilot owns one non-detached async watcher and
+   re-arms it after handling each completion.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with

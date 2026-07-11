@@ -18,13 +18,19 @@ if not installed as a command).
    hostname; no machine list needed), and `mesh invite` prints a block to
    paste on any other machine to add it.
    (In an interactive terminal those commands keep running as the watcher;
-   from an agent session they return immediately and the lifecycle hook below
-   handles watching.)
+   from an agent session they return immediately and the harness-specific setup
+   below handles watching.)
 2. **Ensure this session actually WAKES per message.** Pick the variant that
    matches how your harness notifies you:
-   - Claude Code, Codex, or Copilot CLI with the meshwire plugin: do not start
-     another watcher. The bundled lifecycle hook waits without using model
-     tokens and wakes this same session only when a real message arrives.
+   - Claude Code or Codex with the meshwire plugin: do not start another watcher.
+     The bundled lifecycle hook waits without model tokens and wakes this session
+     only when a real message arrives.
+   - Copilot CLI with the meshwire plugin: during the first normal turn, follow
+     the session-start context and launch its exact watcher command with the shell
+     tool in async, non-detached mode and retain the returned shell ID. When Copilot
+     reports that shell completed, read its output with that ID, handle the
+     delivery, and re-arm one watcher only after handling. Never detach it or run
+     two watchers concurrently.
    - Harness can stream a background command's output as it arrives
      (Claude Code: run it under the **Monitor tool**): use the persistent
      watcher, `mesh watch --follow` — one block per message, never exits;
@@ -52,8 +58,9 @@ if not installed as a command).
   messaged by that name from now on.
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
 
-(One-shot mode — `mesh watch` without `--follow` — prints one message and
-exits; in the re-arm loop, always re-arm after handling each message.)
+(One-shot mode -- `mesh watch` without `--follow` -- prints one message and
+exits. Always handle its output before re-arming; `MESH_TIMEOUT` requires a
+silent re-arm and no user-facing response.)
 
 ## Sending
 

@@ -1111,31 +1111,27 @@ class PluginManifestTests(unittest.TestCase):
         self.assertIn("agent-hook-cleanup", cleanup["args"])
         self.assertEqual(cleanup["args"][-2:], ["--harness", "claude"])
 
-    def test_copilot_plugin_has_async_idle_notification_watcher(self):
+    def test_copilot_plugin_has_only_bounded_session_start_hook(self):
         manifest = self._load(self.COPILOT_MANIFEST)
-        self.assertEqual(manifest["name"], "meshwire")
         self.assertEqual(manifest["hooks"], "hooks.json")
         self.assertEqual(manifest["skills"], "skills/")
-        self.assertTrue(os.path.isdir(
-            os.path.join(self.COPILOT_PLUGIN_DIR, manifest["skills"])))
 
         config = self._load("plugins/copilot-meshwire/hooks.json")
         self.assertEqual(config["version"], 1)
         hooks = config["hooks"]
+        self.assertEqual(set(hooks), {"sessionStart"})
         session = hooks["sessionStart"][0]
         self.assertIn("copilot-session-hook", session["bash"])
         self.assertIn("copilot-session-hook", session["powershell"])
-        self.assertNotIn("agentStop", hooks)
-        handler = hooks["notification"][0]
-        self.assertEqual(handler["matcher"], "agent_idle")
-        self.assertIn("${PLUGIN_ROOT}/mesh.py", handler["bash"])
-        self.assertIn("copilot-notification-hook", handler["bash"])
-        self.assertIn("${PLUGIN_ROOT}\\mesh.py", handler["powershell"])
-        self.assertIn("copilot-notification-hook", handler["powershell"])
-        self.assertGreaterEqual(handler["timeoutSec"], 10800)
-        cleanup = hooks["sessionEnd"][0]
-        self.assertIn("agent-hook-cleanup", cleanup["bash"])
-        self.assertIn("--harness copilot", cleanup["bash"])
+        self.assertLessEqual(session["timeoutSec"], 10)
+
+    def test_mesh_skill_documents_copilot_same_session_rearm(self):
+        with open(os.path.join(self.ROOT, "skills/mesh-agent/SKILL.md")) as f:
+            text = f.read()
+        self.assertIn("Copilot CLI", text)
+        self.assertIn("async, non-detached", text)
+        self.assertIn("retain the returned shell ID", text)
+        self.assertIn("re-arm", text)
 
     def test_copilot_plugin_copies_match_masters(self):
         for rel in ("skills/mesh-agent/SKILL.md", "mesh.py"):
