@@ -2370,11 +2370,25 @@ class MCPServeTests(unittest.TestCase):
         self.assertEqual(len(reqs), 1)
         params = reqs[0]["params"]
         self.assertGreaterEqual(params["maxTokens"], 2048)
-        self.assertIn("mesh_pending",
-                      params["messages"][0]["content"]["text"] +
-                      params.get("systemPrompt", ""))
-        # and it must carry an id so the response can be routed
+        # the delivery is embedded directly in the request (no mesh_pending
+        # round-trip), so the sub-agent can handle + reply
+        text = params["messages"][0]["content"]["text"]
+        self.assertIn("t9", text)
+        self.assertIn("run tests", text)
+        self.assertIn("mesh_reply", text + params.get("systemPrompt", ""))
         self.assertIn("id", reqs[0])
+        # the batch is drained at fire time (prevents a second sampling)
+        self.assertEqual(srv._buf, [])
+
+    def test_same_message_does_not_fire_twice(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=True)
+        srv.deliver({"kind": "message", "from": "beta", "text": "hi"})
+        # a second deliver while the first sampling is still in flight must not
+        # produce a redundant sampling for the already-drained message
+        reqs = [m for m in self._sent(out)
+                if m.get("method") == "sampling/createMessage"]
+        self.assertEqual(len(reqs), 1)
 
     def test_inbound_delivery_no_sampling_when_unsupported(self):
         srv, out = self._server()
