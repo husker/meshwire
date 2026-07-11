@@ -42,6 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
+ACTIVITY_FILE = ".meshwire.activity"
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
@@ -1372,7 +1373,30 @@ class MeshMCPServer:
     def deliver(self, delivery):
         with self._buf_lock:
             self._buf.append(delivery)
+        self._record_activity(delivery)
         self._maybe_sample()
+
+    def _record_activity(self, d):
+        """Append a one-line record so the userPromptSubmitted hook can tell
+        the user what was handled while they were away (Copilot fires no
+        notification for the out-of-band sampling handler)."""
+        frm = d.get("from", "?")
+        text = _single_line(d.get("text") or "")[:60]
+        kind = d.get("kind")
+        if kind == "task":
+            line = f"task from {frm}: {text}"
+        elif kind == "task_update":
+            line = f"task update from {frm}"
+        elif kind == "node_joined":
+            line = f"node joined: {frm}"
+        else:
+            line = f"message from {frm}: {text}"
+        try:
+            with open(os.path.join(self.cfg["_dir"], ACTIVITY_FILE),
+                      "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def _maybe_sample(self):
         if not self._client_sampling:
@@ -1607,6 +1631,43 @@ def cmd_mcp_serve(args):
     threading.Thread(target=server.watch_loop, daemon=True).start()
     _mcp_stdin_loop(server.handle)
     server._stop.set()
+
+
+def cmd_copilot_activity(args):
+    """userPromptSubmitted hook: surface any mesh deliveries the MCP-server
+    watcher handled out-of-band while the user was away, as a one-line note on
+    their next turn. Copilot fires no notification for the sampling handler, so
+    this is the reliable place to tell the user what happened."""
+    payload = {} if sys.stdin.isatty() else _read_hook_input()
+    start = payload.get("cwd") or os.environ.get("COPILOT_PROJECT_DIR") or None
+    path = find_config(start)
+    if not path:
+        print("{}")
+        return
+    act = os.path.join(os.path.dirname(path), ACTIVITY_FILE)
+    try:
+        with open(act, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        lines = []
+    if not lines:
+        print("{}")
+        return
+    try:
+        os.remove(act)
+    except OSError:
+        pass
+    n = len(lines)
+    shown = "; ".join(lines[:5])
+    if n > 5:
+        shown += f"; and {n - 5} more"
+    noun = "delivery was" if n == 1 else "deliveries were"
+    context = (
+        f"[Meshwire] {n} mesh {noun} handled automatically while you were "
+        f"away: {shown}. Open your reply with one short line telling the user "
+        "this happened, then answer their prompt."
+    )
+    print(json.dumps({"additionalContext": context}))
 
 
 def hook_lock_file(cfg, node):
@@ -2278,6 +2339,9 @@ def main():
     p.add_argument("--config", default=None,
                    help="explicit path to the .meshwire.json to watch")
     p.set_defaults(fn=cmd_mcp_serve)
+
+    p = sub.add_parser("copilot-activity", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_copilot_activity)
 
     p = sub.add_parser("agent-hook-cleanup", help=argparse.SUPPRESS)
     p.add_argument("--harness", choices=("claude", "copilot"), required=True)

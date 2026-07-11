@@ -1962,7 +1962,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.8.0")
+        self.assertEqual(release, "0.8.1")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2430,6 +2430,53 @@ class MCPServeTests(unittest.TestCase):
         path, _ = mesh._mcp_config_path(
             argparse.Namespace(config="/no/such/.meshwire.json"))
         self.assertIsNone(path)
+
+    def test_deliver_records_activity_line(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "mac-codex",
+                     "text": "pulled the fix"})
+        with open(os.path.join(self._tmp.name, ".meshwire.activity")) as f:
+            self.assertIn("message from mac-codex", f.read())
+
+
+class CopilotActivityTests(MembershipCmdTests):
+    """The userPromptSubmitted indication hook (mesh copilot-activity)."""
+
+    def _setup_mesh(self):
+        with open(".meshwire.json", "w") as f:
+            json.dump(make_cfg(), f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+
+    def _run(self, payload=None):
+        stdin = io.StringIO(json.dumps(payload)) if payload is not None \
+            else io.StringIO("")
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_activity(argparse.Namespace())
+        return json.loads(out.getvalue())
+
+    def test_surfaces_and_clears_activity(self):
+        self._setup_mesh()
+        with open(".meshwire.activity", "w") as f:
+            f.write("message from mac-codex: hi\ntask from laptop: run\n")
+        result = self._run({"cwd": os.getcwd(), "prompt": "hello"})
+        ctx = result["additionalContext"]
+        self.assertIn("Meshwire", ctx)
+        self.assertIn("mac-codex", ctx)
+        self.assertIn("laptop", ctx)
+        # cleared so the next prompt doesn't repeat it
+        self.assertFalse(os.path.exists(".meshwire.activity"))
+
+    def test_no_activity_returns_empty(self):
+        self._setup_mesh()
+        self.assertEqual(self._run({"cwd": os.getcwd()}), {})
+
+    def test_outside_mesh_returns_empty(self):
+        self.assertEqual(
+            self._run({"cwd": "/no/such/dir", "prompt": "x"}), {})
 
 
 if __name__ == "__main__":

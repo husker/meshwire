@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Meshwire plugins for cross-machine agent messaging",
-    "version": "0.8.0"
+    "version": "0.8.1"
   },
   "plugins": [
     {
       "name": "meshwire",
       "description": "Encrypted messaging and A2A tasks between agent sessions on different machines.",
-      "version": "0.8.0",
+      "version": "0.8.1",
       "source": "./plugins/copilot-meshwire",
       "author": {
         "name": "James Gagan"

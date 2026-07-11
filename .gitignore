@@ -4,3 +4,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.meshwire.json
+.meshwire.node
+.meshwire.cursor-*
+.meshwire.replay-*
+.meshwire.tasks.json
+.meshwire.peers.json
+.meshwire.activity

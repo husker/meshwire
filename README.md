@@ -71,7 +71,9 @@ The loop each session runs:
 
 1. With the plugin, follow the harness-specific setup above. Claude and Codex
    need no manual watcher; Copilot's MCP-server watcher listens and wakes the
-   session automatically — nothing to arm.
+   session automatically — nothing to arm. Handling happens out of band (no
+   "working" spinner); the next prompt you send opens with a one-line note of
+   anything meshwire handled while you were away.
 2. Do your work. After pushing something the other machine should act on:
    `mesh send <node> "one-line summary — pull"`.
 3. When a `MESH_TASK` line arrives, do the work and answer with
