@@ -1542,6 +1542,8 @@ def cmd_mcp_serve(args):
     start = os.environ.get("COPILOT_PROJECT_DIR") or None
     path = find_config(start)
     if not path:
+        print(f"meshwire mcp-serve: no mesh node at "
+              f"{start or os.getcwd()}; idle", file=sys.stderr)
         _mcp_idle_serve()
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -1549,6 +1551,8 @@ def cmd_mcp_serve(args):
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
     me = my_node(cfg, getattr(args, "as_node", None))
+    print(f"meshwire mcp-serve: watching as node '{me}' "
+          f"({cfg['_dir']})", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
     threading.Thread(target=server.watch_loop, daemon=True).start()
     _mcp_stdin_loop(server.handle)
