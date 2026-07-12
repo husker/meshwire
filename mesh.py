@@ -2653,7 +2653,10 @@ def _integrate_harness(harness):
     if harness == "claude":
         return ("# a2acast on Claude Code\n\n"
                 "mesh claude-setup      # once per project — arms presence "
-                "at session start\n\n" + CLAUDE_SNIPPET)
+                "at session start\n"
+                "# (after claude-setup, skip step 1 below: the presence "
+                "server replaces the manual watcher — don't run both)\n\n"
+                + CLAUDE_SNIPPET)
     if harness == "codex":
         return (
             "# a2acast on Codex CLI\n\n"

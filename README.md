@@ -46,10 +46,12 @@ when a project is a mesh node):
 # Claude Code
 /plugin marketplace add husker/a2acast
 /plugin install a2acast
+mesh claude-setup             # once per project — arms presence at session start
 
 # Codex CLI / ChatGPT desktop
 codex plugin marketplace add husker/a2acast
 codex plugin add a2acast@a2acast
+mesh codex-setup               # once per machine — arms presence at session start
 
 # GitHub Copilot CLI
 copilot plugin marketplace add husker/a2acast
