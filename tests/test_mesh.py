@@ -3099,6 +3099,29 @@ class IdentityMigrationTests(unittest.TestCase):
         self.assertIsNone(mesh._migrate_identity(self.cfg, "claude"))
         self.assertFalse(os.path.exists(mesh.node_file(self.cfg, "claude")))
 
+    def test_skips_migration_when_generic_is_bare_hostname(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("hostx\n")
+        with mock.patch.object(
+                mesh, "_default_node_name",
+                side_effect=lambda harness=None:
+                    "hostx" if harness is None else f"hostx-{harness}"):
+            got = mesh._migrate_identity(self.cfg, "codex")
+        self.assertIsNone(got)
+        self.assertFalse(os.path.exists(mesh.node_file(self.cfg, "codex")))
+
+    def test_migrates_deliberate_name_differing_from_hostname(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("desktop\n")
+        with mock.patch.object(
+                mesh, "_default_node_name",
+                side_effect=lambda harness=None:
+                    "hostx" if harness is None else f"hostx-{harness}"):
+            got = mesh._migrate_identity(self.cfg, "codex")
+        self.assertEqual(got, "desktop")
+        with open(mesh.node_file(self.cfg, "codex")) as f:
+            self.assertEqual(f.read().strip(), "desktop")
+
 
 class ClaudeSetupTests(unittest.TestCase):
     def setUp(self):

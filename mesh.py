@@ -162,6 +162,11 @@ def _migrate_identity(cfg, harness):
         return None
     if not name:
         return None
+    if name == _default_node_name(None):
+        # the generic name is just the bare-hostname default (never a
+        # deliberate `mesh iam` choice) -- let the harness-aware default
+        # (<host>-<harness>) apply instead of stripping the suffix.
+        return None
     try:
         with open(pin, "w", encoding="utf-8") as f:
             f.write(name + "\n")
