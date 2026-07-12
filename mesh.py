@@ -45,6 +45,7 @@ CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 ACTIVITY_FILE = ".meshwire.activity"
 SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
+SUPERVISE_MAX_ATTEMPTS = 3
 
 
 def activity_file(cfg, node):
@@ -623,26 +624,44 @@ def _run_task_with_codex(cfg, me, task_id, task, sandbox):
     """Run one delivered task through `codex exec` in a sandboxed,
     read-only-by-default subprocess, then reply with its stdout.
 
+    Claims the task (state="working") before exec'ing so a concurrent
+    supervise poll or a manual reply can't double-process it -- only
+    tasks in state "submitted" are ever (re-)selected. On failure the
+    task is either reset to "submitted" for retry or, once
+    SUPERVISE_MAX_ATTEMPTS is reached, dead-lettered (state="failed" +
+    marked handled) so it stops being retried forever.
+
     Returns True iff a reply was sent and the task was marked handled;
-    False on any failure (left for retry/manual handling)."""
+    False on any failure (left for retry/manual handling, or
+    dead-lettered)."""
+    def _fail():
+        attempts = task.get("attempts", 0) + 1
+        if attempts >= SUPERVISE_MAX_ATTEMPTS:
+            save_task(cfg, task_id, state="failed", attempts=attempts)
+            _mark_handled(cfg, me, task_id)
+        else:
+            save_task(cfg, task_id, state="submitted", attempts=attempts)
+        return False
+
     sender = task.get("peer", "?")
     prompt = _supervise_preamble(task_id, sender) + (task.get("text") or "")
     cmd = ["codex", "exec", "--sandbox", sandbox, prompt]
+    save_task(cfg, task_id, state="working")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         print("error: codex CLI not found", file=sys.stderr)
-        return False
+        return _fail()
     if r.returncode != 0:
         print(f"error: codex exec failed (exit {r.returncode}): {r.stderr}",
               file=sys.stderr)
-        return False
+        return _fail()
     try:
         _send_reply(cfg, me, task_id, "completed", r.stdout.strip())
     except (urllib.error.URLError, socket.timeout) as e:
         print(f"a2acast supervise: reply for task {task_id} failed to send: {e}",
               file=sys.stderr)
-        return False
+        return _fail()
     _mark_handled(cfg, me, task_id)
     return True
 

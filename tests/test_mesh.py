@@ -3444,6 +3444,45 @@ class SuperviseRunTests(unittest.TestCase):
         self.assertFalse(res)
         self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
 
+    def test_claims_working_before_exec(self):
+        # state is "working" while codex runs -> not re-selectable
+        seen = {}
+
+        def fake_run(cmd, **k):
+            seen["state"] = mesh.load_tasks(self.cfg)["t1"].get("state")
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+        with mock.patch.object(mesh.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(mesh, "_send_reply"):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(seen["state"], "working")
+
+    def test_dead_letters_after_max_attempts(self):
+        mesh.save_task(self.cfg, "t1", attempts=mesh.SUPERVISE_MAX_ATTEMPTS - 1)
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertEqual(t["state"], "failed")
+        self.assertEqual(t["attempts"], mesh.SUPERVISE_MAX_ATTEMPTS)
+        self.assertIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_resets_to_submitted_for_retry_below_cap(self):
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                return_value=mock.Mock(returncode=1, stdout="", stderr="x")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertEqual(t["state"], "submitted")
+        self.assertEqual(t["attempts"], 1)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
 
 class SuperviseLoopTests(unittest.TestCase):
     """cmd_codex_supervise tests run chdir'd into a temp dir (find_config
