@@ -266,6 +266,101 @@ def _supervise_preamble(task_id, sender):
 - [ ] Send from a NON-roster identity → verify it is buffered/logged, NOT executed.
 - [ ] `mesh codex-supervise --stop` → process gone.
 
+---
+
+## SECURITY HARDENING (added after the final whole-branch review found the roster is not a trust boundary)
+
+### Task 8: Curated exec-allowlist (the real trust boundary)
+
+**Files:** Modify `mesh.py` (`_supervise_pending`, new `cmd_codex_allow`, parser); Test `tests/test_mesh.py`.
+
+**Why:** `note_peer` auto-adds any authenticated sender to `cfg["nodes"]`, so filtering exec-eligibility on the roster lets a first-contact attacker auto-run code. Gate on a separate, operator-curated `cfg["exec_allow"]` (default empty).
+
+**Interfaces:**
+- `_supervise_pending` filters on `t.get("peer") in cfg.get("exec_allow", [])` (NOT `cfg["nodes"]`).
+- `cmd_codex_allow(args)`: `mesh codex-allow <node>...` adds to `cfg["exec_allow"]` + `_save_config`; `--revoke <node>...` removes; `--list` prints the current allowlist. Persists via `_save_config(cfg)` (search it).
+- Parser `codex-allow`: positional `node` (nargs="*"), `--revoke` (nargs="*"), `--list` (store_true).
+
+- [ ] **Step 1: Failing tests.** In `SupervisePendingTests`, CHANGE the existing setup that used `cfg["nodes"]` for selection to use `cfg["exec_allow"]`, and add the security test:
+```python
+    def test_roster_peer_not_in_exec_allow_is_excluded(self):
+        # SECURITY: being in the auto-grown roster must NOT make a peer
+        # exec-eligible; only the curated exec_allow list does.
+        self.cfg["nodes"] = ["alpha"]; self.cfg["exec_allow"] = []
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+    def test_only_exec_allow_peers_selected(self):
+        self.cfg["exec_allow"] = ["alpha"]
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        mesh.save_task(self.cfg, "t2", direction="inbound", state="submitted",
+                       peer="beta", text="x")
+        self.assertEqual([tid for tid,_ in mesh._supervise_pending(self.cfg,"me")],
+                         ["t1"])
+```
+Add `CodexAllowTests`: allow adds + persists (reload cfg from disk shows it), revoke removes, list prints.
+- [ ] **Step 2: Run → fail.**
+- [ ] **Step 3: Implement** the filter change, `cmd_codex_allow`, parser entry.
+- [ ] **Step 4: tests + full suite pass** (fix any prior SupervisePendingTests that assumed the roster gate).
+- [ ] **Step 5: Commit** `fix(security): gate auto-exec on a curated exec-allowlist, not the auto-grown roster`
+
+---
+
+### Task 9: Autonomy is opt-in — codex-setup defaults to NO supervisor
+
+**Files:** Modify `mesh.py` (`cmd_codex_setup`, parser); Test `tests/test_mesh.py`.
+
+**Interfaces:** Replace `--no-supervise` with `--supervise` (store_true, default False). `cmd_codex_setup` launches the supervisor ONLY when `args.supervise`. When not: print that presence is registered, autonomy is off, and how to enable (`mesh codex-setup --supervise` then `mesh codex-allow <peer>`).
+
+- [ ] **Step 1: Failing tests** — update `CodexSetupTests`: `test_no_supervise_by_default` (Popen NOT called when `supervise` absent/False); `test_supervise_flag_launches` (Popen called when `supervise=True`); update ALL existing CodexSetupTests Namespace call sites: replace `no_supervise=...` with `supervise=...` (default False). The default-run tests must now expect NO Popen.
+- [ ] **Step 2–4:** implement (flip the condition + parser + text), tests, suite.
+- [ ] **Step 5: Commit** `fix(security): codex-setup autonomy is opt-in (--supervise), presence-only by default`
+
+---
+
+### Task 10: No double-exec, no infinite retry (task claim + retry cap)
+
+**Files:** Modify `mesh.py` (`_run_task_with_codex`); Test `tests/test_mesh.py`.
+
+**Interfaces:** `SUPERVISE_MAX_ATTEMPTS = 3` constant. In `_run_task_with_codex`, before `subprocess.run`: `save_task(cfg, task_id, state="working")` (claim — excluded from `_supervise_pending` since it filters state=="submitted"). On codex failure (FileNotFoundError or returncode!=0) OR reply-send failure: read `attempts = task.get("attempts", 0) + 1`; if `attempts >= SUPERVISE_MAX_ATTEMPTS`: `save_task(cfg, task_id, state="failed", attempts=attempts)` + `_mark_handled` (dead-letter, stop retrying) and return False; else `save_task(cfg, task_id, state="submitted", attempts=attempts)` (reset for retry) and return False. On success: unchanged (`_send_reply` sets completed, `_mark_handled`).
+
+- [ ] **Step 1: Failing tests** in `SuperviseRunTests`:
+```python
+    def test_claims_working_before_exec(self):
+        # state is "working" while codex runs -> not re-selectable
+        seen = {}
+        def fake_run(cmd, **k):
+            seen["state"] = mesh.load_tasks(self.cfg)["t1"].get("state")
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(mesh, "_send_reply"):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(seen["state"], "working")
+    def test_dead_letters_after_max_attempts(self):
+        t = mesh.load_tasks(self.cfg)["t1"]; 
+        mesh.save_task(self.cfg, "t1", attempts=mesh.SUPERVISE_MAX_ATTEMPTS - 1)
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        self.assertEqual(mesh.load_tasks(self.cfg)["t1"]["state"], "failed")
+        self.assertIn("t1", mesh._load_handled(self.cfg, "me"))
+    def test_resets_to_submitted_for_retry_below_cap(self):
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="", stderr="x")):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(mesh.load_tasks(self.cfg)["t1"]["state"], "submitted")
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+```
+- [ ] **Step 2–4:** implement, tests, suite.
+- [ ] **Step 5: Commit** `fix(security): supervise claims task as working + caps retries (dead-letter)`
+
+---
+
 ## Self-Review
 
 - Spec coverage: B → Task 1; A selection/dedup → 2; codex exec + reply → 3; loop/singleton/stop → 4; setup wiring + sandbox opt → 5; release → 6; security (allowlist Task 2 filter + sandbox default Tasks 3/4/5 + preamble Task 3 + dedup Task 2) present throughout; live incl. non-roster check → 7.
