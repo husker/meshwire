@@ -46,6 +46,7 @@ NODE_NAME = ".meshwire.node"
 ACTIVITY_FILE = ".meshwire.activity"
 SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
 SUPERVISE_MAX_ATTEMPTS = 3
+SUPERVISE_EXEC_TIMEOUT = 600
 
 
 def activity_file(cfg, node):
@@ -648,9 +649,14 @@ def _run_task_with_codex(cfg, me, task_id, task, sandbox):
     cmd = ["codex", "exec", "--sandbox", sandbox, prompt]
     save_task(cfg, task_id, state="working")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=SUPERVISE_EXEC_TIMEOUT)
     except FileNotFoundError:
         print("error: codex CLI not found", file=sys.stderr)
+        return _fail()
+    except subprocess.TimeoutExpired:
+        print(f"a2acast supervise: codex exec for task {task_id} timed out "
+              f"after {SUPERVISE_EXEC_TIMEOUT}s", file=sys.stderr)
         return _fail()
     if r.returncode != 0:
         print(f"error: codex exec failed (exit {r.returncode}): {r.stderr}",
@@ -2894,6 +2900,20 @@ def cmd_codex_supervise(args):
     pid_path = _supervise_pid_file(cfg, me)
     with open(pid_path, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()) + "\n")
+
+    # We hold the singleton lock, so no other codex-supervise process for
+    # this node can be mid-exec right now -- any task still marked
+    # state="working" was stranded by a prior crash/SIGTERM and would
+    # otherwise never be re-selected (_supervise_pending only picks up
+    # "submitted"). Safe to requeue before entering the poll loop.
+    tasks = load_tasks(cfg)
+    stale = [tid for tid, t in tasks.items()
+             if t.get("direction") == "inbound" and t.get("state") == "working"]
+    for tid in stale:
+        save_task(cfg, tid, state="submitted")
+    if stale:
+        print(f"a2acast supervise: requeued {len(stale)} stale 'working' "
+              f"task(s) from a prior crash")
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:

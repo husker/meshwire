@@ -110,8 +110,8 @@ The `<host>-<harness>` rule is correct and stays. Fix the *fallout*: migrate an
 established generic name to the reliable per-harness pin, and stop steering users
 toward the unreliable env override.
 
-1. **Migration in `claude-setup` / `codex-setup`** (and a standalone
-   `mesh migrate-identity`): if `node_file(cfg)` (generic `.meshwire.node`)
+1. **Migration in `claude-setup` / `codex-setup`** (there is no standalone
+   migration command): if `node_file(cfg)` (generic `.meshwire.node`)
    exists with a non-empty name AND `node_file(cfg, harness)` does not exist,
    copy the generic name into the per-harness pin. Established nodes keep their
    identity under the new rule; nothing goes dark. Idempotent; never overwrites

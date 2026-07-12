@@ -3483,6 +3483,31 @@ class SuperviseRunTests(unittest.TestCase):
         self.assertEqual(t["attempts"], 1)
         self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
 
+    def test_exec_has_timeout(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok) as run, \
+             mock.patch.object(mesh, "_send_reply"):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(run.call_args.kwargs.get("timeout"),
+                         mesh.SUPERVISE_EXEC_TIMEOUT)
+
+    def test_timeout_is_a_failure(self):
+        # A hung `codex exec` must not strand the task in "working" --
+        # TimeoutExpired has to route through the same _fail() path as any
+        # other non-zero-exit failure (retry below cap, dead-letter at cap).
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=mesh.subprocess.TimeoutExpired(cmd="codex", timeout=1)):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertNotEqual(t["state"], "working")
+        self.assertIn(t["state"], ("submitted", "failed"))
+        self.assertEqual(t["attempts"], 1)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
 
 class SuperviseLoopTests(unittest.TestCase):
     """cmd_codex_supervise tests run chdir'd into a temp dir (find_config
@@ -3575,6 +3600,22 @@ class SuperviseLoopTests(unittest.TestCase):
             mesh.cmd_codex_supervise(ns)
         sig.assert_called_once()
         self.assertEqual(sig.call_args[0][0], mesh.signal.SIGTERM)
+
+    def test_startup_requeues_stale_working(self):
+        # A prior crash/SIGTERM mid-exec can strand a task in state
+        # "working" -- _supervise_pending only ever selects "submitted", so
+        # without a startup requeue this task would be stuck forever.
+        # peer="alpha" is already in cfg["exec_allow"] (see setUp), so once
+        # requeued to "submitted" it's immediately eligible.
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="working",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][2], "t1")   # task_id
 
 
 if __name__ == "__main__":
