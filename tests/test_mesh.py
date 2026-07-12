@@ -2412,6 +2412,24 @@ class AckSenderTests(MembershipCmdTests):
         self.assertIn("sent to beta", out.getvalue())
 
 
+class ActivityFileTests(unittest.TestCase):
+    def test_activity_file_is_per_node(self):
+        cfg = {"_dir": "/tmp/x"}
+        self.assertEqual(mesh.activity_file(cfg, "alpha"),
+                         os.path.join("/tmp/x", ".meshwire.activity.alpha"))
+
+    def test_record_activity_writes_per_node_file(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._record_activity({"kind": "message", "from": "beta",
+                              "text": "hello"})
+        path = mesh.activity_file(cfg, "alpha")
+        with open(path) as f:
+            self.assertIn("message from beta: hello", f.read())
+
+
 class MCPServeTests(unittest.TestCase):
     """The Copilot MCP-server watcher (mesh mcp-serve)."""
 
@@ -2601,7 +2619,7 @@ class MCPServeTests(unittest.TestCase):
         self._initialize(srv, out, sampling=False)
         srv.deliver({"kind": "message", "from": "mac-codex",
                      "text": "pulled the fix"})
-        with open(os.path.join(self._tmp.name, ".meshwire.activity")) as f:
+        with open(mesh.activity_file(srv.cfg, "alpha")) as f:
             self.assertIn("message from mac-codex", f.read())
 
     def test_mesh_ask_delegates_a2a_task(self):

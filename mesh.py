@@ -43,6 +43,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 ACTIVITY_FILE = ".meshwire.activity"
+
+
+def activity_file(cfg, node):
+    """Per-node activity/wake-signal file. Two harness nodes sharing one
+    directory must not cross-talk on wake signals."""
+    return os.path.join(cfg["_dir"], f"{ACTIVITY_FILE}.{node}")
+
+
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
@@ -1504,7 +1512,7 @@ class MeshMCPServer:
         else:
             line = f"message from {frm}: {text}"
         try:
-            with open(os.path.join(self.cfg["_dir"], ACTIVITY_FILE),
+            with open(activity_file(self.cfg, self.me),
                       "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
@@ -1753,19 +1761,26 @@ def cmd_copilot_activity(args):
     if not path:
         print("{}")
         return
-    act = os.path.join(os.path.dirname(path), ACTIVITY_FILE)
-    try:
-        with open(act, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except OSError:
-        lines = []
+    cfg = json.load(open(path, "r", encoding="utf-8"))
+    cfg["_path"] = path
+    cfg["_dir"] = os.path.dirname(path)
+    me = my_node(cfg, None)
+    candidates = [os.path.join(cfg["_dir"], ACTIVITY_FILE),   # legacy
+                  activity_file(cfg, me)]
+    lines = []
+    for act in candidates:
+        try:
+            with open(act, "r", encoding="utf-8") as f:
+                lines.extend(ln.strip() for ln in f if ln.strip())
+        except OSError:
+            continue
+        try:
+            os.remove(act)
+        except OSError:
+            pass
     if not lines:
         print("{}")
         return
-    try:
-        os.remove(act)
-    except OSError:
-        pass
     n = len(lines)
     shown = "; ".join(lines[:5])
     if n > 5:
