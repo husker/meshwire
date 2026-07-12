@@ -3224,5 +3224,27 @@ class CopilotActivityTests(MembershipCmdTests):
             self._run({"cwd": "/no/such/dir", "prompt": "x"}), {})
 
 
+class SupervisePendingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(); self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name); self.cfg["nodes"] = ["alpha", "beta"]
+
+    def _task(self, tid, **f):
+        mesh.save_task(self.cfg, tid, **f)
+
+    def test_selects_inbound_submitted_from_roster(self):
+        self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
+        self._task("t2", direction="outbound", state="submitted", peer="alpha", text="x")
+        self._task("t3", direction="inbound", state="completed", peer="alpha", text="done")
+        self._task("t4", direction="inbound", state="submitted", peer="stranger", text="evil")
+        got = [tid for tid, _ in mesh._supervise_pending(self.cfg, "me")]
+        self.assertEqual(got, ["t1"])          # only roster inbound submitted
+
+    def test_skips_handled(self):
+        self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
+        mesh._mark_handled(self.cfg, "me", "t1")
+        self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

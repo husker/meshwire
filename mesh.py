@@ -44,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 ACTIVITY_FILE = ".meshwire.activity"
+SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
 
 
 def activity_file(cfg, node):
@@ -558,6 +559,42 @@ def save_task(cfg, task_id, **fields):
     with open(tasks_file(cfg), "w", encoding="utf-8") as f:
         json.dump(tasks, f, indent=1)
     return t
+
+
+def _supervise_handled_file(cfg, node):
+    return os.path.join(cfg["_dir"], f"{SUPERVISE_HANDLED_NAME}.{node}")
+
+
+def _load_handled(cfg, node):
+    try:
+        with open(_supervise_handled_file(cfg, node), "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
+def _mark_handled(cfg, node, task_id):
+    try:
+        with open(_supervise_handled_file(cfg, node), "a", encoding="utf-8") as f:
+            f.write(task_id + "\n")
+    except OSError:
+        pass
+
+
+def _supervise_pending(cfg, node):
+    """Inbound tasks from a roster peer awaiting `mesh codex-supervise`
+    action, oldest first, skipping ones already marked handled."""
+    handled = _load_handled(cfg, node)
+    tasks = load_tasks(cfg)
+    pending = [
+        (task_id, t) for task_id, t in tasks.items()
+        if t.get("direction") == "inbound"
+        and t.get("state") == "submitted"
+        and t.get("peer") in cfg.get("nodes", [])
+        and task_id not in handled
+    ]
+    pending.sort(key=lambda item: item[1].get("updated", 0))
+    return pending
 
 
 def _text_of(message_or_artifact):
