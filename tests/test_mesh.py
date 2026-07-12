@@ -3626,6 +3626,14 @@ class SuperviseLoopTests(unittest.TestCase):
         self._harness_patch = mock.patch.object(
             mesh, "_detect_harness", return_value=None)
         self._harness_patch.start()
+        # #32: cmd_codex_supervise now starts a background relay-receiver
+        # thread (MeshMCPServer.watch_loop) before its exec poll loop. These
+        # tests are about the exec-loop behavior, not the receiver, so patch
+        # threading.Thread to a no-op stand-in -- it must not spin up a real
+        # thread that attempts real network I/O. SuperviseReceiverTests
+        # covers the receiver wiring itself.
+        self._thread_patch = mock.patch.object(mesh.threading, "Thread")
+        self._thread_patch.start()
         self._tmp = tempfile.TemporaryDirectory()
         self._old = os.getcwd()
         os.chdir(self._tmp.name)
@@ -3641,6 +3649,7 @@ class SuperviseLoopTests(unittest.TestCase):
         os.chdir(self._old)
         self._tmp.cleanup()
         self._harness_patch.stop()
+        self._thread_patch.stop()
         if self._env is not None:
             os.environ["A2ACAST_NODE"] = self._env
 
@@ -3760,6 +3769,105 @@ class SuperviseLoopTests(unittest.TestCase):
         # Iteration 2: cfg reloaded, picks up the concurrent allow -> called.
         run.assert_called_once()
         self.assertEqual(run.call_args[0][2], "t1")   # task_id
+
+
+class _ImmediateThread:
+    """Deterministic stand-in for threading.Thread: runs `target`
+    synchronously inside start() instead of on a real OS thread. Used to
+    test the receive -> store -> exec wiring in cmd_codex_supervise without
+    real thread-scheduling races (see SuperviseReceiverTests)."""
+
+    def __init__(self, target=None, daemon=None, **_kwargs):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+
+class SuperviseReceiverTests(unittest.TestCase):
+    # #32: cmd_codex_supervise must be self-contained -- it starts its own
+    # relay receiver (a MeshMCPServer.watch_loop, in a daemon thread) before
+    # the exec poll loop, so a headless node (no harness session running
+    # `mesh mcp-serve`) still receives inbound A2A tasks. These tests cover
+    # that receiver wiring; SuperviseLoopTests covers the exec-loop behavior
+    # and patches threading.Thread to a no-op so it stays unaffected.
+
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._harness_patch = mock.patch.object(
+            mesh, "_detect_harness", return_value=None)
+        self._harness_patch.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        cfg["nodes"] = ["mynode", "alpha"]
+        cfg["exec_allow"] = ["alpha"]
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        self.cfg = mesh.load_config()
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        self._harness_patch.stop()
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def test_supervisor_starts_receiver_thread(self):
+        # The supervisor constructs its own MeshMCPServer for this node and
+        # runs its watch_loop on a daemon thread, unconditionally (no
+        # presence-lock coordination -- see the comment in mesh.py). On
+        # exit, it must tear the receiver down via _stop.set() so no
+        # thread/subscription is leaked.
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex"), \
+             mock.patch.object(mesh, "MeshMCPServer") as mcp_cls, \
+             mock.patch.object(mesh.threading, "Thread") as thread_cls:
+            mesh.cmd_codex_supervise(ns)
+
+        # A receiver was constructed for this node.
+        mcp_cls.assert_called_once()
+        self.assertEqual(mcp_cls.call_args[0][1], "mynode")
+        receiver = mcp_cls.return_value
+
+        # Its watch_loop was started on a daemon thread.
+        self.assertEqual(thread_cls.call_args.kwargs.get("target"),
+                         receiver.watch_loop)
+        self.assertEqual(thread_cls.call_args.kwargs.get("daemon"), True)
+        thread_cls.return_value.start.assert_called_once()
+
+        # Torn down on exit -- no leaked thread/subscription.
+        receiver._stop.set.assert_called_once()
+
+    def test_receiver_delivers_task_that_exec_loop_then_processes(self):
+        # End-to-end: a task the receiver "delivers" (saves into the local
+        # store, exactly like MeshMCPServer's normal delivery path does) is
+        # picked up by the SAME --once exec pass -- proving the supervisor
+        # no longer depends on an external presence server to populate the
+        # store. threading.Thread is replaced with a synchronous stand-in
+        # so the delivery happens deterministically before the exec loop
+        # reads the store.
+        def _fake_watch_loop():
+            mesh.save_task(self.cfg, "t1", direction="inbound",
+                           state="submitted", peer="alpha", text="hi")
+
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "MeshMCPServer") as mcp_cls, \
+             mock.patch.object(mesh.threading, "Thread",
+                               side_effect=_ImmediateThread), \
+             mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run:
+            mcp_cls.return_value.watch_loop.side_effect = _fake_watch_loop
+            mesh.cmd_codex_supervise(ns)
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][2], "t1")   # task_id
+        mcp_cls.return_value._stop.set.assert_called_once()
 
 
 if __name__ == "__main__":
