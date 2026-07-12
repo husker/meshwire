@@ -2549,7 +2549,43 @@ This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 
 
 def cmd_claude_setup(args):
-    print(CLAUDE_SNIPPET, end="")
+    """Register the a2acast presence watcher for Claude Code by writing the
+    project's .mcp.json (idempotent). Claude Code spawns the server with
+    every session, so the node answers pings and captures messages from the
+    moment the session opens. Run once per project per machine."""
+    cfg_path = find_config(getattr(args, "dir", None))
+    if not cfg_path:
+        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
+                 f"directory. Run `mesh init` or `mesh join` first.")
+    project = os.path.dirname(cfg_path)
+    mcp_path = os.path.join(project, ".mcp.json")
+    data = {}
+    if os.path.isfile(mcp_path):
+        try:
+            with open(mcp_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["a2acast"] = {
+        "command": "mesh",
+        "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)],
+    }
+    data["mcpServers"] = servers
+    with open(mcp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    # the pinned path is machine-specific; keep it out of version control
+    _gitignore_add(project, [".mcp.json"])
+    print(f"Wrote {mcp_path}")
+    print(f"  a2acast presence watcher pinned to {os.path.abspath(cfg_path)}")
+    print("Start a Claude Code session in this project to pick it up. For "
+          "the CLAUDE.md protocol snippet, run `mesh integrate --format "
+          "claude`.")
 
 
 _INTEGRATE_GUIDE = """\
@@ -2810,8 +2846,10 @@ def main():
     p.set_defaults(fn=cmd_a2a_serve)
 
     p = sub.add_parser("claude-setup",
-                       help="print a CLAUDE.md section teaching an agent "
-                            "session the protocol")
+                       help="wire the Claude Code presence watcher for this "
+                            "project (writes .mcp.json)")
+    p.add_argument("--dir", default=None,
+                   help="project dir to set up (default: search from cwd)")
     p.set_defaults(fn=cmd_claude_setup)
 
     args = ap.parse_args()

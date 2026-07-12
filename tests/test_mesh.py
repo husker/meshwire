@@ -2872,6 +2872,54 @@ class IntegrateTests(unittest.TestCase):
         self.assertIn("mcp", srv["args"])
 
 
+class ClaudeSetupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_claude_setup(argparse.Namespace(dir=None))
+        return out.getvalue()
+
+    def test_writes_mcp_json_with_pinned_config(self):
+        self._run()
+        with open(".mcp.json") as f:
+            data = json.load(f)
+        srv = data["mcpServers"]["a2acast"]
+        self.assertEqual(srv["command"], "mesh")
+        self.assertEqual(srv["args"][:2], ["mcp-serve", "--config"])
+        self.assertTrue(os.path.isabs(srv["args"][2]))
+
+    def test_idempotent_and_preserves_other_servers(self):
+        with open(".mcp.json", "w") as f:
+            json.dump({"mcpServers": {"other": {"command": "x"}}}, f)
+        self._run()
+        self._run()
+        with open(".mcp.json") as f:
+            data = json.load(f)
+        self.assertIn("other", data["mcpServers"])
+        self.assertIn("a2acast", data["mcpServers"])
+
+    def test_gitignores_mcp_json(self):
+        self._run()
+        with open(".gitignore") as f:
+            self.assertIn(".mcp.json", f.read())
+
+    def test_errors_without_mesh_config(self):
+        os.remove(mesh.CONFIG_NAME)
+        with self.assertRaises(SystemExit):
+            mesh.cmd_claude_setup(argparse.Namespace(dir=None))
+
+
 class CopilotSetupTests(unittest.TestCase):
     """`mesh copilot-setup` pins the watcher via a workspace .github/mcp.json
     with an explicit --config — the deterministic, cross-platform route now that
