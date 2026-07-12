@@ -2828,15 +2828,16 @@ def cmd_codex_setup(args):
         else:
             print(f"Launched codex-supervise (sandbox={sandbox}). "
                   "Stop it with: mesh codex-supervise --stop")
-            print("Tasks from roster peers are handled automatically; "
-                  "messages from unknown senders are buffered for "
-                  "manual review.")
+            print("Tasks from exec-allowlisted peers are handled "
+                  "automatically; messages from unknown senders are "
+                  "buffered for manual review.")
 
 
 def cmd_codex_supervise(args):
-    """Drive Codex autonomy: poll for inbound tasks from roster peers and
-    hand each to `codex exec` via `_run_task_with_codex`. Singleton per
-    node (like the presence watcher); `--stop` signals a running loop."""
+    """Drive Codex autonomy: poll for inbound tasks from exec-allowlisted
+    peers (curated via `mesh codex-allow`) and hand each to `codex exec`
+    under the configured sandbox. Singleton per node (like the presence
+    watcher); `--stop` signals a running loop."""
     cfg = load_config()
     me = my_node(cfg, args.as_node, "codex")
 
@@ -3213,8 +3214,9 @@ def main():
     p.set_defaults(fn=cmd_codex_setup)
 
     p = sub.add_parser("codex-supervise",
-                       help="drive Codex autonomy: poll for inbound roster "
-                            "tasks and run each through `codex exec`")
+                       help="drive Codex autonomy: poll for inbound "
+                            "exec-allowlisted tasks and run each through "
+                            "`codex exec`")
     p.add_argument("--sandbox", default="read-only",
                    choices=["read-only", "workspace-write",
                             "danger-full-access"],
