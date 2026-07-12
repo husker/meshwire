@@ -2805,10 +2805,13 @@ def cmd_codex_setup(args):
           "with every Codex session on this machine and serves this "
           "project's node; the presence lock keeps it single-instance.")
 
-    if getattr(args, "no_supervise", False):
-        print("Autonomy is off (--no-supervise): presence is registered, "
-              "but codex-supervise is not running. Start it manually with:\n"
-              "  mesh codex-supervise --sandbox read-only")
+    if not getattr(args, "supervise", False):
+        print("Autonomy is off: presence is registered, but no task "
+              "handling will happen automatically.")
+        print("To enable it: run `mesh codex-setup --supervise` "
+              "(starts the codex-supervise actor), then "
+              "`mesh codex-allow <peer>` to trust specific peers. "
+              "Nothing auto-runs until you allow a peer.")
     else:
         sandbox = getattr(args, "supervise_sandbox", "read-only")
         log_path = os.path.join(project_dir, ".meshwire.supervise.log")
@@ -2828,9 +2831,11 @@ def cmd_codex_setup(args):
         else:
             print(f"Launched codex-supervise (sandbox={sandbox}). "
                   "Stop it with: mesh codex-supervise --stop")
-            print("Tasks from exec-allowlisted peers are handled "
-                  "automatically; messages from unknown senders are "
-                  "buffered for manual review.")
+            print("The allowlist is empty by default — run "
+                  "`mesh codex-allow <peer>` before anything actually "
+                  "auto-runs. Tasks from exec-allowlisted peers are "
+                  "handled automatically; messages from unknown senders "
+                  "are buffered for manual review.")
 
 
 def cmd_codex_supervise(args):
@@ -3209,8 +3214,9 @@ def main():
                             "danger-full-access"],
                    help="sandbox mode for the codex-supervise actor "
                         "launched after setup (default read-only)")
-    p.add_argument("--no-supervise", action="store_true",
-                   help="skip launching codex-supervise (presence only)")
+    p.add_argument("--supervise", action="store_true", default=False,
+                   help="launch codex-supervise after setup (default: "
+                        "presence only, autonomy off)")
     p.set_defaults(fn=cmd_codex_setup)
 
     p = sub.add_parser("codex-supervise",

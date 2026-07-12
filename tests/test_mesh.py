@@ -3074,10 +3074,10 @@ class CodexSetupTests(unittest.TestCase):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run",
                                return_value=ok) as run:
-            with mock.patch.object(mesh.subprocess, "Popen"):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
                 with contextlib.redirect_stdout(io.StringIO()):
                     mesh.cmd_codex_setup(argparse.Namespace(
-                        dir=None, no_supervise=False,
+                        dir=None, supervise=False,
                         supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
@@ -3087,6 +3087,7 @@ class CodexSetupTests(unittest.TestCase):
                                "mesh", "mcp-serve", "--config",
                                expected_cfg, "--as",
                                mesh._default_node_name("codex")])
+        popen.assert_not_called()
 
     def test_migrated_identity_is_used_as_node_name(self):
         with open(mesh.NODE_NAME, "w") as f:
@@ -3097,7 +3098,7 @@ class CodexSetupTests(unittest.TestCase):
             with mock.patch.object(mesh.subprocess, "Popen"):
                 with contextlib.redirect_stdout(io.StringIO()):
                     mesh.cmd_codex_setup(argparse.Namespace(
-                        dir=None, no_supervise=False,
+                        dir=None, supervise=False,
                         supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         # the migrated identity (established via the generic node file)
@@ -3109,7 +3110,7 @@ class CodexSetupTests(unittest.TestCase):
                                side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit) as ctx:
                 mesh.cmd_codex_setup(argparse.Namespace(
-                    dir=None, no_supervise=False,
+                    dir=None, supervise=False,
                     supervise_sandbox="read-only"))
         msg = str(ctx.exception)
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
@@ -3125,7 +3126,7 @@ class CodexSetupTests(unittest.TestCase):
         with mock.patch.object(mesh.subprocess, "run", return_value=bad):
             with self.assertRaises(SystemExit) as ctx:
                 mesh.cmd_codex_setup(argparse.Namespace(
-                    dir=None, no_supervise=False,
+                    dir=None, supervise=False,
                     supervise_sandbox="read-only"))
         self.assertIn("nope", str(ctx.exception))
 
@@ -3133,16 +3134,27 @@ class CodexSetupTests(unittest.TestCase):
         os.remove(mesh.CONFIG_NAME)
         with self.assertRaises(SystemExit):
             mesh.cmd_codex_setup(argparse.Namespace(
-                dir=None, no_supervise=False,
+                dir=None, supervise=False,
                 supervise_sandbox="read-only"))
 
-    def test_launches_supervisor_by_default(self):
+    def test_no_supervisor_by_default(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
+        popen.assert_not_called()
+        self.assertIn("--supervise", out.getvalue())
+
+    def test_supervise_flag_launches(self):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run", return_value=ok):
             with mock.patch.object(mesh.subprocess, "Popen") as popen:
                 with contextlib.redirect_stdout(io.StringIO()):
                     mesh.cmd_codex_setup(argparse.Namespace(
-                        dir=None, no_supervise=False,
+                        dir=None, supervise=True,
                         supervise_sandbox="read-only"))
         self.assertEqual(popen.call_count, 1)
         argv = popen.call_args[0][0]
@@ -3150,23 +3162,13 @@ class CodexSetupTests(unittest.TestCase):
         self.assertEqual(argv, ["mesh", "codex-supervise", "--sandbox",
                                 "read-only", "--as", me])
 
-    def test_no_supervise_skips_launch(self):
-        ok = mock.Mock(returncode=0, stdout="", stderr="")
-        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
-            with mock.patch.object(mesh.subprocess, "Popen") as popen:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    mesh.cmd_codex_setup(argparse.Namespace(
-                        dir=None, no_supervise=True,
-                        supervise_sandbox="read-only"))
-        popen.assert_not_called()
-
     def test_supervise_sandbox_passthrough(self):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run", return_value=ok):
             with mock.patch.object(mesh.subprocess, "Popen") as popen:
                 with contextlib.redirect_stdout(io.StringIO()):
                     mesh.cmd_codex_setup(argparse.Namespace(
-                        dir=None, no_supervise=False,
+                        dir=None, supervise=True,
                         supervise_sandbox="workspace-write"))
         argv = popen.call_args[0][0]
         self.assertIn("workspace-write", argv)
@@ -3180,7 +3182,7 @@ class CodexSetupTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     with contextlib.redirect_stderr(io.StringIO()) as err:
                         mesh.cmd_codex_setup(argparse.Namespace(
-                            dir=None, no_supervise=False,
+                            dir=None, supervise=True,
                             supervise_sandbox="read-only"))
         self.assertIn("warning: could not launch codex-supervise",
                        err.getvalue())
