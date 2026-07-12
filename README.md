@@ -201,6 +201,10 @@ mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude 
 mesh claude-setup              register the presence watcher (writes .mcp.json)
 ```
 
+To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
+Prefer this over the `A2ACAST_NODE` env var, which is not reliably inherited
+by harness-spawned processes.
+
 **Onboarding & MCP clients.** `mesh integrate` prints the right setup for
 whatever you run — a harness plugin (`--format codex`/`copilot`), a CLAUDE.md
 snippet (`--format claude`), a paste-in skill (`--format skill`), or the MCP

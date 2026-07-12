@@ -139,6 +139,32 @@ def _pin_node_name(cfg, name, harness):
         pass
 
 
+def _migrate_identity(cfg, harness):
+    """Preserve an established generic-file identity under the harness-aware
+    naming rule: copy `.meshwire.node` into `.meshwire.node.<harness>` when the
+    per-harness pin does not yet exist. Prevents a node that was known by a
+    plain name from going dark on upgrade. Idempotent; never clobbers a pin."""
+    if not harness or not cfg.get("_dir"):
+        return None
+    pin = node_file(cfg, harness)
+    if os.path.isfile(pin):
+        return None
+    generic = node_file(cfg)
+    try:
+        with open(generic, "r", encoding="utf-8") as f:
+            name = f.read().strip()
+    except OSError:
+        return None
+    if not name:
+        return None
+    try:
+        with open(pin, "w", encoding="utf-8") as f:
+            f.write(name + "\n")
+    except OSError:
+        return None
+    return name
+
+
 def my_node(cfg, override=None, harness=None):
     """Resolve this machine's node name.
 
@@ -2564,6 +2590,11 @@ def cmd_claude_setup(args):
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
     project = os.path.dirname(cfg_path)
+    migrated = _migrate_identity({"_dir": project}, "claude")
+    if migrated:
+        print(f"  migrated established identity '{migrated}' -> "
+              f".meshwire.node.claude (kept your node name under the new "
+              f"per-harness naming)")
     mcp_path = os.path.join(project, ".mcp.json")
     data = {}
     if os.path.isfile(mcp_path):
@@ -2605,6 +2636,10 @@ def cmd_codex_setup(args):
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
     pinned = os.path.abspath(cfg_path)
+    migrated = _migrate_identity({"_dir": os.path.dirname(cfg_path)}, "codex")
+    if migrated:
+        print(f"  migrated established identity '{migrated}' -> "
+              f".meshwire.node.codex")
     cmd = ["codex", "mcp", "add", "a2acast", "--",
            "mesh", "mcp-serve", "--config", pinned]
     # Codex spawns MCP servers without the session's env, so the server

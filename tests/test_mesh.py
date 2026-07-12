@@ -2982,6 +2982,34 @@ class OnboardingTextTests(unittest.TestCase):
         self.assertIn("mesh_pending", out.getvalue())
 
 
+class IdentityMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+
+    def test_migrates_generic_to_per_harness_pin(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("desktop\n")
+        got = mesh._migrate_identity(self.cfg, "claude")
+        self.assertEqual(got, "desktop")
+        with open(mesh.node_file(self.cfg, "claude")) as f:
+            self.assertEqual(f.read().strip(), "desktop")
+
+    def test_noop_when_pin_exists(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("desktop\n")
+        with open(mesh.node_file(self.cfg, "claude"), "w") as f:
+            f.write("keep\n")
+        self.assertIsNone(mesh._migrate_identity(self.cfg, "claude"))
+        with open(mesh.node_file(self.cfg, "claude")) as f:
+            self.assertEqual(f.read().strip(), "keep")
+
+    def test_noop_when_no_generic(self):
+        self.assertIsNone(mesh._migrate_identity(self.cfg, "claude"))
+        self.assertFalse(os.path.exists(mesh.node_file(self.cfg, "claude")))
+
+
 class ClaudeSetupTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
