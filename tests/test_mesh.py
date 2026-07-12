@@ -2445,10 +2445,40 @@ class WatchLoopResilienceTests(unittest.TestCase):
                 raise RuntimeError("boom")          # unexpected error
             srv._stop.set()                         # second pass: end test
 
+        # Stub the Event.wait() the loop actually sleeps on (not
+        # time.sleep, which watch_loop never calls) so no real time
+        # passes; it returns True only once _stop is set, matching
+        # `if self._stop.wait(backoff): return`.
         with mock.patch.object(srv, "_watch_once", fake_watch_once), \
-             mock.patch.object(mesh.time, "sleep", lambda s: None):
+             mock.patch.object(srv._stop, "wait",
+                                side_effect=lambda t: srv._stop.is_set()
+                                ) as waited:
             srv.watch_loop()
         self.assertEqual(len(calls), 2)             # it came back
+        self.assertEqual([c.args[0] for c in waited.call_args_list], [1])
+
+    def test_watch_loop_backoff_escalates_and_caps_at_30(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._initialized.set()
+        calls = []
+
+        def fake_watch_once(cfg_, me_, tpc_):
+            calls.append(1)
+            if len(calls) <= 7:
+                raise RuntimeError("boom")          # unexpected error
+            srv._stop.set()                         # 8th pass: end test
+
+        with mock.patch.object(srv, "_watch_once", fake_watch_once), \
+             mock.patch.object(srv._stop, "wait",
+                                side_effect=lambda t: srv._stop.is_set()
+                                ) as waited:
+            srv.watch_loop()
+        self.assertEqual(len(calls), 8)              # 7 retries + clean pass
+        self.assertEqual([c.args[0] for c in waited.call_args_list],
+                          [1, 2, 4, 8, 16, 30, 30])   # doubles, caps at 30
 
 
 class MCPServeTests(unittest.TestCase):
