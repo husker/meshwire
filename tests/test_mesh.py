@@ -3171,6 +3171,20 @@ class CodexSetupTests(unittest.TestCase):
         argv = popen.call_args[0][0]
         self.assertIn("workspace-write", argv)
 
+    def test_launch_failure_warns_but_setup_succeeds(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(
+                    mesh.subprocess, "Popen",
+                    side_effect=FileNotFoundError("mesh not found")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()) as err:
+                        mesh.cmd_codex_setup(argparse.Namespace(
+                            dir=None, no_supervise=False,
+                            supervise_sandbox="read-only"))
+        self.assertIn("warning: could not launch codex-supervise",
+                       err.getvalue())
+
 
 class CopilotSetupTests(unittest.TestCase):
     """`mesh copilot-setup` pins the watcher via a workspace .github/mcp.json
