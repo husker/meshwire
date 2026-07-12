@@ -793,7 +793,8 @@ def cmd_join(args):
         if not cfg.get(field):
             sys.exit(f"error: join code missing '{field}'")
     cfg.setdefault("nodes", [])
-    me = args.as_node or _default_node_name()
+    harness = _detect_harness()
+    me = args.as_node or _default_node_name(harness)
     if not me or me == BROADCAST:
         sys.exit("error: couldn't derive a usable node name from the "
                  "hostname — pass --as <name>")
@@ -802,7 +803,7 @@ def cmd_join(args):
     cfg["_path"] = os.path.abspath(CONFIG_NAME)
     cfg["_dir"] = os.getcwd()
     _write_config_here(cfg)
-    with open(NODE_NAME, "w", encoding="utf-8") as f:
+    with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
         f.write(me + "\n")
     print(f"joined mesh '{cfg['mesh']}' as '{me}' "
           f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")

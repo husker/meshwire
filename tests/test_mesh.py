@@ -257,6 +257,48 @@ class HarnessNamingTests(unittest.TestCase):
             self.assertEqual(f.read().strip(), "mine")
 
 
+class JoinHarnessTests(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def _code(self):
+        cfg = make_cfg(self._tmp.name)
+        return mesh.join_code({k: v for k, v in cfg.items()
+                               if not k.startswith("_")})
+
+    def test_join_inside_harness_pins_per_harness_name(self):
+        code = self._code()
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value="claude"), \
+             mock.patch.object(mesh, "send_raw"), \
+             mock.patch.object(mesh, "_watch_if_interactive"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
+        with open(".meshwire.node.claude") as f:
+            name = f.read().strip()
+        self.assertTrue(name.endswith("-claude"))
+        self.assertFalse(os.path.exists(".meshwire.node"))
+
+    def test_join_outside_harness_writes_generic_file(self):
+        code = self._code()
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value=None), \
+             mock.patch.object(mesh, "send_raw"), \
+             mock.patch.object(mesh, "_watch_if_interactive"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
+        self.assertTrue(os.path.exists(".meshwire.node"))
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
