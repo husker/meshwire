@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.1
+- Fix (security): config writes are now durable read-modify-write under a
+  lock — an incoming message (note_peer) or `mesh iam` can no longer clobber
+  the curated `exec_allow` allowlist (#30). Also covers cmd_iam and my_node.
+- Fix: `mesh codex-supervise` reloads the allowlist each poll, so
+  `mesh codex-allow` takes effect on a running supervisor (#31).
+- Fix: the supervisor runs its own relay receiver, so a headless Codex node
+  (no session open) actually receives tasks instead of starving (#32).
+- Fix: identity migration no longer claims the bare hostname — a node whose
+  established name was just the old hostname default keeps the harness-aware
+  `<host>-<harness>` name (#33).
+
 ## 0.14.0
 - Identity migration: `mesh claude-setup`/`codex-setup` migrate an established
   generic `.meshwire.node` name into the per-harness pin, so nodes known by a
