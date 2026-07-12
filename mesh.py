@@ -29,6 +29,7 @@ import re
 import secrets
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2588,6 +2589,37 @@ def cmd_claude_setup(args):
           "claude`.")
 
 
+def cmd_codex_setup(args):
+    """Register the a2acast presence watcher with Codex CLI via
+    `codex mcp add` (Codex owns its config format — shelling out keeps us
+    compatible). The registration is global to Codex and pinned to this
+    project's node; running codex-setup from another mesh project later
+    repoints the single `a2acast` entry there."""
+    cfg_path = find_config(getattr(args, "dir", None))
+    if not cfg_path:
+        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
+                 f"directory. Run `mesh init` or `mesh join` first.")
+    pinned = os.path.abspath(cfg_path)
+    cmd = ["codex", "mcp", "add", "a2acast", "--",
+           "mesh", "mcp-serve", "--config", pinned]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("error: `codex` CLI not found on PATH. Install Codex CLI, "
+                 "or add this to ~/.codex/config.toml yourself:\n"
+                 "  [mcp_servers.a2acast]\n"
+                 "  command = \"mesh\"\n"
+                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\"]")
+    if r.returncode != 0:
+        sys.exit("error: `codex mcp add` failed: "
+                 f"{(r.stderr or r.stdout).strip()}")
+    print("Registered the a2acast presence watcher with Codex CLI "
+          f"(pinned to {pinned}).")
+    print("Note: Codex MCP registration is global — the watcher starts "
+          "with every Codex session on this machine and serves this "
+          "project's node; the presence lock keeps it single-instance.")
+
+
 _INTEGRATE_GUIDE = """\
 # a2acast — connect this machine to the mesh
 
@@ -2851,6 +2883,13 @@ def main():
     p.add_argument("--dir", default=None,
                    help="project dir to set up (default: search from cwd)")
     p.set_defaults(fn=cmd_claude_setup)
+
+    p = sub.add_parser("codex-setup",
+                       help="wire the Codex CLI presence watcher "
+                            "(runs `codex mcp add`)")
+    p.add_argument("--dir", default=None,
+                   help="project dir to set up (default: search from cwd)")
+    p.set_defaults(fn=cmd_codex_setup)
 
     args = ap.parse_args()
     try:

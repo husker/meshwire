@@ -2920,6 +2920,50 @@ class ClaudeSetupTests(unittest.TestCase):
             mesh.cmd_claude_setup(argparse.Namespace(dir=None))
 
 
+class CodexSetupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def test_invokes_codex_mcp_add_with_pinned_config(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=ok) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["codex", "mcp", "add", "a2acast"])
+        self.assertIn("mcp-serve", cmd)
+        self.assertIn("--config", cmd)
+        self.assertTrue(os.path.isabs(cmd[-1]))
+
+    def test_missing_codex_cli_prints_manual_toml(self):
+        with mock.patch.object(mesh.subprocess, "run",
+                               side_effect=FileNotFoundError):
+            with self.assertRaises(SystemExit) as ctx:
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        self.assertIn("[mcp_servers.a2acast]", str(ctx.exception))
+
+    def test_codex_failure_surfaces_stderr(self):
+        bad = mock.Mock(returncode=1, stdout="", stderr="nope")
+        with mock.patch.object(mesh.subprocess, "run", return_value=bad):
+            with self.assertRaises(SystemExit) as ctx:
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        self.assertIn("nope", str(ctx.exception))
+
+    def test_errors_without_mesh_config(self):
+        os.remove(mesh.CONFIG_NAME)
+        with self.assertRaises(SystemExit):
+            mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+
+
 class CopilotSetupTests(unittest.TestCase):
     """`mesh copilot-setup` pins the watcher via a workspace .github/mcp.json
     with an explicit --config — the deterministic, cross-platform route now that
