@@ -3287,5 +3287,73 @@ class SuperviseRunTests(unittest.TestCase):
         self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
 
 
+class SuperviseLoopTests(unittest.TestCase):
+    """cmd_codex_supervise tests run chdir'd into a temp dir (find_config
+    walks up from cwd) so load_config() works, mirroring CodexSetupTests /
+    MembershipCmdTests."""
+
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._harness_patch = mock.patch.object(
+            mesh, "_detect_harness", return_value=None)
+        self._harness_patch.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        cfg["nodes"] = ["mynode", "alpha"]
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        self.cfg = mesh.load_config()
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        self._harness_patch.stop()
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def test_once_processes_pending(self):
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_called_once()
+        call_args = run.call_args[0]
+        self.assertEqual(call_args[2], "t1")   # task_id
+        self.assertEqual(call_args[4], "read-only")   # sandbox
+        # lock and pid file cleaned up after the pass
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "mynode")))
+        self.assertFalse(os.path.exists(
+            mesh.supervise_lock_file(self.cfg, "mynode")))
+
+    def test_second_instance_does_not_process(self):
+        lock = mesh._acquire_supervise_lock(self.cfg, "mynode")
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex") as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_not_called()
+
+    def test_stop_sends_sigterm(self):
+        pid_path = mesh._supervise_pid_file(self.cfg, "mynode")
+        with open(pid_path, "w") as f:
+            f.write("4242\n")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=False,
+                                stop=True, as_node="mynode")
+        with mock.patch("os.kill") as kill:
+            mesh.cmd_codex_supervise(ns)
+        kill.assert_called_once_with(4242, mesh.signal.SIGTERM)
+        self.assertFalse(os.path.exists(pid_path))
+
+
 if __name__ == "__main__":
     unittest.main()

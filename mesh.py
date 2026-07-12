@@ -73,6 +73,7 @@ MAX_RELAY_TIME = 4_102_444_800
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
+SUPERVISE_LOCK_PREFIX = "mw-supervise-"
 
 
 # ---------------------------------------------------------------- config
@@ -563,6 +564,10 @@ def save_task(cfg, task_id, **fields):
 
 def _supervise_handled_file(cfg, node):
     return os.path.join(cfg["_dir"], f"{SUPERVISE_HANDLED_NAME}.{node}")
+
+
+def _supervise_pid_file(cfg, node):
+    return os.path.join(cfg["_dir"], f".meshwire.supervise.pid.{node}")
 
 
 def _load_handled(cfg, node):
@@ -2046,6 +2051,37 @@ def _acquire_presence_lock(cfg, node):
     return None
 
 
+def supervise_lock_file(cfg, node):
+    """Cross-platform singleton lock: one `mesh codex-supervise` loop per
+    mesh node (same scheme as presence_lock_file)."""
+    identity = f"{os.path.realpath(cfg['_dir'])}\0{node}".encode()
+    suffix = hashlib.sha256(identity).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), SUPERVISE_LOCK_PREFIX + suffix)
+
+
+def _acquire_supervise_lock(cfg, node):
+    path = supervise_lock_file(cfg, node)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _hook_lock_is_live(path):
+                return None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            continue
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid()}).encode())
+        finally:
+            os.close(fd)
+        return path
+    return None
+
+
 def _presence_is_live(cfg, node):
     path = presence_lock_file(cfg, node)
     return os.path.exists(path) and _hook_lock_is_live(path)
@@ -2762,6 +2798,61 @@ def cmd_codex_setup(args):
           "project's node; the presence lock keeps it single-instance.")
 
 
+def cmd_codex_supervise(args):
+    """Drive Codex autonomy: poll for inbound tasks from roster peers and
+    hand each to `codex exec` via `_run_task_with_codex`. Singleton per
+    node (like the presence watcher); `--stop` signals a running loop."""
+    cfg = load_config()
+    me = my_node(cfg, args.as_node, "codex")
+
+    if args.stop:
+        pid_path = _supervise_pid_file(cfg, me)
+        try:
+            with open(pid_path, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            print(f"a2acast supervise: no running loop found for node '{me}'")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            print(f"a2acast supervise: process {pid} not running")
+        else:
+            print(f"a2acast supervise: sent SIGTERM to {pid}")
+        try:
+            os.unlink(pid_path)
+        except OSError:
+            pass
+        return
+
+    lock = _acquire_supervise_lock(cfg, me)
+    if not lock:
+        print(f"a2acast supervise: another codex-supervise already owns "
+              f"node '{me}'", file=sys.stderr)
+        return
+
+    pid_path = _supervise_pid_file(cfg, me)
+    with open(pid_path, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()) + "\n")
+
+    try:
+        while True:
+            for task_id, task in _supervise_pending(cfg, me):
+                _run_task_with_codex(cfg, me, task_id, task, args.sandbox)
+            if args.once:
+                return
+            time.sleep(args.interval)
+    finally:
+        try:
+            os.unlink(pid_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
 _INTEGRATE_GUIDE = """\
 # a2acast — connect this machine to the mesh
 
@@ -3043,6 +3134,22 @@ def main():
     p.add_argument("--dir", default=None,
                    help="project dir to set up (default: search from cwd)")
     p.set_defaults(fn=cmd_codex_setup)
+
+    p = sub.add_parser("codex-supervise",
+                       help="drive Codex autonomy: poll for inbound roster "
+                            "tasks and run each through `codex exec`")
+    p.add_argument("--sandbox", default="read-only",
+                   choices=["read-only", "workspace-write",
+                            "danger-full-access"],
+                   help="codex exec sandbox mode (default read-only)")
+    p.add_argument("--interval", type=int, default=5,
+                   help="seconds between polls (default 5)")
+    p.add_argument("--once", action="store_true",
+                   help="process one pass of pending tasks and exit")
+    p.add_argument("--stop", action="store_true",
+                   help="signal a running codex-supervise loop to stop")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_codex_supervise)
 
     args = ap.parse_args()
     try:
