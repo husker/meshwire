@@ -2607,14 +2607,22 @@ def cmd_codex_setup(args):
     pinned = os.path.abspath(cfg_path)
     cmd = ["codex", "mcp", "add", "a2acast", "--",
            "mesh", "mcp-serve", "--config", pinned]
+    # Codex spawns MCP servers without the session's env, so the server
+    # cannot detect its harness — pin the per-harness identity explicitly
+    # (verified live 2026-07-12: without --as it serves the generic name).
+    me = _default_node_name("codex")
+    if me:
+        cmd += ["--as", me]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
+        as_hint = f", \"--as\", \"{me}\"" if me else ""
         sys.exit("error: `codex` CLI not found on PATH. Install Codex CLI, "
                  "or add this to ~/.codex/config.toml yourself:\n"
                  "  [mcp_servers.a2acast]\n"
                  "  command = \"mesh\"\n"
-                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\"]")
+                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\""
+                 f"{as_hint}]")
     if r.returncode != 0:
         sys.exit("error: `codex mcp add` failed: "
                  f"{(r.stderr or r.stdout).strip()}")

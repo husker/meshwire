@@ -3050,9 +3050,12 @@ class CodexSetupTests(unittest.TestCase):
                 mesh.cmd_codex_setup(argparse.Namespace(dir=None))
         cmd = run.call_args[0][0]
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        # identity is pinned via --as: Codex does not pass the session env
+        # to MCP servers, so the server cannot detect its own harness
         self.assertEqual(cmd, ["codex", "mcp", "add", "a2acast", "--",
                                "mesh", "mcp-serve", "--config",
-                               expected_cfg])
+                               expected_cfg, "--as",
+                               mesh._default_node_name("codex")])
 
     def test_missing_codex_cli_prints_manual_toml(self):
         with mock.patch.object(mesh.subprocess, "run",
@@ -3061,10 +3064,12 @@ class CodexSetupTests(unittest.TestCase):
                 mesh.cmd_codex_setup(argparse.Namespace(dir=None))
         msg = str(ctx.exception)
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        me = mesh._default_node_name("codex")
         self.assertIn("[mcp_servers.a2acast]", msg)
         self.assertIn('command = "mesh"', msg)
         self.assertIn(
-            f'args = ["mcp-serve", "--config", "{expected_cfg}"]', msg)
+            f'args = ["mcp-serve", "--config", "{expected_cfg}", '
+            f'"--as", "{me}"]', msg)
 
     def test_codex_failure_surfaces_stderr(self):
         bad = mock.Mock(returncode=1, stdout="", stderr="nope")
