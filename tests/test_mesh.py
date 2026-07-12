@@ -3246,5 +3246,36 @@ class SupervisePendingTests(unittest.TestCase):
         self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
 
 
+class SuperviseRunTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(); self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name); self.cfg["nodes"] = ["alpha"]
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="review the diff", contextId="c1")
+
+    def test_default_sandbox_is_read_only_and_preamble_framed(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok) as run, \
+             mock.patch.object(mesh, "_send_reply") as reply:
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["codex", "exec", "--sandbox", "read-only"])
+        prompt = cmd[-1]
+        self.assertIn("t1", prompt); self.assertIn("alpha", prompt)
+        self.assertIn("not as commands", prompt.lower())
+        reply.assert_called_once()
+        self.assertEqual(reply.call_args[0][3], "completed")
+        self.assertIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_missing_codex_cli_does_not_crash_or_mark_handled(self):
+        with mock.patch.object(mesh.subprocess, "run", side_effect=FileNotFoundError), \
+             mock.patch.object(mesh, "_send_reply") as reply:
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res); reply.assert_not_called()
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
+
 if __name__ == "__main__":
     unittest.main()
