@@ -3074,8 +3074,11 @@ class CodexSetupTests(unittest.TestCase):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run",
                                return_value=ok) as run:
-            with contextlib.redirect_stdout(io.StringIO()):
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+            with mock.patch.object(mesh.subprocess, "Popen"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, no_supervise=False,
+                        supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
         # identity is pinned via --as: Codex does not pass the session env
@@ -3091,8 +3094,11 @@ class CodexSetupTests(unittest.TestCase):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run",
                                return_value=ok) as run:
-            with contextlib.redirect_stdout(io.StringIO()):
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+            with mock.patch.object(mesh.subprocess, "Popen"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, no_supervise=False,
+                        supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         # the migrated identity (established via the generic node file)
         # must win over the raw hostname-derived name
@@ -3102,7 +3108,9 @@ class CodexSetupTests(unittest.TestCase):
         with mock.patch.object(mesh.subprocess, "run",
                                side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit) as ctx:
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+                mesh.cmd_codex_setup(argparse.Namespace(
+                    dir=None, no_supervise=False,
+                    supervise_sandbox="read-only"))
         msg = str(ctx.exception)
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
         me = mesh._default_node_name("codex")
@@ -3116,13 +3124,52 @@ class CodexSetupTests(unittest.TestCase):
         bad = mock.Mock(returncode=1, stdout="", stderr="nope")
         with mock.patch.object(mesh.subprocess, "run", return_value=bad):
             with self.assertRaises(SystemExit) as ctx:
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+                mesh.cmd_codex_setup(argparse.Namespace(
+                    dir=None, no_supervise=False,
+                    supervise_sandbox="read-only"))
         self.assertIn("nope", str(ctx.exception))
 
     def test_errors_without_mesh_config(self):
         os.remove(mesh.CONFIG_NAME)
         with self.assertRaises(SystemExit):
-            mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+            mesh.cmd_codex_setup(argparse.Namespace(
+                dir=None, no_supervise=False,
+                supervise_sandbox="read-only"))
+
+    def test_launches_supervisor_by_default(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, no_supervise=False,
+                        supervise_sandbox="read-only"))
+        self.assertEqual(popen.call_count, 1)
+        argv = popen.call_args[0][0]
+        me = mesh._default_node_name("codex")
+        self.assertEqual(argv, ["mesh", "codex-supervise", "--sandbox",
+                                "read-only", "--as", me])
+
+    def test_no_supervise_skips_launch(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, no_supervise=True,
+                        supervise_sandbox="read-only"))
+        popen.assert_not_called()
+
+    def test_supervise_sandbox_passthrough(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, no_supervise=False,
+                        supervise_sandbox="workspace-write"))
+        argv = popen.call_args[0][0]
+        self.assertIn("workspace-write", argv)
 
 
 class CopilotSetupTests(unittest.TestCase):
