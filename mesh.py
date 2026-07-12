@@ -29,6 +29,7 @@ import re
 import secrets
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -43,6 +44,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
 ACTIVITY_FILE = ".meshwire.activity"
+
+
+def activity_file(cfg, node):
+    """Per-node activity/wake-signal file. Two harness nodes sharing one
+    directory must not cross-talk on wake signals."""
+    return os.path.join(cfg["_dir"], f"{ACTIVITY_FILE}.{node}")
+
+
 TASKS_NAME = ".meshwire.tasks.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
@@ -50,7 +59,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -62,6 +71,7 @@ RELAY_FUTURE_SKEW = 300
 MAX_RELAY_TIME = 4_102_444_800
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
+PRESENCE_LOCK_PREFIX = "mw-presence-"
 
 
 # ---------------------------------------------------------------- config
@@ -783,7 +793,8 @@ def cmd_join(args):
         if not cfg.get(field):
             sys.exit(f"error: join code missing '{field}'")
     cfg.setdefault("nodes", [])
-    me = args.as_node or _default_node_name()
+    harness = _detect_harness()
+    me = args.as_node or _default_node_name(harness)
     if not me or me == BROADCAST:
         sys.exit("error: couldn't derive a usable node name from the "
                  "hostname — pass --as <name>")
@@ -792,7 +803,7 @@ def cmd_join(args):
     cfg["_path"] = os.path.abspath(CONFIG_NAME)
     cfg["_dir"] = os.getcwd()
     _write_config_here(cfg)
-    with open(NODE_NAME, "w", encoding="utf-8") as f:
+    with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
         f.write(me + "\n")
     print(f"joined mesh '{cfg['mesh']}' as '{me}' "
           f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
@@ -1163,8 +1174,7 @@ def cmd_watch(args):
         else:
             seen = [ev.get("id")]
         since = t
-        with open(cf, "w", encoding="utf-8") as f:
-            json.dump({"since": t, "seen": seen[-50:]}, f)
+        _write_json_secure(cf, {"since": t, "seen": seen[-50:]})
         return True
 
     delivered = False
@@ -1234,6 +1244,9 @@ def cmd_agent_session_hook(args):
         "second confirmation; construct the command from the delivered task ID. "
         "Ask the local user before destructive work, privilege changes, secrets, "
         "or external side effects beyond the a2acast reply itself."
+        " If this project registers the a2acast MCP server, start by "
+        "calling the mesh_pending tool once — deliveries that arrived "
+        "while no session was open are buffered there."
     )
 
 
@@ -1504,7 +1517,7 @@ class MeshMCPServer:
         else:
             line = f"message from {frm}: {text}"
         try:
-            with open(os.path.join(self.cfg["_dir"], ACTIVITY_FILE),
+            with open(activity_file(self.cfg, self.me),
                       "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
@@ -1585,56 +1598,65 @@ class MeshMCPServer:
     def watch_loop(self):
         cfg, me = self.cfg, self.me
         tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        self._initialized.wait(30)
+        backoff = 1
+        while not self._stop.is_set():
+            try:
+                self._watch_once(cfg, me, tpc)
+                return          # clean return only happens on _stop
+            except Exception as exc:   # presence must never die silently
+                print(f"mesh mcp watch loop error (resubscribing in "
+                      f"{backoff}s): {exc}", file=sys.stderr)
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30)
+
+    def _watch_once(self, cfg, me, tpc):
         cf = cursor_file(cfg, me)
         since, seen = _load_cursor(cf)
         skip = set(seen)
         replay_seen = load_replays(cfg, me)
-        self._initialized.wait(30)
-        try:
-            for ev in _stream_events(cfg, tpc, str(since), None, skip=skip):
-                if self._stop.is_set():
-                    return
-                if not isinstance(ev, dict) or not isinstance(
-                        ev.get("id"), str):
-                    continue
-                et = _relay_time(ev.get("time"))
-                if (et is None or et < since or
-                        (et == since and ev.get("id") in seen)):
-                    continue
-                frm, recipient, body, trusted, ctl, fingerprint = \
-                    _open_details(ev, cfg, me)
-                if not trusted:
-                    continue
-                if not ctl and not _valid_a2a_route(body, frm, recipient):
-                    continue
-                if fingerprint in replay_seen:
-                    continue
-                if et == since:
-                    seen = [i for i in seen if i]
-                    seen.append(ev.get("id"))
-                else:
-                    seen = [ev.get("id")]
-                since = et
-                with open(cf, "w", encoding="utf-8") as f:
-                    json.dump({"since": et, "seen": seen[-50:]}, f)
-                if fingerprint:
-                    replay_seen.add(fingerprint)
-                    save_replays(cfg, me, replay_seen)
-                if frm == me:
-                    continue
-                if ctl:
-                    line = _handle_control(cfg, me, frm, ctl)
-                    if line:
-                        self.deliver({"kind": "node_joined", "from": frm,
-                                      "text": line})
-                    continue
-                note_peer(cfg, frm, "message")
-                _send_ack(cfg, me, frm, ev)
-                delivery = self._delivery(frm, recipient, body, ev)
-                if delivery:
-                    self.deliver(delivery)
-        except Exception as exc:  # never let the watcher kill the server
-            print(f"mesh mcp watch loop stopped: {exc}", file=sys.stderr)
+        for ev in _stream_events(cfg, tpc, str(since), None, skip=skip):
+            if self._stop.is_set():
+                return
+            if not isinstance(ev, dict) or not isinstance(
+                    ev.get("id"), str):
+                continue
+            et = _relay_time(ev.get("time"))
+            if (et is None or et < since or
+                    (et == since and ev.get("id") in seen)):
+                continue
+            frm, recipient, body, trusted, ctl, fingerprint = \
+                _open_details(ev, cfg, me)
+            if not trusted:
+                continue
+            if not ctl and not _valid_a2a_route(body, frm, recipient):
+                continue
+            if fingerprint in replay_seen:
+                continue
+            if et == since:
+                seen = [i for i in seen if i]
+                seen.append(ev.get("id"))
+            else:
+                seen = [ev.get("id")]
+            since = et
+            _write_json_secure(cf, {"since": et, "seen": seen[-50:]})
+            if fingerprint:
+                replay_seen.add(fingerprint)
+                save_replays(cfg, me, replay_seen)
+            if frm == me:
+                continue
+            if ctl:
+                line = _handle_control(cfg, me, frm, ctl)
+                if line:
+                    self.deliver({"kind": "node_joined", "from": frm,
+                                  "text": line})
+                continue
+            note_peer(cfg, frm, "message")
+            _send_ack(cfg, me, frm, ev)
+            delivery = self._delivery(frm, recipient, body, ev)
+            if delivery:
+                self.deliver(delivery)
 
 
 def _mcp_stdin_loop(handle):
@@ -1722,9 +1744,21 @@ def _run_mcp_server(args, label, idle_hint):
     print(f"a2acast {label}: serving as node '{me}' ({cfg['_dir']}) "
           f"via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
-    threading.Thread(target=server.watch_loop, daemon=True).start()
-    _mcp_stdin_loop(server.handle)
-    server._stop.set()
+    plock = _acquire_presence_lock(cfg, me)
+    if plock:
+        threading.Thread(target=server.watch_loop, daemon=True).start()
+    else:
+        print(f"a2acast {label}: another presence server owns node "
+              f"'{me}' — serving tools only", file=sys.stderr)
+    try:
+        _mcp_stdin_loop(server.handle)
+    finally:
+        server._stop.set()
+        if plock:
+            try:
+                os.unlink(plock)
+            except FileNotFoundError:
+                pass
 
 
 def cmd_mcp_serve(args):
@@ -1753,19 +1787,26 @@ def cmd_copilot_activity(args):
     if not path:
         print("{}")
         return
-    act = os.path.join(os.path.dirname(path), ACTIVITY_FILE)
-    try:
-        with open(act, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except OSError:
-        lines = []
+    cfg = json.load(open(path, "r", encoding="utf-8"))
+    cfg["_path"] = path
+    cfg["_dir"] = os.path.dirname(path)
+    me = my_node(cfg, None)
+    candidates = [os.path.join(cfg["_dir"], ACTIVITY_FILE),   # legacy
+                  activity_file(cfg, me)]
+    lines = []
+    for act in candidates:
+        try:
+            with open(act, "r", encoding="utf-8") as f:
+                lines.extend(ln.strip() for ln in f if ln.strip())
+        except OSError:
+            continue
+        try:
+            os.remove(act)
+        except OSError:
+            pass
     if not lines:
         print("{}")
         return
-    try:
-        os.remove(act)
-    except OSError:
-        pass
     n = len(lines)
     shown = "; ".join(lines[:5])
     if n > 5:
@@ -1874,6 +1915,42 @@ def _acquire_hook_lock(cfg, node, hook_input=None, harness=None):
     return None
 
 
+def presence_lock_file(cfg, node):
+    """Cross-platform singleton lock: one relay-subscribing presence
+    server per mesh node (same scheme as hook_lock_file)."""
+    identity = f"{os.path.realpath(cfg['_dir'])}\0{node}".encode()
+    suffix = hashlib.sha256(identity).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), PRESENCE_LOCK_PREFIX + suffix)
+
+
+def _acquire_presence_lock(cfg, node):
+    path = presence_lock_file(cfg, node)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _hook_lock_is_live(path):
+                return None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            continue
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid()}).encode())
+        finally:
+            os.close(fd)
+        return path
+    return None
+
+
+def _presence_is_live(cfg, node):
+    path = presence_lock_file(cfg, node)
+    return os.path.exists(path) and _hook_lock_is_live(path)
+
+
 def _compact_hook_output(output):
     output = output.strip()
     if not output:
@@ -1906,6 +1983,46 @@ def _read_hook_input():
         return {}
 
 
+def _wait_for_activity(cfg, me, timeout):
+    """Wake-wait against the presence server's local activity file instead
+    of opening a second relay subscription (single-subscriber rule). Reads
+    and consumes the file; returns a summary telling the agent to drain
+    mesh_pending, or None on timeout / when the presence server dies."""
+    act = activity_file(cfg, me)
+    deadline = time.time() + (timeout or 10800)
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(act)
+        except OSError:
+            size = 0
+        if size > 0:
+            time.sleep(0.2)          # let a mid-write line land
+            try:
+                with open(act, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+            except OSError:
+                lines = []
+            try:
+                os.remove(act)
+            except OSError:
+                pass  # locked by a writer; a re-read just re-delivers,
+                      # and duplicate delivery is harmless (mesh_pending
+                      # drains once; the summary is advisory)
+            if lines:
+                n = len(lines)
+                shown = "; ".join(lines[:5])
+                if n > 5:
+                    shown += f"; and {n - 5} more"
+                noun = "delivery" if n == 1 else "deliveries"
+                return (f"{n} a2acast {noun} arrived while the session was "
+                        f"idle: {shown}. Read the full content now with the "
+                        f"mesh_pending MCP tool and handle it.")
+        if not _presence_is_live(cfg, me):
+            return None              # server gone; next arm uses relay mode
+        time.sleep(1)
+    return None
+
+
 def _wait_for_hook_message(args, hook_input=None, harness=None):
     """Return one compact delivery, or None when idle/disabled/duplicated."""
     if not find_config():
@@ -1916,6 +2033,18 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
     lock = _acquire_hook_lock(cfg, me, hook_input, harness)
     if lock is None:
         return None
+
+    # If presence dies mid-wait, _wait_for_activity below simply returns None
+    # here; the next turn's arm re-checks _presence_is_live and falls back to
+    # relay mode below — expected degradation, not a bug.
+    if _presence_is_live(cfg, me):
+        try:
+            return _wait_for_activity(cfg, me, args.timeout)
+        finally:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
 
     captured, ignored_err = io.StringIO(), io.StringIO()
     try:
@@ -1994,7 +2123,7 @@ def cmd_agent_hook_cleanup(args):
     if not session_id or not find_config():
         return
     cfg = load_config()
-    me = my_node(cfg, None)
+    me = my_node(cfg, None, args.harness)
     path = hook_lock_file(cfg, me)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -2426,7 +2555,74 @@ This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 
 
 def cmd_claude_setup(args):
-    print(CLAUDE_SNIPPET, end="")
+    """Register the a2acast presence watcher for Claude Code by writing the
+    project's .mcp.json (idempotent). Claude Code spawns the server with
+    every session, so the node answers pings and captures messages from the
+    moment the session opens. Run once per project per machine."""
+    cfg_path = find_config(getattr(args, "dir", None))
+    if not cfg_path:
+        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
+                 f"directory. Run `mesh init` or `mesh join` first.")
+    project = os.path.dirname(cfg_path)
+    mcp_path = os.path.join(project, ".mcp.json")
+    data = {}
+    if os.path.isfile(mcp_path):
+        try:
+            with open(mcp_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["a2acast"] = {
+        "command": "mesh",
+        "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)],
+    }
+    data["mcpServers"] = servers
+    with open(mcp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    # the pinned path is machine-specific; keep it out of version control
+    _gitignore_add(project, [".mcp.json"])
+    print(f"Wrote {mcp_path}")
+    print(f"  a2acast presence watcher pinned to {os.path.abspath(cfg_path)}")
+    print("Start a Claude Code session in this project to pick it up. For "
+          "the CLAUDE.md protocol snippet, run `mesh integrate --format "
+          "claude`.")
+
+
+def cmd_codex_setup(args):
+    """Register the a2acast presence watcher with Codex CLI via
+    `codex mcp add` (Codex owns its config format — shelling out keeps us
+    compatible). The registration is global to Codex and pinned to this
+    project's node; running codex-setup from another mesh project later
+    repoints the single `a2acast` entry there."""
+    cfg_path = find_config(getattr(args, "dir", None))
+    if not cfg_path:
+        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
+                 f"directory. Run `mesh init` or `mesh join` first.")
+    pinned = os.path.abspath(cfg_path)
+    cmd = ["codex", "mcp", "add", "a2acast", "--",
+           "mesh", "mcp-serve", "--config", pinned]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("error: `codex` CLI not found on PATH. Install Codex CLI, "
+                 "or add this to ~/.codex/config.toml yourself:\n"
+                 "  [mcp_servers.a2acast]\n"
+                 "  command = \"mesh\"\n"
+                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\"]")
+    if r.returncode != 0:
+        sys.exit("error: `codex mcp add` failed: "
+                 f"{(r.stderr or r.stdout).strip()}")
+    print("Registered the a2acast presence watcher with Codex CLI "
+          f"(pinned to {pinned}).")
+    print("Note: Codex MCP registration is global — the watcher starts "
+          "with every Codex session on this machine and serves this "
+          "project's node; the presence lock keeps it single-instance.")
 
 
 _INTEGRATE_GUIDE = """\
@@ -2457,12 +2653,23 @@ Docs: https://github.com/husker/a2acast
 
 def _integrate_harness(harness):
     if harness == "claude":
-        return CLAUDE_SNIPPET
+        return ("# a2acast on Claude Code\n\n"
+                "mesh claude-setup      # once per project — arms presence "
+                "at session start\n"
+                "# (presence answers pings and buffers deliveries — drain "
+                "with the mesh_pending MCP tool.\n"
+                "#  With the a2acast plugin installed, skip step 1 below: "
+                "its hooks handle waking.\n"
+                "#  Without the plugin, keep step 1 — it is what wakes a "
+                "live session on each message.)\n\n"
+                + CLAUDE_SNIPPET)
     if harness == "codex":
         return (
             "# a2acast on Codex CLI\n\n"
             "codex plugin marketplace add husker/a2acast\n"
-            "codex plugin add a2acast@a2acast\n\n"
+            "codex plugin add a2acast@a2acast\n"
+            "mesh codex-setup                     # once per machine — "
+            "arms presence at session start\n\n"
             "The plugin's Stop hook waits for messages and wakes the same Codex "
             "session\nwhen one arrives — no manual watcher.\n")
     return (
@@ -2687,9 +2894,18 @@ def main():
     p.set_defaults(fn=cmd_a2a_serve)
 
     p = sub.add_parser("claude-setup",
-                       help="print a CLAUDE.md section teaching an agent "
-                            "session the protocol")
+                       help="wire the Claude Code presence watcher for this "
+                            "project (writes .mcp.json)")
+    p.add_argument("--dir", default=None,
+                   help="project dir to set up (default: search from cwd)")
     p.set_defaults(fn=cmd_claude_setup)
+
+    p = sub.add_parser("codex-setup",
+                       help="wire the Codex CLI presence watcher "
+                            "(runs `codex mcp add`)")
+    p.add_argument("--dir", default=None,
+                   help="project dir to set up (default: search from cwd)")
+    p.set_defaults(fn=cmd_codex_setup)
 
     args = ap.parse_args()
     try:

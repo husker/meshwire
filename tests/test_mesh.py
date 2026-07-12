@@ -257,6 +257,48 @@ class HarnessNamingTests(unittest.TestCase):
             self.assertEqual(f.read().strip(), "mine")
 
 
+class JoinHarnessTests(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def _code(self):
+        cfg = make_cfg(self._tmp.name)
+        return mesh.join_code({k: v for k, v in cfg.items()
+                               if not k.startswith("_")})
+
+    def test_join_inside_harness_pins_per_harness_name(self):
+        code = self._code()
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value="claude"), \
+             mock.patch.object(mesh, "send_raw"), \
+             mock.patch.object(mesh, "_watch_if_interactive"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
+        with open(".meshwire.node.claude") as f:
+            name = f.read().strip()
+        self.assertTrue(name.endswith("-claude"))
+        self.assertFalse(os.path.exists(".meshwire.node"))
+
+    def test_join_outside_harness_writes_generic_file(self):
+        code = self._code()
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value=None), \
+             mock.patch.object(mesh, "send_raw"), \
+             mock.patch.object(mesh, "_watch_if_interactive"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
+        self.assertTrue(os.path.exists(".meshwire.node"))
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1753,6 +1795,11 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_session_cleanup_stops_its_background_watcher(self):
         cfg = self._setup_mesh()
+        # Cleanup now resolves identity via the hook's own --harness (not
+        # ambient detection), so it needs the same per-harness pin the
+        # watcher locked under.
+        with open(".meshwire.node.claude", "w") as f:
+            f.write("alpha\n")
         lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
         with open(lock, "w") as f:
             json.dump({"pid": 12345, "session_id": "session-1",
@@ -1765,6 +1812,9 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_copilot_session_cleanup_accepts_camel_case_session_id(self):
         cfg = self._setup_mesh()
+        # Same per-harness pin requirement as above, for the copilot hook.
+        with open(".meshwire.node.copilot", "w") as f:
+            f.write("alpha\n")
         lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
         with open(lock, "w") as f:
             json.dump({"pid": 12345, "session_id": "session-1",
@@ -1775,6 +1825,113 @@ class CodexHookTests(MembershipCmdTests):
             mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="copilot"))
         kill.assert_called_once_with(12345, signal.SIGTERM)
         self.assertFalse(os.path.exists(lock))
+
+    def test_cleanup_resolves_node_for_its_harness(self):
+        # Regression: cleanup must resolve identity for the hook's own
+        # --harness, not via ambient detection, or it looks at the wrong
+        # per-harness lock file.
+        self._setup_mesh()
+        with open(".meshwire.node.claude", "w") as f:
+            f.write("alpha\n")
+        seen = {}
+        with mock.patch.object(
+                mesh, "my_node",
+                side_effect=lambda c, o, h=None:
+                seen.setdefault("h", h) or "alpha"), \
+             mock.patch.object(sys, "stdin",
+                               io.StringIO('{"session_id": "s1"}')):
+            mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="claude"))
+        self.assertEqual(seen["h"], "claude")
+
+
+class PresenceLockTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_acquire_and_liveness(self):
+        self.assertFalse(mesh._presence_is_live(self.cfg, "alpha"))
+        path = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.assertIsNotNone(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.assertTrue(mesh._presence_is_live(self.cfg, "alpha"))
+
+    def test_second_acquire_fails_while_first_lives(self):
+        path = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.assertIsNone(mesh._acquire_presence_lock(self.cfg, "alpha"))
+
+    def test_stale_lock_is_reclaimed(self):
+        path = mesh.presence_lock_file(self.cfg, "alpha")
+        with open(path, "w") as f:
+            json.dump({"pid": 99999999}, f)      # dead pid
+        got = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.assertIsNotNone(got)
+        os.unlink(got)
+
+    def test_distinct_nodes_get_distinct_locks(self):
+        self.assertNotEqual(mesh.presence_lock_file(self.cfg, "alpha"),
+                            mesh.presence_lock_file(self.cfg, "beta"))
+
+
+class BufferWaitTests(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._old = os.getcwd()
+        self.addCleanup(os.chdir, self._old)
+        self.addCleanup(self._restore_env)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def _restore_env(self):
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def test_returns_summary_when_activity_appears(self):
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("message from beta: hi\n")
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
+        self.assertIn("message from beta: hi", got)
+        self.assertIn("mesh_pending", got)
+        self.assertFalse(os.path.exists(act))     # consumed
+
+    def test_times_out_quietly_when_no_activity(self):
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            self.assertIsNone(
+                mesh._wait_for_activity(self.cfg, "alpha", timeout=1))
+
+    def test_returns_none_when_presence_dies(self):
+        with mock.patch.object(mesh, "_presence_is_live",
+                               return_value=False):
+            self.assertIsNone(
+                mesh._wait_for_activity(self.cfg, "alpha", timeout=5))
+
+    def test_hook_wait_uses_buffer_mode_when_presence_live(self):
+        # in cwd with a mesh config + pinned identity
+        os.chdir(self.cfg["_dir"])
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in self.cfg.items()
+                       if not k.startswith("_")}, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("task from beta: build it\n")
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value=None), \
+             mock.patch.object(mesh, "_presence_is_live",
+                               return_value=True), \
+             mock.patch.object(mesh, "cmd_watch") as watch:
+            out = mesh._wait_for_hook_message(
+                argparse.Namespace(timeout=3), hook_input={})
+        watch.assert_not_called()                  # no second subscription
+        self.assertIn("task from beta", out)
+        lock = mesh.hook_lock_file(self.cfg, "alpha")
+        self.assertFalse(os.path.exists(lock))      # lock released
 
 
 class AwaitResultTests(MembershipCmdTests):
@@ -2085,7 +2242,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.12.0")
+        self.assertEqual(release, "0.13.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2412,6 +2569,75 @@ class AckSenderTests(MembershipCmdTests):
         self.assertIn("sent to beta", out.getvalue())
 
 
+class ActivityFileTests(unittest.TestCase):
+    def test_activity_file_is_per_node(self):
+        cfg = {"_dir": "/tmp/x"}
+        self.assertEqual(mesh.activity_file(cfg, "alpha"),
+                         os.path.join("/tmp/x", ".meshwire.activity.alpha"))
+
+    def test_record_activity_writes_per_node_file(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._record_activity({"kind": "message", "from": "beta",
+                              "text": "hello"})
+        path = mesh.activity_file(cfg, "alpha")
+        with open(path) as f:
+            self.assertIn("message from beta: hello", f.read())
+
+
+class WatchLoopResilienceTests(unittest.TestCase):
+    def test_watch_loop_resubscribes_after_unexpected_error(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._initialized.set()
+        calls = []
+
+        def fake_watch_once(cfg_, me_, tpc_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")          # unexpected error
+            srv._stop.set()                         # second pass: end test
+
+        # Stub the Event.wait() the loop actually sleeps on (not
+        # time.sleep, which watch_loop never calls) so no real time
+        # passes; it returns True only once _stop is set, matching
+        # `if self._stop.wait(backoff): return`.
+        with mock.patch.object(srv, "_watch_once", fake_watch_once), \
+             mock.patch.object(srv._stop, "wait",
+                                side_effect=lambda t: srv._stop.is_set()
+                                ) as waited:
+            srv.watch_loop()
+        self.assertEqual(len(calls), 2)             # it came back
+        self.assertEqual([c.args[0] for c in waited.call_args_list], [1])
+
+    def test_watch_loop_backoff_escalates_and_caps_at_30(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._initialized.set()
+        calls = []
+
+        def fake_watch_once(cfg_, me_, tpc_):
+            calls.append(1)
+            if len(calls) <= 7:
+                raise RuntimeError("boom")          # unexpected error
+            srv._stop.set()                         # 8th pass: end test
+
+        with mock.patch.object(srv, "_watch_once", fake_watch_once), \
+             mock.patch.object(srv._stop, "wait",
+                                side_effect=lambda t: srv._stop.is_set()
+                                ) as waited:
+            srv.watch_loop()
+        self.assertEqual(len(calls), 8)              # 7 retries + clean pass
+        self.assertEqual([c.args[0] for c in waited.call_args_list],
+                          [1, 2, 4, 8, 16, 30, 30])   # doubles, caps at 30
+
+
 class MCPServeTests(unittest.TestCase):
     """The Copilot MCP-server watcher (mesh mcp-serve)."""
 
@@ -2601,7 +2827,7 @@ class MCPServeTests(unittest.TestCase):
         self._initialize(srv, out, sampling=False)
         srv.deliver({"kind": "message", "from": "mac-codex",
                      "text": "pulled the fix"})
-        with open(os.path.join(self._tmp.name, ".meshwire.activity")) as f:
+        with open(mesh.activity_file(srv.cfg, "alpha")) as f:
             self.assertIn("message from mac-codex", f.read())
 
     def test_mesh_ask_delegates_a2a_task(self):
@@ -2647,6 +2873,51 @@ class MCPServeTests(unittest.TestCase):
         self.assertIn("beta", names)
         self.assertNotIn("alpha", names)  # excludes self
 
+    def _write_real_config(self, tmp):
+        cfg = make_cfg(tmp, key=True)
+        cfg["nodes"] = ["alpha", "beta"]
+        with open(os.path.join(tmp, mesh.CONFIG_NAME), "w") as f:
+            json.dump({k: v for k, v in cfg.items() if not k.startswith("_")}, f)
+        old = os.getcwd()
+        os.chdir(tmp)
+        self.addCleanup(os.chdir, old)
+
+    def test_lock_contention_serves_tools_only(self):
+        # second presence server for the same node must not start a watch loop
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._write_real_config(tmp.name)
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                                return_value=None), \
+             mock.patch.object(mesh.MeshMCPServer, "watch_loop") as loop, \
+             mock.patch.object(mesh, "_mcp_stdin_loop"), \
+             contextlib.redirect_stderr(err):
+            mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
+                                  "mcp-serve", "")
+        loop.assert_not_called()
+        self.assertIn("serving tools only", err.getvalue())
+
+    def test_lock_acquired_starts_watch_thread(self):
+        # first presence server for a node arms the watch loop in a thread
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._write_real_config(tmp.name)
+        fake_lock = os.path.join(tmp.name, "fake.lock")
+        with open(fake_lock, "w") as f:
+            f.write("{}")
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                                return_value=fake_lock), \
+             mock.patch.object(mesh.threading, "Thread") as thread_cls, \
+             mock.patch.object(mesh, "_mcp_stdin_loop"), \
+             contextlib.redirect_stderr(err):
+            mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
+                                  "mcp-serve", "")
+        self.assertEqual(thread_cls.call_args.kwargs.get("daemon"), True)
+        thread_cls.return_value.start.assert_called_once()
+        self.assertNotIn("serving tools only", err.getvalue())
+
 
 class IntegrateTests(unittest.TestCase):
     """`mesh integrate` prints onboarding for each route/harness."""
@@ -2663,7 +2934,7 @@ class IntegrateTests(unittest.TestCase):
         self.assertIn("mesh integrate --format", g)
 
     def test_claude_format_is_the_claude_snippet(self):
-        self.assertEqual(self._run("claude"), mesh.CLAUDE_SNIPPET)
+        self.assertIn(mesh.CLAUDE_SNIPPET, self._run("claude"))
 
     def test_skill_format_has_frontmatter(self):
         s = self._run("skill")
@@ -2686,6 +2957,126 @@ class IntegrateTests(unittest.TestCase):
         srv = block["mcpServers"]["a2acast"]
         self.assertEqual(srv["command"], "mesh")
         self.assertIn("mcp", srv["args"])
+
+
+class OnboardingTextTests(unittest.TestCase):
+    def test_integrate_codex_mentions_codex_setup(self):
+        self.assertIn("mesh codex-setup", mesh._integrate_harness("codex"))
+
+    def test_integrate_claude_mentions_claude_setup(self):
+        self.assertIn("mesh claude-setup", mesh._integrate_harness("claude"))
+
+    def test_session_hook_mentions_mesh_pending(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(old))
+        os.chdir(tmp.name)
+        cfg = make_cfg(tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_agent_session_hook(argparse.Namespace())
+        self.assertIn("mesh_pending", out.getvalue())
+
+
+class ClaudeSetupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_claude_setup(argparse.Namespace(dir=None))
+        return out.getvalue()
+
+    def test_writes_mcp_json_with_pinned_config(self):
+        self._run()
+        with open(".mcp.json") as f:
+            data = json.load(f)
+        srv = data["mcpServers"]["a2acast"]
+        self.assertEqual(srv["command"], "mesh")
+        self.assertEqual(srv["args"][:2], ["mcp-serve", "--config"])
+        self.assertTrue(os.path.isabs(srv["args"][2]))
+
+    def test_idempotent_and_preserves_other_servers(self):
+        with open(".mcp.json", "w") as f:
+            json.dump({"mcpServers": {"other": {"command": "x"}}}, f)
+        self._run()
+        self._run()
+        with open(".mcp.json") as f:
+            data = json.load(f)
+        self.assertIn("other", data["mcpServers"])
+        self.assertIn("a2acast", data["mcpServers"])
+
+    def test_gitignores_mcp_json(self):
+        self._run()
+        with open(".gitignore") as f:
+            self.assertIn(".mcp.json", f.read())
+
+    def test_errors_without_mesh_config(self):
+        os.remove(mesh.CONFIG_NAME)
+        with self.assertRaises(SystemExit):
+            mesh.cmd_claude_setup(argparse.Namespace(dir=None))
+
+
+class CodexSetupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def test_invokes_codex_mcp_add_with_pinned_config(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=ok) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        cmd = run.call_args[0][0]
+        expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        self.assertEqual(cmd, ["codex", "mcp", "add", "a2acast", "--",
+                               "mesh", "mcp-serve", "--config",
+                               expected_cfg])
+
+    def test_missing_codex_cli_prints_manual_toml(self):
+        with mock.patch.object(mesh.subprocess, "run",
+                               side_effect=FileNotFoundError):
+            with self.assertRaises(SystemExit) as ctx:
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        msg = str(ctx.exception)
+        expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        self.assertIn("[mcp_servers.a2acast]", msg)
+        self.assertIn('command = "mesh"', msg)
+        self.assertIn(
+            f'args = ["mcp-serve", "--config", "{expected_cfg}"]', msg)
+
+    def test_codex_failure_surfaces_stderr(self):
+        bad = mock.Mock(returncode=1, stdout="", stderr="nope")
+        with mock.patch.object(mesh.subprocess, "run", return_value=bad):
+            with self.assertRaises(SystemExit) as ctx:
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        self.assertIn("nope", str(ctx.exception))
+
+    def test_errors_without_mesh_config(self):
+        os.remove(mesh.CONFIG_NAME)
+        with self.assertRaises(SystemExit):
+            mesh.cmd_codex_setup(argparse.Namespace(dir=None))
 
 
 class CopilotSetupTests(unittest.TestCase):

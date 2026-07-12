@@ -46,10 +46,12 @@ when a project is a mesh node):
 # Claude Code
 /plugin marketplace add husker/a2acast
 /plugin install a2acast
+mesh claude-setup             # once per project — arms presence at session start
 
 # Codex CLI / ChatGPT desktop
 codex plugin marketplace add husker/a2acast
 codex plugin add a2acast@a2acast
+mesh codex-setup              # once per machine — arms presence at session start
 
 # GitHub Copilot CLI
 copilot plugin marketplace add husker/a2acast
@@ -85,11 +87,12 @@ The loop each session runs:
    `mesh reply <task-id> "<result>"`.
 
 Works with any number of nodes; each node has an inbox topic and `all`
-broadcasts. `mesh claude-setup` prints a CLAUDE.md section with the same
-protocol for projects that don't use the plugin — **if you use the plugin,
-skip it**. (You still run `mesh init`/`mesh join` once per machine either
-way: the plugin teaches sessions the protocol, it doesn't create the mesh.
-On Copilot you also run `mesh copilot-setup` once per project. The plugin's
+broadcasts. `mesh claude-setup` registers the a2acast presence watcher by
+writing the project's `.mcp.json` — the CLAUDE.md protocol snippet itself
+now lives at `mesh integrate --format claude`. (You still run `mesh
+init`/`mesh join` once per machine either way: the plugin teaches sessions
+the protocol, it doesn't create the mesh. On Copilot you also run `mesh
+copilot-setup` once per project. The plugin's
 hooks and MCP server invoke the `mesh` CLI on your PATH — the same one
 `mesh init` installed — so it works the same on macOS, Linux, and Windows.
 Keep it current: `pipx upgrade a2acast` (or `uv tool upgrade a2acast`) when
@@ -195,7 +198,7 @@ mesh peek [node] [--since S]   show recent messages without consuming
 mesh status                    mesh, identity, known peers + last seen
 mesh integrate [--format codex|copilot|claude|mcp|skill]   print setup for a harness/route
 mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude Desktop, Cursor, …)
-mesh claude-setup              print the CLAUDE.md protocol section
+mesh claude-setup              register the presence watcher (writes .mcp.json)
 ```
 
 **Onboarding & MCP clients.** `mesh integrate` prints the right setup for
