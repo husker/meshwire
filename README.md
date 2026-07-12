@@ -51,7 +51,7 @@ mesh claude-setup             # once per project — arms presence at session st
 # Codex CLI / ChatGPT desktop
 codex plugin marketplace add husker/a2acast
 codex plugin add a2acast@a2acast
-mesh codex-setup               # once per machine — arms presence at session start
+mesh codex-setup              # once per machine — arms presence at session start
 
 # GitHub Copilot CLI
 copilot plugin marketplace add husker/a2acast
