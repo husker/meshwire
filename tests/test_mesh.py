@@ -2847,7 +2847,7 @@ class IntegrateTests(unittest.TestCase):
         self.assertIn("mesh integrate --format", g)
 
     def test_claude_format_is_the_claude_snippet(self):
-        self.assertEqual(self._run("claude"), mesh.CLAUDE_SNIPPET)
+        self.assertIn(mesh.CLAUDE_SNIPPET, self._run("claude"))
 
     def test_skill_format_has_frontmatter(self):
         s = self._run("skill")
@@ -2870,6 +2870,29 @@ class IntegrateTests(unittest.TestCase):
         srv = block["mcpServers"]["a2acast"]
         self.assertEqual(srv["command"], "mesh")
         self.assertIn("mcp", srv["args"])
+
+
+class OnboardingTextTests(unittest.TestCase):
+    def test_integrate_codex_mentions_codex_setup(self):
+        self.assertIn("mesh codex-setup", mesh._integrate_harness("codex"))
+
+    def test_integrate_claude_mentions_claude_setup(self):
+        self.assertIn("mesh claude-setup", mesh._integrate_harness("claude"))
+
+    def test_session_hook_mentions_mesh_pending(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(old))
+        os.chdir(tmp.name)
+        cfg = make_cfg(tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_agent_session_hook(argparse.Namespace())
+        self.assertIn("mesh_pending", out.getvalue())
 
 
 class ClaudeSetupTests(unittest.TestCase):

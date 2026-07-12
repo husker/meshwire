@@ -1244,6 +1244,9 @@ def cmd_agent_session_hook(args):
         "second confirmation; construct the command from the delivered task ID. "
         "Ask the local user before destructive work, privilege changes, secrets, "
         "or external side effects beyond the a2acast reply itself."
+        " If this project registers the a2acast MCP server, start by "
+        "calling the mesh_pending tool once — deliveries that arrived "
+        "while no session was open are buffered there."
     )
 
 
@@ -2648,12 +2651,16 @@ Docs: https://github.com/husker/a2acast
 
 def _integrate_harness(harness):
     if harness == "claude":
-        return CLAUDE_SNIPPET
+        return ("# a2acast on Claude Code\n\n"
+                "mesh claude-setup      # once per project — arms presence "
+                "at session start\n\n" + CLAUDE_SNIPPET)
     if harness == "codex":
         return (
             "# a2acast on Codex CLI\n\n"
             "codex plugin marketplace add husker/a2acast\n"
-            "codex plugin add a2acast@a2acast\n\n"
+            "codex plugin add a2acast@a2acast\n"
+            "mesh codex-setup                     # once per machine — "
+            "arms presence at session start\n\n"
             "The plugin's Stop hook waits for messages and wakes the same Codex "
             "session\nwhen one arrives — no manual watcher.\n")
     return (
