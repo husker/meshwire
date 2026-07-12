@@ -1980,6 +1980,41 @@ def _read_hook_input():
         return {}
 
 
+def _wait_for_activity(cfg, me, timeout):
+    """Wake-wait against the presence server's local activity file instead
+    of opening a second relay subscription (single-subscriber rule). Reads
+    and consumes the file; returns a summary telling the agent to drain
+    mesh_pending, or None on timeout / when the presence server dies."""
+    act = activity_file(cfg, me)
+    deadline = time.time() + (timeout or 10800)
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(act)
+        except OSError:
+            size = 0
+        if size > 0:
+            time.sleep(0.2)          # let a mid-write line land
+            try:
+                with open(act, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+                os.remove(act)
+            except OSError:
+                lines = []
+            if lines:
+                n = len(lines)
+                shown = "; ".join(lines[:5])
+                if n > 5:
+                    shown += f"; and {n - 5} more"
+                noun = "delivery" if n == 1 else "deliveries"
+                return (f"{n} a2acast {noun} arrived while the session was "
+                        f"idle: {shown}. Read the full content now with the "
+                        f"mesh_pending MCP tool and handle it.")
+        if not _presence_is_live(cfg, me):
+            return None              # server gone; next arm uses relay mode
+        time.sleep(1)
+    return None
+
+
 def _wait_for_hook_message(args, hook_input=None, harness=None):
     """Return one compact delivery, or None when idle/disabled/duplicated."""
     if not find_config():
@@ -1990,6 +2025,15 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
     lock = _acquire_hook_lock(cfg, me, hook_input, harness)
     if lock is None:
         return None
+
+    if _presence_is_live(cfg, me):
+        try:
+            return _wait_for_activity(cfg, me, args.timeout)
+        finally:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
 
     captured, ignored_err = io.StringIO(), io.StringIO()
     try:

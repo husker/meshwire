@@ -1808,6 +1808,57 @@ class PresenceLockTests(unittest.TestCase):
                             mesh.presence_lock_file(self.cfg, "beta"))
 
 
+class BufferWaitTests(unittest.TestCase):
+    def setUp(self):
+        self._old = os.getcwd()
+        self.addCleanup(os.chdir, self._old)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_returns_summary_when_activity_appears(self):
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("message from beta: hi\n")
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
+        self.assertIn("message from beta: hi", got)
+        self.assertIn("mesh_pending", got)
+        self.assertFalse(os.path.exists(act))     # consumed
+
+    def test_times_out_quietly_when_no_activity(self):
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            self.assertIsNone(
+                mesh._wait_for_activity(self.cfg, "alpha", timeout=1))
+
+    def test_returns_none_when_presence_dies(self):
+        with mock.patch.object(mesh, "_presence_is_live",
+                               return_value=False):
+            self.assertIsNone(
+                mesh._wait_for_activity(self.cfg, "alpha", timeout=5))
+
+    def test_hook_wait_uses_buffer_mode_when_presence_live(self):
+        # in cwd with a mesh config + pinned identity
+        os.chdir(self.cfg["_dir"])
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in self.cfg.items()
+                       if not k.startswith("_")}, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("task from beta: build it\n")
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value=None), \
+             mock.patch.object(mesh, "_presence_is_live",
+                               return_value=True), \
+             mock.patch.object(mesh, "cmd_watch") as watch:
+            out = mesh._wait_for_hook_message(
+                argparse.Namespace(timeout=3), hook_input={})
+        watch.assert_not_called()                  # no second subscription
+        self.assertIn("task from beta", out)
+
+
 class AwaitResultTests(MembershipCmdTests):
     def test_await_matches_task_id(self):
         cfg = make_cfg(self._tmp.name)
