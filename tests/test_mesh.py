@@ -3276,6 +3276,16 @@ class SuperviseRunTests(unittest.TestCase):
         self.assertFalse(res); reply.assert_not_called()
         self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
 
+    def test_reply_send_failure_does_not_crash_or_mark_handled(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok), \
+             mock.patch.object(mesh, "_send_reply",
+                                side_effect=mesh.socket.timeout("timed out")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -624,7 +624,12 @@ def _run_task_with_codex(cfg, me, task_id, task, sandbox):
         print(f"error: codex exec failed (exit {r.returncode}): {r.stderr}",
               file=sys.stderr)
         return False
-    _send_reply(cfg, me, task_id, "completed", r.stdout.strip())
+    try:
+        _send_reply(cfg, me, task_id, "completed", r.stdout.strip())
+    except (urllib.error.URLError, socket.timeout) as e:
+        print(f"a2acast supervise: reply for task {task_id} failed to send: {e}",
+              file=sys.stderr)
+        return False
     _mark_handled(cfg, me, task_id)
     return True
 
