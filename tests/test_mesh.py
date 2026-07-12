@@ -2939,17 +2939,22 @@ class CodexSetupTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 mesh.cmd_codex_setup(argparse.Namespace(dir=None))
         cmd = run.call_args[0][0]
-        self.assertEqual(cmd[:4], ["codex", "mcp", "add", "a2acast"])
-        self.assertIn("mcp-serve", cmd)
-        self.assertIn("--config", cmd)
-        self.assertTrue(os.path.isabs(cmd[-1]))
+        expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        self.assertEqual(cmd, ["codex", "mcp", "add", "a2acast", "--",
+                               "mesh", "mcp-serve", "--config",
+                               expected_cfg])
 
     def test_missing_codex_cli_prints_manual_toml(self):
         with mock.patch.object(mesh.subprocess, "run",
                                side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit) as ctx:
                 mesh.cmd_codex_setup(argparse.Namespace(dir=None))
-        self.assertIn("[mcp_servers.a2acast]", str(ctx.exception))
+        msg = str(ctx.exception)
+        expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
+        self.assertIn("[mcp_servers.a2acast]", msg)
+        self.assertIn('command = "mesh"', msg)
+        self.assertIn(
+            f'args = ["mcp-serve", "--config", "{expected_cfg}"]', msg)
 
     def test_codex_failure_surfaces_stderr(self):
         bad = mock.Mock(returncode=1, stdout="", stderr="nope")
