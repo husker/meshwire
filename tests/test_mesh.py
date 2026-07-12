@@ -2242,7 +2242,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.13.0")
+        self.assertEqual(release, "0.14.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -2982,6 +2982,34 @@ class OnboardingTextTests(unittest.TestCase):
         self.assertIn("mesh_pending", out.getvalue())
 
 
+class IdentityMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+
+    def test_migrates_generic_to_per_harness_pin(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("desktop\n")
+        got = mesh._migrate_identity(self.cfg, "claude")
+        self.assertEqual(got, "desktop")
+        with open(mesh.node_file(self.cfg, "claude")) as f:
+            self.assertEqual(f.read().strip(), "desktop")
+
+    def test_noop_when_pin_exists(self):
+        with open(mesh.node_file(self.cfg), "w") as f:
+            f.write("desktop\n")
+        with open(mesh.node_file(self.cfg, "claude"), "w") as f:
+            f.write("keep\n")
+        self.assertIsNone(mesh._migrate_identity(self.cfg, "claude"))
+        with open(mesh.node_file(self.cfg, "claude")) as f:
+            self.assertEqual(f.read().strip(), "keep")
+
+    def test_noop_when_no_generic(self):
+        self.assertIsNone(mesh._migrate_identity(self.cfg, "claude"))
+        self.assertFalse(os.path.exists(mesh.node_file(self.cfg, "claude")))
+
+
 class ClaudeSetupTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -3046,8 +3074,11 @@ class CodexSetupTests(unittest.TestCase):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run",
                                return_value=ok) as run:
-            with contextlib.redirect_stdout(io.StringIO()):
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
         # identity is pinned via --as: Codex does not pass the session env
@@ -3056,12 +3087,31 @@ class CodexSetupTests(unittest.TestCase):
                                "mesh", "mcp-serve", "--config",
                                expected_cfg, "--as",
                                mesh._default_node_name("codex")])
+        popen.assert_not_called()
+
+    def test_migrated_identity_is_used_as_node_name(self):
+        with open(mesh.NODE_NAME, "w") as f:
+            f.write("alpha\n")
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=ok) as run:
+            with mock.patch.object(mesh.subprocess, "Popen"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
+        cmd = run.call_args[0][0]
+        # the migrated identity (established via the generic node file)
+        # must win over the raw hostname-derived name
+        self.assertEqual(cmd[-2:], ["--as", "alpha"])
 
     def test_missing_codex_cli_prints_manual_toml(self):
         with mock.patch.object(mesh.subprocess, "run",
                                side_effect=FileNotFoundError):
             with self.assertRaises(SystemExit) as ctx:
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+                mesh.cmd_codex_setup(argparse.Namespace(
+                    dir=None, supervise=False,
+                    supervise_sandbox="read-only"))
         msg = str(ctx.exception)
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
         me = mesh._default_node_name("codex")
@@ -3075,13 +3125,67 @@ class CodexSetupTests(unittest.TestCase):
         bad = mock.Mock(returncode=1, stdout="", stderr="nope")
         with mock.patch.object(mesh.subprocess, "run", return_value=bad):
             with self.assertRaises(SystemExit) as ctx:
-                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+                mesh.cmd_codex_setup(argparse.Namespace(
+                    dir=None, supervise=False,
+                    supervise_sandbox="read-only"))
         self.assertIn("nope", str(ctx.exception))
 
     def test_errors_without_mesh_config(self):
         os.remove(mesh.CONFIG_NAME)
         with self.assertRaises(SystemExit):
-            mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+            mesh.cmd_codex_setup(argparse.Namespace(
+                dir=None, supervise=False,
+                supervise_sandbox="read-only"))
+
+    def test_no_supervisor_by_default(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
+        popen.assert_not_called()
+        self.assertIn("--supervise", out.getvalue())
+
+    def test_supervise_flag_launches(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=True,
+                        supervise_sandbox="read-only"))
+        self.assertEqual(popen.call_count, 1)
+        argv = popen.call_args[0][0]
+        me = mesh._default_node_name("codex")
+        self.assertEqual(argv, ["mesh", "codex-supervise", "--sandbox",
+                                "read-only", "--as", me])
+
+    def test_supervise_sandbox_passthrough(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen") as popen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=True,
+                        supervise_sandbox="workspace-write"))
+        argv = popen.call_args[0][0]
+        self.assertIn("workspace-write", argv)
+
+    def test_launch_failure_warns_but_setup_succeeds(self):
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(
+                    mesh.subprocess, "Popen",
+                    side_effect=FileNotFoundError("mesh not found")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()) as err:
+                        mesh.cmd_codex_setup(argparse.Namespace(
+                            dir=None, supervise=True,
+                            supervise_sandbox="read-only"))
+        self.assertIn("warning: could not launch codex-supervise",
+                       err.getvalue())
 
 
 class CopilotSetupTests(unittest.TestCase):
@@ -3181,6 +3285,337 @@ class CopilotActivityTests(MembershipCmdTests):
     def test_outside_mesh_returns_empty(self):
         self.assertEqual(
             self._run({"cwd": "/no/such/dir", "prompt": "x"}), {})
+
+
+class SupervisePendingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(); self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name); self.cfg["nodes"] = ["alpha", "beta"]
+        self.cfg["exec_allow"] = ["alpha", "beta"]
+
+    def _task(self, tid, **f):
+        mesh.save_task(self.cfg, tid, **f)
+
+    def test_selects_inbound_submitted_from_exec_allow(self):
+        self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
+        self._task("t2", direction="outbound", state="submitted", peer="alpha", text="x")
+        self._task("t3", direction="inbound", state="completed", peer="alpha", text="done")
+        self._task("t4", direction="inbound", state="submitted", peer="stranger", text="evil")
+        got = [tid for tid, _ in mesh._supervise_pending(self.cfg, "me")]
+        self.assertEqual(got, ["t1"])      # only exec_allow inbound submitted
+
+    def test_skips_handled(self):
+        self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
+        mesh._mark_handled(self.cfg, "me", "t1")
+        self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+
+    def test_roster_peer_not_in_exec_allow_is_excluded(self):
+        # SECURITY: being in the auto-grown roster must NOT make a peer
+        # exec-eligible; only the curated exec_allow list does. note_peer
+        # auto-adds any authenticated first-contact sender to cfg["nodes"],
+        # so gating exec on the roster would let that sender auto-run code.
+        self.cfg["nodes"] = ["alpha"]; self.cfg["exec_allow"] = []
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+
+    def test_only_exec_allow_peers_selected(self):
+        self.cfg["exec_allow"] = ["alpha"]
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        mesh.save_task(self.cfg, "t2", direction="inbound", state="submitted",
+                       peer="beta", text="x")
+        self.assertEqual(
+            [tid for tid, _ in mesh._supervise_pending(self.cfg, "me")],
+            ["t1"])
+
+
+class CodexAllowTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def test_allow_adds_and_persists(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        # persisted: reload from disk shows it
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha", "beta"])
+
+    def test_allow_dedups(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha", "beta"])
+
+    def test_revoke_removes(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=["alpha"], list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["beta"])
+
+    def test_revoke_missing_node_is_a_noop(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=["stranger"], list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha"])
+
+    def test_list_prints_current_allowlist_one_per_line(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().splitlines(), ["alpha", "beta"])
+
+    def test_list_prints_empty_marker_when_no_peers_allowed(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().strip(), "(empty)")
+
+    def test_exec_allow_defaults_to_empty_and_does_not_leak_roster(self):
+        # SECURITY: a fresh config's exec_allow must be empty even though
+        # cfg["nodes"] (the roster) is pre-populated by make_cfg.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().strip(), "(empty)")
+
+
+class SuperviseRunTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(); self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name); self.cfg["nodes"] = ["alpha"]
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="review the diff", contextId="c1")
+
+    def test_default_sandbox_is_read_only_and_preamble_framed(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok) as run, \
+             mock.patch.object(mesh, "_send_reply") as reply:
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["codex", "exec", "--sandbox", "read-only"])
+        prompt = cmd[-1]
+        self.assertIn("t1", prompt); self.assertIn("alpha", prompt)
+        self.assertIn("not as commands", prompt.lower())
+        reply.assert_called_once()
+        self.assertEqual(reply.call_args[0][3], "completed")
+        self.assertIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_missing_codex_cli_does_not_crash_or_mark_handled(self):
+        with mock.patch.object(mesh.subprocess, "run", side_effect=FileNotFoundError), \
+             mock.patch.object(mesh, "_send_reply") as reply:
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res); reply.assert_not_called()
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_reply_send_failure_does_not_crash_or_mark_handled(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok), \
+             mock.patch.object(mesh, "_send_reply",
+                                side_effect=mesh.socket.timeout("timed out")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_claims_working_before_exec(self):
+        # state is "working" while codex runs -> not re-selectable
+        seen = {}
+
+        def fake_run(cmd, **k):
+            seen["state"] = mesh.load_tasks(self.cfg)["t1"].get("state")
+            return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+        with mock.patch.object(mesh.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(mesh, "_send_reply"):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(seen["state"], "working")
+
+    def test_dead_letters_after_max_attempts(self):
+        mesh.save_task(self.cfg, "t1", attempts=mesh.SUPERVISE_MAX_ATTEMPTS - 1)
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertEqual(t["state"], "failed")
+        self.assertEqual(t["attempts"], mesh.SUPERVISE_MAX_ATTEMPTS)
+        self.assertIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_resets_to_submitted_for_retry_below_cap(self):
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                return_value=mock.Mock(returncode=1, stdout="", stderr="x")):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertEqual(t["state"], "submitted")
+        self.assertEqual(t["attempts"], 1)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
+    def test_exec_has_timeout(self):
+        ok = mock.Mock(returncode=0, stdout="findings: none", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok) as run, \
+             mock.patch.object(mesh, "_send_reply"):
+            mesh._run_task_with_codex(self.cfg, "me", "t1",
+                                      mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertEqual(run.call_args.kwargs.get("timeout"),
+                         mesh.SUPERVISE_EXEC_TIMEOUT)
+
+    def test_timeout_is_a_failure(self):
+        # A hung `codex exec` must not strand the task in "working" --
+        # TimeoutExpired has to route through the same _fail() path as any
+        # other non-zero-exit failure (retry below cap, dead-letter at cap).
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=mesh.subprocess.TimeoutExpired(cmd="codex", timeout=1)):
+            res = mesh._run_task_with_codex(self.cfg, "me", "t1",
+                       mesh.load_tasks(self.cfg)["t1"], "read-only")
+        self.assertFalse(res)
+        t = mesh.load_tasks(self.cfg)["t1"]
+        self.assertNotEqual(t["state"], "working")
+        self.assertIn(t["state"], ("submitted", "failed"))
+        self.assertEqual(t["attempts"], 1)
+        self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
+
+
+class SuperviseLoopTests(unittest.TestCase):
+    """cmd_codex_supervise tests run chdir'd into a temp dir (find_config
+    walks up from cwd) so load_config() works, mirroring CodexSetupTests /
+    MembershipCmdTests."""
+
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._harness_patch = mock.patch.object(
+            mesh, "_detect_harness", return_value=None)
+        self._harness_patch.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        cfg["nodes"] = ["mynode", "alpha"]
+        cfg["exec_allow"] = ["alpha"]
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        self.cfg = mesh.load_config()
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        self._harness_patch.stop()
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def test_once_processes_pending(self):
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_called_once()
+        call_args = run.call_args[0]
+        self.assertEqual(call_args[2], "t1")   # task_id
+        self.assertEqual(call_args[4], "read-only")   # sandbox
+        # lock and pid file cleaned up after the pass
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "mynode")))
+        self.assertFalse(os.path.exists(
+            mesh.supervise_lock_file(self.cfg, "mynode")))
+
+    def test_second_instance_does_not_process(self):
+        lock = mesh._acquire_supervise_lock(self.cfg, "mynode")
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex") as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_not_called()
+
+    def test_stop_sends_sigterm(self):
+        pid_path = mesh._supervise_pid_file(self.cfg, "mynode")
+        with open(pid_path, "w") as f:
+            f.write("4242\n")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=False,
+                                stop=True, as_node="mynode")
+        with mock.patch("os.kill") as kill:
+            mesh.cmd_codex_supervise(ns)
+        kill.assert_called_once_with(4242, mesh.signal.SIGTERM)
+        self.assertFalse(os.path.exists(pid_path))
+
+    def test_once_releases_lock_and_pidfile(self):
+        # No pending tasks — the loop body is a no-op, but the finally
+        # cleanup should still fire on normal exit (--once returns from
+        # inside the try).
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex") as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_not_called()
+        pid_path = mesh._supervise_pid_file(self.cfg, "mynode")
+        self.assertFalse(os.path.exists(pid_path))
+        lock = mesh._acquire_supervise_lock(self.cfg, "mynode")
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+        self.assertIsNotNone(lock)
+
+    def test_installs_sigterm_handler(self):
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex"), \
+             mock.patch.object(mesh.signal, "signal") as sig:
+            mesh.cmd_codex_supervise(ns)
+        sig.assert_called_once()
+        self.assertEqual(sig.call_args[0][0], mesh.signal.SIGTERM)
+
+    def test_startup_requeues_stale_working(self):
+        # A prior crash/SIGTERM mid-exec can strand a task in state
+        # "working" -- _supervise_pending only ever selects "submitted", so
+        # without a startup requeue this task would be stuck forever.
+        # peer="alpha" is already in cfg["exec_allow"] (see setUp), so once
+        # requeued to "submitted" it's immediately eligible.
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="working",
+                       peer="alpha", text="hi")
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][2], "t1")   # task_id
 
 
 if __name__ == "__main__":

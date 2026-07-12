@@ -4,13 +4,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-.meshwire.json
-.meshwire.node
-.meshwire.cursor-*
-.meshwire.replay-*
-.meshwire.tasks.json
-.meshwire.peers.json
-.meshwire.activity
+# a2acast runtime state (per-machine, never shared)
+.meshwire.*
+.gstack/
 
 # Personal Claude Code settings (not shared)
 .claude/settings.local.json
+.mcp.json
+.github/mcp.json
