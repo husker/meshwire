@@ -3007,25 +3007,28 @@ def cmd_codex_supervise(args):
         print(f"a2acast supervise: requeued {len(stale)} stale 'working' "
               f"task(s) from a prior crash")
 
-    # #32: the exec loop below only ever reads the local task store, and
-    # nothing populates that store unless a harness session's `mesh
-    # mcp-serve` presence server is running to subscribe to the relay and
-    # save inbound A2A tasks. A headless node (no harness session open) has
-    # no such presence server, so it would poll an eternally empty store.
-    # Make the supervisor self-contained by running its own receiver: a
-    # MeshMCPServer's watch_loop, in a daemon thread, subscribing to the
-    # relay and saving inbound tasks (via its normal delivery path) for the
-    # exec loop below to pick up. We deliberately do NOT coordinate with the
-    # presence lock here (kept simple/correct, out of scope for #32): if a
-    # harness session's presence server is ALSO subscribed for this node,
-    # both receive the same inbound events and both call save_task --
-    # harmless, since save_task is idempotent by task-id and double receipt
-    # just re-writes the same record.
-    receiver = MeshMCPServer(cfg, me)
-    threading.Thread(target=receiver.watch_loop, daemon=True).start()
+    receiver = None
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
+        # #32: the exec loop below only ever reads the local task store, and
+        # nothing populates that store unless a harness session's `mesh
+        # mcp-serve` presence server is running to subscribe to the relay
+        # and save inbound A2A tasks. A headless node (no harness session
+        # open) has no such presence server, so it would poll an eternally
+        # empty store. Make the supervisor self-contained by running its
+        # own receiver: a MeshMCPServer's watch_loop, in a daemon thread,
+        # subscribing to the relay and saving inbound tasks (via its normal
+        # delivery path) for the exec loop below to pick up. We deliberately
+        # do NOT coordinate with the presence lock here (kept simple/
+        # correct, out of scope for #32): if a harness session's presence
+        # server is ALSO subscribed for this node, both receive the same
+        # inbound events and both call save_task -- harmless, since
+        # save_task is idempotent by task-id and double receipt just
+        # re-writes the same record.
+        receiver = MeshMCPServer(cfg, me)
+        threading.Thread(target=receiver.watch_loop, daemon=True).start()
+
         while True:
             # Live allowlist reload (#31): re-read the config on every poll
             # so `mesh codex-allow` takes effect on a running supervisor
@@ -3038,7 +3041,8 @@ def cmd_codex_supervise(args):
                 return
             time.sleep(args.interval)
     finally:
-        receiver._stop.set()
+        if receiver is not None:
+            receiver._stop.set()
         try:
             os.unlink(pid_path)
         except OSError:
