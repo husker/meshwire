@@ -1174,8 +1174,7 @@ def cmd_watch(args):
         else:
             seen = [ev.get("id")]
         since = t
-        with open(cf, "w", encoding="utf-8") as f:
-            json.dump({"since": t, "seen": seen[-50:]}, f)
+        _write_json_secure(cf, {"since": t, "seen": seen[-50:]})
         return True
 
     delivered = False
@@ -1641,8 +1640,7 @@ class MeshMCPServer:
             else:
                 seen = [ev.get("id")]
             since = et
-            with open(cf, "w", encoding="utf-8") as f:
-                json.dump({"since": et, "seen": seen[-50:]}, f)
+            _write_json_secure(cf, {"since": et, "seen": seen[-50:]})
             if fingerprint:
                 replay_seen.add(fingerprint)
                 save_replays(cfg, me, replay_seen)
@@ -2036,6 +2034,9 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
     if lock is None:
         return None
 
+    # If presence dies mid-wait, _wait_for_activity below simply returns None
+    # here; the next turn's arm re-checks _presence_is_live and falls back to
+    # relay mode below — expected degradation, not a bug.
     if _presence_is_live(cfg, me):
         try:
             return _wait_for_activity(cfg, me, args.timeout)

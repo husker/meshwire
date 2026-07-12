@@ -2873,6 +2873,51 @@ class MCPServeTests(unittest.TestCase):
         self.assertIn("beta", names)
         self.assertNotIn("alpha", names)  # excludes self
 
+    def _write_real_config(self, tmp):
+        cfg = make_cfg(tmp, key=True)
+        cfg["nodes"] = ["alpha", "beta"]
+        with open(os.path.join(tmp, mesh.CONFIG_NAME), "w") as f:
+            json.dump({k: v for k, v in cfg.items() if not k.startswith("_")}, f)
+        old = os.getcwd()
+        os.chdir(tmp)
+        self.addCleanup(os.chdir, old)
+
+    def test_lock_contention_serves_tools_only(self):
+        # second presence server for the same node must not start a watch loop
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._write_real_config(tmp.name)
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                                return_value=None), \
+             mock.patch.object(mesh.MeshMCPServer, "watch_loop") as loop, \
+             mock.patch.object(mesh, "_mcp_stdin_loop"), \
+             contextlib.redirect_stderr(err):
+            mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
+                                  "mcp-serve", "")
+        loop.assert_not_called()
+        self.assertIn("serving tools only", err.getvalue())
+
+    def test_lock_acquired_starts_watch_thread(self):
+        # first presence server for a node arms the watch loop in a thread
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._write_real_config(tmp.name)
+        fake_lock = os.path.join(tmp.name, "fake.lock")
+        with open(fake_lock, "w") as f:
+            f.write("{}")
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                                return_value=fake_lock), \
+             mock.patch.object(mesh.threading, "Thread") as thread_cls, \
+             mock.patch.object(mesh, "_mcp_stdin_loop"), \
+             contextlib.redirect_stderr(err):
+            mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
+                                  "mcp-serve", "")
+        self.assertEqual(thread_cls.call_args.kwargs.get("daemon"), True)
+        thread_cls.return_value.start.assert_called_once()
+        self.assertNotIn("serving tools only", err.getvalue())
+
 
 class IntegrateTests(unittest.TestCase):
     """`mesh integrate` prints onboarding for each route/harness."""
