@@ -587,15 +587,23 @@ def _mark_handled(cfg, node, task_id):
 
 
 def _supervise_pending(cfg, node):
-    """Inbound tasks from a roster peer awaiting `mesh codex-supervise`
-    action, oldest first, skipping ones already marked handled."""
+    """Inbound tasks from an exec-allowlisted peer awaiting `mesh
+    codex-supervise` action, oldest first, skipping ones already marked
+    handled.
+
+    SECURITY: gates on cfg["exec_allow"] (curated via `mesh codex-allow`),
+    NOT cfg["nodes"]. `note_peer` auto-adds any authenticated first-contact
+    sender to cfg["nodes"], so gating auto-exec on the roster would let
+    that sender run code. exec_allow defaults to empty -- nothing auto-runs
+    until the operator explicitly trusts a peer.
+    """
     handled = _load_handled(cfg, node)
     tasks = load_tasks(cfg)
     pending = [
         (task_id, t) for task_id, t in tasks.items()
         if t.get("direction") == "inbound"
         and t.get("state") == "submitted"
-        and t.get("peer") in cfg.get("nodes", [])
+        and t.get("peer") in cfg.get("exec_allow", [])
         and task_id not in handled
     ]
     pending.sort(key=lambda item: item[1].get("updated", 0))
@@ -2881,6 +2889,39 @@ def cmd_codex_supervise(args):
             pass
 
 
+def cmd_codex_allow(args):
+    """Curate cfg["exec_allow"], the trust boundary that gates Codex
+    auto-exec (see `_supervise_pending`).
+
+    SECURITY: cfg["nodes"] (the roster) is NOT sufficient for exec
+    eligibility -- `note_peer` auto-adds any authenticated first-contact
+    sender there. Only nodes explicitly added here, via `mesh codex-allow
+    <node>`, are exec-eligible; the list starts empty so nothing auto-runs
+    until the operator opts a peer in.
+    """
+    cfg = load_config()
+    allow = cfg.setdefault("exec_allow", [])
+    if args.list:
+        if allow:
+            for node in allow:
+                print(node)
+        else:
+            print("(empty)")
+        return
+    if args.revoke:
+        for node in args.revoke:
+            if node in allow:
+                allow.remove(node)
+        _save_config(cfg)
+        print(f"exec_allow: {', '.join(allow) if allow else '(empty)'}")
+        return
+    for node in args.node:
+        if node not in allow:
+            allow.append(node)
+    _save_config(cfg)
+    print(f"exec_allow: {', '.join(allow) if allow else '(empty)'}")
+
+
 _INTEGRATE_GUIDE = """\
 # a2acast — connect this machine to the mesh
 
@@ -3186,6 +3227,18 @@ def main():
                    help="signal a running codex-supervise loop to stop")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_codex_supervise)
+
+    p = sub.add_parser("codex-allow",
+                       help="curate the exec-allowlist gating Codex "
+                            "auto-exec (mesh codex-supervise only runs "
+                            "tasks from these peers)")
+    p.add_argument("node", nargs="*",
+                   help="node(s) to add to the exec-allowlist")
+    p.add_argument("--revoke", nargs="*", default=None,
+                   help="node(s) to remove from the exec-allowlist")
+    p.add_argument("--list", action="store_true",
+                   help="print the current exec-allowlist")
+    p.set_defaults(fn=cmd_codex_allow)
 
     args = ap.parse_args()
     try:

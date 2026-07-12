@@ -3289,22 +3289,117 @@ class SupervisePendingTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(); self.addCleanup(self._tmp.cleanup)
         self.cfg = make_cfg(self._tmp.name); self.cfg["nodes"] = ["alpha", "beta"]
+        self.cfg["exec_allow"] = ["alpha", "beta"]
 
     def _task(self, tid, **f):
         mesh.save_task(self.cfg, tid, **f)
 
-    def test_selects_inbound_submitted_from_roster(self):
+    def test_selects_inbound_submitted_from_exec_allow(self):
         self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
         self._task("t2", direction="outbound", state="submitted", peer="alpha", text="x")
         self._task("t3", direction="inbound", state="completed", peer="alpha", text="done")
         self._task("t4", direction="inbound", state="submitted", peer="stranger", text="evil")
         got = [tid for tid, _ in mesh._supervise_pending(self.cfg, "me")]
-        self.assertEqual(got, ["t1"])          # only roster inbound submitted
+        self.assertEqual(got, ["t1"])      # only exec_allow inbound submitted
 
     def test_skips_handled(self):
         self._task("t1", direction="inbound", state="submitted", peer="alpha", text="hi")
         mesh._mark_handled(self.cfg, "me", "t1")
         self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+
+    def test_roster_peer_not_in_exec_allow_is_excluded(self):
+        # SECURITY: being in the auto-grown roster must NOT make a peer
+        # exec-eligible; only the curated exec_allow list does. note_peer
+        # auto-adds any authenticated first-contact sender to cfg["nodes"],
+        # so gating exec on the roster would let that sender auto-run code.
+        self.cfg["nodes"] = ["alpha"]; self.cfg["exec_allow"] = []
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        self.assertEqual(mesh._supervise_pending(self.cfg, "me"), [])
+
+    def test_only_exec_allow_peers_selected(self):
+        self.cfg["exec_allow"] = ["alpha"]
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="alpha", text="hi")
+        mesh.save_task(self.cfg, "t2", direction="inbound", state="submitted",
+                       peer="beta", text="x")
+        self.assertEqual(
+            [tid for tid, _ in mesh._supervise_pending(self.cfg, "me")],
+            ["t1"])
+
+
+class CodexAllowTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def test_allow_adds_and_persists(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        # persisted: reload from disk shows it
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha", "beta"])
+
+    def test_allow_dedups(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha", "beta"])
+
+    def test_revoke_removes(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=["alpha"], list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["beta"])
+
+    def test_revoke_missing_node_is_a_noop(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha"], revoke=None, list=False))
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=["stranger"], list=False))
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha"])
+
+    def test_list_prints_current_allowlist_one_per_line(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha", "beta"], revoke=None, list=False))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().splitlines(), ["alpha", "beta"])
+
+    def test_list_prints_empty_marker_when_no_peers_allowed(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().strip(), "(empty)")
+
+    def test_exec_allow_defaults_to_empty_and_does_not_leak_roster(self):
+        # SECURITY: a fresh config's exec_allow must be empty even though
+        # cfg["nodes"] (the roster) is pre-populated by make_cfg.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=[], revoke=None, list=True))
+        self.assertEqual(out.getvalue().strip(), "(empty)")
 
 
 class SuperviseRunTests(unittest.TestCase):
@@ -3363,6 +3458,7 @@ class SuperviseLoopTests(unittest.TestCase):
         os.chdir(self._tmp.name)
         cfg = make_cfg(self._tmp.name)
         cfg["nodes"] = ["mynode", "alpha"]
+        cfg["exec_allow"] = ["alpha"]
         with open(mesh.CONFIG_NAME, "w") as f:
             json.dump({k: v for k, v in cfg.items()
                        if not k.startswith("_")}, f)
