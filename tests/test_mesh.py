@@ -161,6 +161,102 @@ class NodeNameTests(unittest.TestCase):
             self.assertIsNone(mesh._default_node_name())
 
 
+class HarnessNamingTests(unittest.TestCase):
+    """Node identity is per-harness so two agents on one machine, or one
+    agent reusing another's directory, never collide on a node name."""
+
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = self._tmp.name
+        self._old = os.getcwd()
+        os.chdir(self.d)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def test_default_node_name_appends_harness(self):
+        with mock.patch("socket.gethostname", return_value="Laptop.local"):
+            self.assertEqual(mesh._default_node_name("claude"), "laptop-claude")
+            self.assertEqual(mesh._default_node_name(), "laptop")  # unchanged
+
+    def test_default_node_name_unusable_host_is_none_even_with_harness(self):
+        with mock.patch("socket.gethostname", return_value="'''"):
+            self.assertIsNone(mesh._default_node_name("claude"))
+
+    def test_node_file_is_per_harness(self):
+        cfg = make_cfg(self.d)
+        self.assertTrue(
+            mesh.node_file(cfg, "claude").endswith(".meshwire.node.claude"))
+        self.assertTrue(mesh.node_file(cfg).endswith(".meshwire.node"))
+
+    def test_my_node_ignores_foreign_generic_file_when_harness_known(self):
+        # The reported bug: a Claude session in a directory set up for Copilot
+        # must NOT inherit copilot-cli-mac from the shared .meshwire.node file.
+        cfg = make_cfg(self.d)
+        with open(mesh.node_file(cfg), "w") as f:      # generic, copilot's
+            f.write("copilot-cli-mac\n")
+        with mock.patch("socket.gethostname", return_value="Laptop.local"):
+            name = mesh.my_node(cfg, harness="claude")
+        self.assertEqual(name, "laptop-claude")
+        self.assertNotEqual(name, "copilot-cli-mac")
+        self.assertIn("laptop-claude", cfg["nodes"])
+        # and it pins the per-harness file so the identity stays stable
+        with open(mesh.node_file(cfg, "claude")) as f:
+            self.assertEqual(f.read().strip(), "laptop-claude")
+
+    def test_my_node_prefers_per_harness_pin(self):
+        cfg = make_cfg(self.d)
+        with open(mesh.node_file(cfg, "claude"), "w") as f:
+            f.write("my-claude\n")
+        self.assertEqual(mesh.my_node(cfg, harness="claude"), "my-claude")
+
+    def test_my_node_override_wins_over_harness(self):
+        cfg = make_cfg(self.d)
+        self.assertEqual(
+            mesh.my_node(cfg, override="foo", harness="claude"), "foo")
+
+    def test_my_node_env_wins_over_harness(self):
+        cfg = make_cfg(self.d)
+        os.environ["A2ACAST_NODE"] = "bar"
+        try:
+            self.assertEqual(mesh.my_node(cfg, harness="claude"), "bar")
+        finally:
+            os.environ.pop("A2ACAST_NODE", None)
+
+    def test_my_node_generic_file_used_when_no_harness(self):
+        cfg = make_cfg(self.d)
+        with open(mesh.node_file(cfg), "w") as f:
+            f.write("gamma\n")
+        with mock.patch.object(mesh, "_detect_harness", return_value=None):
+            self.assertEqual(mesh.my_node(cfg), "gamma")
+
+    def test_two_harnesses_same_dir_get_distinct_names(self):
+        cfg = make_cfg(self.d)
+        with mock.patch("socket.gethostname", return_value="Laptop.local"):
+            claude = mesh.my_node(make_cfg(self.d), harness="claude")
+            copilot = mesh.my_node(make_cfg(self.d), harness="copilot")
+        self.assertEqual(claude, "laptop-claude")
+        self.assertEqual(copilot, "laptop-copilot")
+        self.assertNotEqual(claude, copilot)
+
+    def test_iam_pins_per_harness_file_under_harness(self):
+        with open(os.path.join(self.d, ".meshwire.json"), "w") as f:
+            json.dump({"mesh": "t", "id": "abc", "server": "https://x",
+                       "nodes": ["alpha"]}, f)
+        buf = io.StringIO()
+        with mock.patch.object(mesh, "_detect_harness", return_value="claude"), \
+             contextlib.redirect_stdout(buf):
+            mesh.cmd_iam(argparse.Namespace(node="mine"))
+        pinned = os.path.join(self.d, ".meshwire.node.claude")
+        self.assertTrue(os.path.exists(pinned))
+        with open(pinned) as f:
+            self.assertEqual(f.read().strip(), "mine")
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
@@ -200,7 +296,14 @@ class MembershipCmdTests(unittest.TestCase):
     """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
 
     def setUp(self):
-        self._env = os.environ.pop("a2acast_NODE", None)
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        # These cmd_* tests establish identity via the generic .meshwire.node
+        # file. Neutralize ambient harness detection so the suite is
+        # deterministic no matter which agent harness runs it (the test
+        # process itself runs inside one, e.g. CLAUDECODE=1).
+        self._harness_patch = mock.patch.object(
+            mesh, "_detect_harness", return_value=None)
+        self._harness_patch.start()
         self._tmp = tempfile.TemporaryDirectory()
         self._old = os.getcwd()
         os.chdir(self._tmp.name)
@@ -208,8 +311,9 @@ class MembershipCmdTests(unittest.TestCase):
     def tearDown(self):
         os.chdir(self._old)
         self._tmp.cleanup()
+        self._harness_patch.stop()
         if self._env is not None:
-            os.environ["a2acast_NODE"] = self._env
+            os.environ["A2ACAST_NODE"] = self._env
 
     def test_init_without_nodes_uses_hostname(self):
         ns = argparse.Namespace(name="home", nodes=None,
@@ -1631,6 +1735,11 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_live_hook_lock_prevents_duplicate_watchers(self):
         cfg = self._setup_mesh()
+        # A named Copilot session pins its identity per-harness (as `mesh iam`
+        # does inside a harness); the copilot hook resolves that pin, not the
+        # generic node file, so lock identity matches the real session.
+        with open(".meshwire.node.copilot", "w") as f:
+            f.write("alpha\n")
         lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
         with open(lock, "w") as f:
             json.dump({"pid": os.getpid()}, f)

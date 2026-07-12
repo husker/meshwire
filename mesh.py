@@ -91,14 +91,68 @@ def load_config():
     return cfg
 
 
-def node_file(cfg):
-    return os.path.join(cfg["_dir"], NODE_NAME)
+def node_file(cfg, harness=None):
+    base = os.path.join(cfg["_dir"], NODE_NAME)
+    return f"{base}.{harness}" if harness else base
 
 
-def my_node(cfg, override=None):
-    """Resolve this machine's node name: --as flag > env > .meshwire.node."""
+def _detect_harness():
+    """Best-effort: which agent harness runs this process, or None.
+
+    The hook entrypoints already pass the harness explicitly; this covers
+    manual CLI use inside an agent session (e.g. `mesh send` typed into a
+    Claude Code / Codex / Copilot terminal) so it resolves that session's
+    node instead of a directory-shared one.
+    """
+    env = os.environ
+    if (env.get("CLAUDECODE") or env.get("CLAUDE_CODE")
+            or env.get("CLAUDE_TRANSCRIPT_PATH")):
+        return "claude"
+    if (env.get("CODEX_SANDBOX") or env.get("CODEX_HOME")
+            or env.get("CODEX_SANDBOX_NETWORK_DISABLED")):
+        return "codex"
+    if (env.get("COPILOT_PROJECT_DIR") or env.get("GITHUB_COPILOT_CLI")
+            or env.get("COPILOT_AGENT_ID")):
+        return "copilot"
+    return None
+
+
+def _pin_node_name(cfg, name, harness):
+    """Persist a derived identity to its per-harness node file (best effort),
+    so a session's name stays stable across restarts and is inspectable."""
+    if not harness or not cfg.get("_dir"):
+        return
+    try:
+        with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
+            f.write(name + "\n")
+    except OSError:
+        pass
+
+
+def my_node(cfg, override=None, harness=None):
+    """Resolve this machine's node name.
+
+    Precedence: --as override > A2ACAST_NODE env > per-harness pin
+    (.meshwire.node.<harness>) > derived <host>-<harness> > the legacy
+    shared .meshwire.node (only when the harness is unknown).
+
+    Identity is per-harness so two agents on one machine (Claude, Codex,
+    Copilot) never collide, and a session never inherits another harness's
+    name from a shared directory. `mesh iam` still overrides the name.
+    """
+    if harness is None:
+        harness = _detect_harness()
     name = override or os.environ.get("A2ACAST_NODE")
-    if not name and os.path.isfile(node_file(cfg)):
+    if not name and harness:
+        pin = node_file(cfg, harness)
+        if os.path.isfile(pin):
+            with open(pin, "r", encoding="utf-8") as f:
+                name = f.read().strip()
+        if not name:
+            name = _default_node_name(harness)
+            if name:
+                _pin_node_name(cfg, name, harness)
+    if not name and not harness and os.path.isfile(node_file(cfg)):
         with open(node_file(cfg), "r", encoding="utf-8") as f:
             name = f.read().strip()
     if not name:
@@ -120,8 +174,10 @@ def cursor_file(cfg, node):
     return os.path.join(cfg["_dir"], f".meshwire.cursor-{node}")
 
 
-def _default_node_name():
-    """This machine's default identity: sanitized hostname, or None."""
+def _default_node_name(harness=None):
+    """This machine's default identity: sanitized hostname, optionally
+    suffixed with the harness (so <host>-claude and <host>-copilot are
+    distinct nodes on the same machine), or None if the hostname is unusable."""
     name = socket.gethostname().lower()
     for suffix in (".local", ".lan"):
         if name.endswith(suffix):
@@ -130,7 +186,7 @@ def _default_node_name():
     name = re.sub(r"-{2,}", "-", name).strip("-")
     if not name or name == BROADCAST:
         return None
-    return name
+    return f"{name}-{harness}" if harness else name
 
 
 def _save_config(cfg):
@@ -777,7 +833,7 @@ def cmd_iam(args):
     if args.node not in cfg["nodes"]:
         cfg["nodes"].append(args.node)
         _save_config(cfg)
-    with open(node_file(cfg), "w", encoding="utf-8") as f:
+    with open(node_file(cfg, _detect_harness()), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
 
@@ -1856,7 +1912,7 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
         return None
 
     cfg = load_config()
-    me = my_node(cfg, None)
+    me = my_node(cfg, None, harness)
     lock = _acquire_hook_lock(cfg, me, hook_input, harness)
     if lock is None:
         return None
