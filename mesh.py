@@ -200,9 +200,14 @@ def my_node(cfg, override=None, harness=None):
         sys.exit("error: this machine has no node identity. Run "
                  "`mesh iam <node>` (or pass --as / set A2ACAST_NODE).")
     if name not in cfg["nodes"]:
-        cfg["nodes"].append(name)
         if cfg.get("_path"):
-            _save_config(cfg)
+            def _add_node(latest):
+                latest.setdefault("nodes", [])
+                if name not in latest["nodes"]:
+                    latest["nodes"].append(name)
+            _mutate_config(cfg, _add_node)
+        else:
+            cfg["nodes"].append(name)
     return name
 
 
@@ -1064,8 +1069,11 @@ def cmd_iam(args):
     if args.node == BROADCAST:
         sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
     if args.node not in cfg["nodes"]:
-        cfg["nodes"].append(args.node)
-        _save_config(cfg)
+        def _add_node(latest):
+            latest.setdefault("nodes", [])
+            if args.node not in latest["nodes"]:
+                latest["nodes"].append(args.node)
+        _mutate_config(cfg, _add_node)
     with open(node_file(cfg, _detect_harness()), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")

@@ -361,6 +361,68 @@ class PeerTests(unittest.TestCase):
             self.assertIn("newpeer", after["nodes"])
             self.assertIn("newpeer", cfg["nodes"])  # in-memory copy synced too
 
+    def test_cmd_iam_does_not_clobber_concurrent_exec_allow(self):
+        # Security regression test for #30: cmd_iam used to _save_config()
+        # the whole in-memory cfg it loaded, so a concurrent exec_allow
+        # edit landing between its load and its write would be wiped.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            # cmd_iam's own load_config() call is stubbed to return THIS
+            # stale cfg -- simulating a race where a concurrent writer
+            # (e.g. `mesh codex-allow`) curates the allowlist between
+            # cmd_iam's load and its write.
+            stale_cfg = dict(cfg)
+            self.assertNotIn("exec_allow", stale_cfg)
+
+            with open(cfg["_path"]) as f:
+                disk = json.load(f)
+            disk["exec_allow"] = ["trusted"]
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump(disk, f)
+
+            with mock.patch.object(mesh, "load_config",
+                                   return_value=stale_cfg), \
+                 mock.patch.object(mesh, "_detect_harness",
+                                   return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_iam(argparse.Namespace(node="newnode"))
+
+            with open(cfg["_path"]) as f:
+                after = json.load(f)
+            self.assertEqual(after.get("exec_allow"), ["trusted"])
+            self.assertIn("newnode", after["nodes"])
+
+    def test_my_node_persist_does_not_clobber_exec_allow(self):
+        # Security regression test for #30: my_node's node-learning persist
+        # path used to _save_config(cfg) with the whole in-memory dict.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            # A different process curates the allowlist after our cfg was
+            # loaded -- our in-memory cfg still has no exec_allow key.
+            with open(cfg["_path"]) as f:
+                disk = json.load(f)
+            disk["exec_allow"] = ["trusted"]
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump(disk, f)
+            self.assertNotIn("exec_allow", cfg)
+
+            # override bypasses harness/env resolution and lands straight
+            # on the "learn this new name" persist branch.
+            name = mesh.my_node(cfg, override="newnode")
+
+            self.assertEqual(name, "newnode")
+            self.assertIn("newnode", cfg["nodes"])  # in-memory copy synced too
+            with open(cfg["_path"]) as f:
+                after = json.load(f)
+            self.assertEqual(after.get("exec_allow"), ["trusted"])
+            self.assertIn("newnode", after["nodes"])
+
 
 class MembershipCmdTests(unittest.TestCase):
     """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
