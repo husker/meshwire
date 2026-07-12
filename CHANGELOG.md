@@ -18,8 +18,10 @@
   repo contents, so only allow peers you trust). `--supervise-sandbox`
   widens it.
 - Reliability: a task is claimed (state "working") before exec so it can't
-  double-run, and failing tasks are retried up to 3 times then
-  dead-lettered (state "failed").
+  double-run; `codex exec` is bounded by a 600s timeout; failing or
+  timed-out tasks are retried up to 3 times then dead-lettered (state
+  "failed"); tasks stranded in "working" by a crash/stop are requeued on
+  supervisor startup.
 
 ## 0.13.0
 - Presence on session open: `mesh mcp-serve` is now the uniform presence
