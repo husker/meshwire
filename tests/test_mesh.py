@@ -1777,6 +1777,37 @@ class CodexHookTests(MembershipCmdTests):
         self.assertFalse(os.path.exists(lock))
 
 
+class PresenceLockTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_acquire_and_liveness(self):
+        self.assertFalse(mesh._presence_is_live(self.cfg, "alpha"))
+        path = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.assertIsNotNone(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.assertTrue(mesh._presence_is_live(self.cfg, "alpha"))
+
+    def test_second_acquire_fails_while_first_lives(self):
+        path = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.assertIsNone(mesh._acquire_presence_lock(self.cfg, "alpha"))
+
+    def test_stale_lock_is_reclaimed(self):
+        path = mesh.presence_lock_file(self.cfg, "alpha")
+        with open(path, "w") as f:
+            json.dump({"pid": 99999999}, f)      # dead pid
+        got = mesh._acquire_presence_lock(self.cfg, "alpha")
+        self.assertIsNotNone(got)
+        os.unlink(got)
+
+    def test_distinct_nodes_get_distinct_locks(self):
+        self.assertNotEqual(mesh.presence_lock_file(self.cfg, "alpha"),
+                            mesh.presence_lock_file(self.cfg, "beta"))
+
+
 class AwaitResultTests(MembershipCmdTests):
     def test_await_matches_task_id(self):
         cfg = make_cfg(self._tmp.name)

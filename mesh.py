@@ -70,6 +70,7 @@ RELAY_FUTURE_SKEW = 300
 MAX_RELAY_TIME = 4_102_444_800
 TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
+PRESENCE_LOCK_PREFIX = "mw-presence-"
 
 
 # ---------------------------------------------------------------- config
@@ -1740,9 +1741,21 @@ def _run_mcp_server(args, label, idle_hint):
     print(f"a2acast {label}: serving as node '{me}' ({cfg['_dir']}) "
           f"via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
-    threading.Thread(target=server.watch_loop, daemon=True).start()
-    _mcp_stdin_loop(server.handle)
-    server._stop.set()
+    plock = _acquire_presence_lock(cfg, me)
+    if plock:
+        threading.Thread(target=server.watch_loop, daemon=True).start()
+    else:
+        print(f"a2acast {label}: another presence server owns node "
+              f"'{me}' — serving tools only", file=sys.stderr)
+    try:
+        _mcp_stdin_loop(server.handle)
+    finally:
+        server._stop.set()
+        if plock:
+            try:
+                os.unlink(plock)
+            except FileNotFoundError:
+                pass
 
 
 def cmd_mcp_serve(args):
@@ -1897,6 +1910,42 @@ def _acquire_hook_lock(cfg, node, hook_input=None, harness=None):
             os.close(fd)
         return path
     return None
+
+
+def presence_lock_file(cfg, node):
+    """Cross-platform singleton lock: one relay-subscribing presence
+    server per mesh node (same scheme as hook_lock_file)."""
+    identity = f"{os.path.realpath(cfg['_dir'])}\0{node}".encode()
+    suffix = hashlib.sha256(identity).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), PRESENCE_LOCK_PREFIX + suffix)
+
+
+def _acquire_presence_lock(cfg, node):
+    path = presence_lock_file(cfg, node)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _hook_lock_is_live(path):
+                return None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            continue
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid()}).encode())
+        finally:
+            os.close(fd)
+        return path
+    return None
+
+
+def _presence_is_live(cfg, node):
+    path = presence_lock_file(cfg, node)
+    return os.path.exists(path) and _hook_lock_is_live(path)
 
 
 def _compact_hook_output(output):
