@@ -3354,6 +3354,30 @@ class SuperviseLoopTests(unittest.TestCase):
         kill.assert_called_once_with(4242, mesh.signal.SIGTERM)
         self.assertFalse(os.path.exists(pid_path))
 
+    def test_once_releases_lock_and_pidfile(self):
+        # No pending tasks — the loop body is a no-op, but the finally
+        # cleanup should still fire on normal exit (--once returns from
+        # inside the try).
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex") as run:
+            mesh.cmd_codex_supervise(ns)
+        run.assert_not_called()
+        pid_path = mesh._supervise_pid_file(self.cfg, "mynode")
+        self.assertFalse(os.path.exists(pid_path))
+        lock = mesh._acquire_supervise_lock(self.cfg, "mynode")
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+        self.assertIsNotNone(lock)
+
+    def test_installs_sigterm_handler(self):
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=True,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex"), \
+             mock.patch.object(mesh.signal, "signal") as sig:
+            mesh.cmd_codex_supervise(ns)
+        sig.assert_called_once()
+        self.assertEqual(sig.call_args[0][0], mesh.signal.SIGTERM)
+
 
 if __name__ == "__main__":
     unittest.main()

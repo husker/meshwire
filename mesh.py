@@ -2815,8 +2815,8 @@ def cmd_codex_supervise(args):
             return
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            print(f"a2acast supervise: process {pid} not running")
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            print(f"a2acast supervise: could not signal process {pid}: {e}")
         else:
             print(f"a2acast supervise: sent SIGTERM to {pid}")
         try:
@@ -2835,6 +2835,7 @@ def cmd_codex_supervise(args):
     with open(pid_path, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()) + "\n")
 
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while True:
             for task_id, task in _supervise_pending(cfg, me):
