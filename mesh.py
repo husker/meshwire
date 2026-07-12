@@ -2117,7 +2117,7 @@ def cmd_agent_hook_cleanup(args):
     if not session_id or not find_config():
         return
     cfg = load_config()
-    me = my_node(cfg, None)
+    me = my_node(cfg, None, args.harness)
     path = hook_lock_file(cfg, me)
     try:
         with open(path, "r", encoding="utf-8") as f:

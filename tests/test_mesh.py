@@ -1753,6 +1753,11 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_session_cleanup_stops_its_background_watcher(self):
         cfg = self._setup_mesh()
+        # Cleanup now resolves identity via the hook's own --harness (not
+        # ambient detection), so it needs the same per-harness pin the
+        # watcher locked under.
+        with open(".meshwire.node.claude", "w") as f:
+            f.write("alpha\n")
         lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
         with open(lock, "w") as f:
             json.dump({"pid": 12345, "session_id": "session-1",
@@ -1765,6 +1770,9 @@ class CodexHookTests(MembershipCmdTests):
 
     def test_copilot_session_cleanup_accepts_camel_case_session_id(self):
         cfg = self._setup_mesh()
+        # Same per-harness pin requirement as above, for the copilot hook.
+        with open(".meshwire.node.copilot", "w") as f:
+            f.write("alpha\n")
         lock = mesh.hook_lock_file(dict(cfg, _dir=self._tmp.name), "alpha")
         with open(lock, "w") as f:
             json.dump({"pid": 12345, "session_id": "session-1",
@@ -1775,6 +1783,23 @@ class CodexHookTests(MembershipCmdTests):
             mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="copilot"))
         kill.assert_called_once_with(12345, signal.SIGTERM)
         self.assertFalse(os.path.exists(lock))
+
+    def test_cleanup_resolves_node_for_its_harness(self):
+        # Regression: cleanup must resolve identity for the hook's own
+        # --harness, not via ambient detection, or it looks at the wrong
+        # per-harness lock file.
+        self._setup_mesh()
+        with open(".meshwire.node.claude", "w") as f:
+            f.write("alpha\n")
+        seen = {}
+        with mock.patch.object(
+                mesh, "my_node",
+                side_effect=lambda c, o, h=None:
+                seen.setdefault("h", h) or "alpha"), \
+             mock.patch.object(sys, "stdin",
+                               io.StringIO('{"session_id": "s1"}')):
+            mesh.cmd_agent_hook_cleanup(argparse.Namespace(harness="claude"))
+        self.assertEqual(seen["h"], "claude")
 
 
 class PresenceLockTests(unittest.TestCase):
