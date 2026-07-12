@@ -76,6 +76,7 @@ TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
+CONFIG_LOCK_PREFIX = "mw-config-"
 
 
 # ---------------------------------------------------------------- config
@@ -238,6 +239,86 @@ def _save_config(cfg):
         indent=2)
 
 
+def _config_lock_file(cfg):
+    """Cross-platform singleton lock keyed on the config path: serializes
+    read-modify-write config mutations (same scheme as presence_lock_file)."""
+    path = os.path.abspath(cfg.get("_path") or CONFIG_NAME)
+    suffix = hashlib.sha256(path.encode()).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), CONFIG_LOCK_PREFIX + suffix)
+
+
+def _acquire_config_lock(cfg, attempts=10, wait=0.05):
+    """Acquire the brief config-write lock. Unlike the long-lived
+    presence/supervise locks (held for a process's whole lifetime), a
+    config lock is only ever held for one read-modify-write cycle -- so,
+    when it's already held, it's worth waiting it out for a few tries
+    rather than giving up immediately. Returns the lock path, or None if
+    still unobtainable after `attempts` tries (caller falls back to an
+    unlocked best-effort write rather than losing the change)."""
+    path = _config_lock_file(cfg)
+    for i in range(attempts):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _hook_lock_is_live(path):
+                if i < attempts - 1:
+                    time.sleep(wait)
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            continue
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid()}).encode())
+        finally:
+            os.close(fd)
+        return path
+    return None
+
+
+def _mutate_config(cfg, apply):
+    """Read-modify-write a single surgical change against the LATEST
+    on-disk config, under a brief lock, rather than blindly overwriting
+    with a (possibly stale) in-memory `cfg`.
+
+    A long-running process (e.g. a presence server) may hold a `cfg` that
+    was loaded long before this call; meanwhile another process (e.g.
+    `mesh codex-allow`) may have changed a DIFFERENT key on disk since
+    then. Re-reading fresh before writing means this mutation can never
+    clobber that concurrent change -- the classic bug this closes:
+    `note_peer` appending to cfg["nodes"] and saving the whole stale dict,
+    silently wiping cfg["exec_allow"] (the codex auto-exec trust boundary).
+
+    `apply(latest)` mutates `latest` in place to make the surgical change;
+    it is called once against the freshly re-read on-disk config (or, if
+    no config file exists yet, against a plain copy of the non-underscore
+    keys of the passed-in `cfg`), and once more against `cfg` itself so the
+    caller's in-memory copy stays consistent without a second disk read.
+    """
+    path = cfg.get("_path") or CONFIG_NAME
+    lock = _acquire_config_lock(cfg)
+    try:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                latest = json.load(f)
+        except (OSError, ValueError):
+            latest = {k: v for k, v in cfg.items() if not k.startswith("_")}
+        apply(latest)
+        _write_json_secure(
+            path, {k: v for k, v in latest.items()
+                   if not k.startswith("_")}, indent=2)
+    finally:
+        if lock:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+    apply(cfg)
+
+
 def _write_json_secure(path, value, indent=None):
     """Atomically write JSON through a same-directory mode-0600 temp file."""
     destination = os.path.abspath(path)
@@ -300,8 +381,11 @@ def note_peer(cfg, node, via):
     if not node or node == BROADCAST:
         return
     if node not in cfg["nodes"]:
-        cfg["nodes"].append(node)
-        _save_config(cfg)
+        def _add_node(latest):
+            latest.setdefault("nodes", [])
+            if node not in latest["nodes"]:
+                latest["nodes"].append(node)
+        _mutate_config(cfg, _add_node)
     if not os.path.exists(peers_file(cfg)):
         _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
     peers = load_peers(cfg)
@@ -2918,6 +3002,11 @@ def cmd_codex_supervise(args):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while True:
+            # Live allowlist reload (#31): re-read the config on every poll
+            # so `mesh codex-allow` takes effect on a running supervisor
+            # without a restart. _supervise_pending gates strictly on
+            # cfg["exec_allow"], so a fresh cfg is all this needs.
+            cfg = load_config()
             for task_id, task in _supervise_pending(cfg, me):
                 _run_task_with_codex(cfg, me, task_id, task, args.sandbox)
             if args.once:
@@ -2954,16 +3043,29 @@ def cmd_codex_allow(args):
             print("(empty)")
         return
     if args.revoke:
-        for node in args.revoke:
-            if node in allow:
-                allow.remove(node)
-        _save_config(cfg)
+        revoke = args.revoke
+
+        def _revoke(latest):
+            latest.setdefault("exec_allow", [])
+            for node in revoke:
+                if node in latest["exec_allow"]:
+                    latest["exec_allow"].remove(node)
+        # Route through _mutate_config (not _save_config) so a concurrent
+        # note_peer -- possibly holding a stale cfg -- can't clobber this
+        # allowlist edit with a whole-dict overwrite.
+        _mutate_config(cfg, _revoke)
+        allow = cfg["exec_allow"]
         print(f"exec_allow: {', '.join(allow) if allow else '(empty)'}")
         return
-    for node in args.node:
-        if node not in allow:
-            allow.append(node)
-    _save_config(cfg)
+    nodes = args.node
+
+    def _add(latest):
+        latest.setdefault("exec_allow", [])
+        for node in nodes:
+            if node not in latest["exec_allow"]:
+                latest["exec_allow"].append(node)
+    _mutate_config(cfg, _add)
+    allow = cfg["exec_allow"]
     print(f"exec_allow: {', '.join(allow) if allow else '(empty)'}")
 
 

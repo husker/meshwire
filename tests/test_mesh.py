@@ -333,6 +333,34 @@ class PeerTests(unittest.TestCase):
             with open(os.path.join(d, ".gitignore")) as f:
                 self.assertIn(".meshwire.peers.json", f.read())
 
+    def test_note_peer_does_not_clobber_concurrent_exec_allow(self):
+        # Security regression test for #30: a long-running process (e.g. a
+        # presence server) may hold a stale in-memory cfg with no
+        # exec_allow. If note_peer ever goes back to blindly saving that
+        # whole stale dict, it silently wipes the codex auto-exec
+        # allowlist the instant a message arrives.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            # A DIFFERENT process curates the allowlist after our cfg was
+            # loaded -- our in-memory cfg still has no exec_allow key.
+            with open(cfg["_path"]) as f:
+                disk = json.load(f)
+            disk["exec_allow"] = ["trusted"]
+            with open(cfg["_path"], "w", encoding="utf-8") as f:
+                json.dump(disk, f)
+            self.assertNotIn("exec_allow", cfg)
+
+            mesh.note_peer(cfg, "newpeer", "message")
+
+            with open(cfg["_path"]) as f:
+                after = json.load(f)
+            self.assertEqual(after.get("exec_allow"), ["trusted"])
+            self.assertIn("newpeer", after["nodes"])
+            self.assertIn("newpeer", cfg["nodes"])  # in-memory copy synced too
+
 
 class MembershipCmdTests(unittest.TestCase):
     """cmd_* tests run chdir'd into a temp dir (find_config walks up from cwd)."""
@@ -3403,6 +3431,23 @@ class CodexAllowTests(unittest.TestCase):
                 node=[], revoke=None, list=True))
         self.assertEqual(out.getvalue().strip(), "(empty)")
 
+    def test_allow_add_persists_through_concurrent_stale_note_peer(self):
+        # A different process (e.g. a presence server) is holding a stale
+        # cfg loaded BEFORE this allowlist edit hits disk. Its note_peer
+        # call must not be able to win the race and erase exec_allow.
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_codex_allow(argparse.Namespace(
+                node=["alpha"], revoke=None, list=False))
+        stale_cfg = make_cfg(self._tmp.name)  # loaded before alpha existed
+        stale_cfg["_path"] = mesh.CONFIG_NAME
+        self.assertNotIn("exec_allow", stale_cfg)
+
+        mesh.note_peer(stale_cfg, "newpeer", "message")
+
+        reloaded = mesh.load_config()
+        self.assertEqual(reloaded["exec_allow"], ["alpha"])
+        self.assertIn("newpeer", reloaded["nodes"])
+
 
 class SuperviseRunTests(unittest.TestCase):
     def setUp(self):
@@ -3614,6 +3659,43 @@ class SuperviseLoopTests(unittest.TestCase):
         with mock.patch.object(mesh, "_run_task_with_codex",
                                return_value=True) as run:
             mesh.cmd_codex_supervise(ns)
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][2], "t1")   # task_id
+
+    def test_reloads_config_on_each_poll_iteration(self):
+        # #31: a `mesh codex-allow` run against a LIVE supervisor must take
+        # effect without a restart. peer "beta" is submitted but NOT
+        # exec_allow'd at startup -- it must only become eligible once a
+        # concurrent codex-allow write lands on disk between polls.
+        mesh.save_task(self.cfg, "t1", direction="inbound", state="submitted",
+                       peer="beta", text="hi")
+
+        class _StopLoop(Exception):
+            pass
+
+        calls = []
+
+        def _fake_sleep(_seconds):
+            calls.append(1)
+            if len(calls) == 1:
+                # Simulate a concurrent `mesh codex-allow beta` landing on
+                # disk from a different process, mid-run.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_allow(argparse.Namespace(
+                        node=["beta"], revoke=None, list=False))
+                return
+            raise _StopLoop
+
+        ns = argparse.Namespace(sandbox="read-only", interval=5, once=False,
+                                stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex",
+                               return_value=True) as run, \
+             mock.patch.object(mesh.time, "sleep", side_effect=_fake_sleep):
+            with self.assertRaises(_StopLoop):
+                mesh.cmd_codex_supervise(ns)
+
+        # Iteration 1: beta not yet allow-listed -> not called.
+        # Iteration 2: cfg reloaded, picks up the concurrent allow -> called.
         run.assert_called_once()
         self.assertEqual(run.call_args[0][2], "t1")   # task_id
 
