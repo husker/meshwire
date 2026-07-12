@@ -3085,6 +3085,19 @@ class CodexSetupTests(unittest.TestCase):
                                expected_cfg, "--as",
                                mesh._default_node_name("codex")])
 
+    def test_migrated_identity_is_used_as_node_name(self):
+        with open(mesh.NODE_NAME, "w") as f:
+            f.write("alpha\n")
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=ok) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_codex_setup(argparse.Namespace(dir=None))
+        cmd = run.call_args[0][0]
+        # the migrated identity (established via the generic node file)
+        # must win over the raw hostname-derived name
+        self.assertEqual(cmd[-2:], ["--as", "alpha"])
+
     def test_missing_codex_cli_prints_manual_toml(self):
         with mock.patch.object(mesh.subprocess, "run",
                                side_effect=FileNotFoundError):

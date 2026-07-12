@@ -2636,7 +2636,8 @@ def cmd_codex_setup(args):
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
     pinned = os.path.abspath(cfg_path)
-    migrated = _migrate_identity({"_dir": os.path.dirname(cfg_path)}, "codex")
+    project_dir = os.path.dirname(cfg_path)
+    migrated = _migrate_identity({"_dir": project_dir}, "codex")
     if migrated:
         print(f"  migrated established identity '{migrated}' -> "
               f".meshwire.node.codex")
@@ -2645,7 +2646,18 @@ def cmd_codex_setup(args):
     # Codex spawns MCP servers without the session's env, so the server
     # cannot detect its harness — pin the per-harness identity explicitly
     # (verified live 2026-07-12: without --as it serves the generic name).
-    me = _default_node_name("codex")
+    # Use the pinned per-harness identity (migrated, or set via `mesh iam`)
+    # so an established node keeps its name; --as is top precedence in
+    # my_node, so it must carry the pin, not a raw hostname-derived name.
+    _pin = node_file({"_dir": project_dir}, "codex")
+    me = None
+    if os.path.isfile(_pin):
+        try:
+            with open(_pin, "r", encoding="utf-8") as f:
+                me = f.read().strip()
+        except OSError:
+            me = None
+    me = me or _default_node_name("codex")
     if me:
         cmd += ["--as", me]
     try:
