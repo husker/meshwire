@@ -1593,56 +1593,66 @@ class MeshMCPServer:
     def watch_loop(self):
         cfg, me = self.cfg, self.me
         tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        self._initialized.wait(30)
+        backoff = 1
+        while not self._stop.is_set():
+            try:
+                self._watch_once(cfg, me, tpc)
+                return          # clean return only happens on _stop
+            except Exception as exc:   # presence must never die silently
+                print(f"mesh mcp watch loop error (resubscribing in "
+                      f"{backoff}s): {exc}", file=sys.stderr)
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30)
+
+    def _watch_once(self, cfg, me, tpc):
         cf = cursor_file(cfg, me)
         since, seen = _load_cursor(cf)
         skip = set(seen)
         replay_seen = load_replays(cfg, me)
-        self._initialized.wait(30)
-        try:
-            for ev in _stream_events(cfg, tpc, str(since), None, skip=skip):
-                if self._stop.is_set():
-                    return
-                if not isinstance(ev, dict) or not isinstance(
-                        ev.get("id"), str):
-                    continue
-                et = _relay_time(ev.get("time"))
-                if (et is None or et < since or
-                        (et == since and ev.get("id") in seen)):
-                    continue
-                frm, recipient, body, trusted, ctl, fingerprint = \
-                    _open_details(ev, cfg, me)
-                if not trusted:
-                    continue
-                if not ctl and not _valid_a2a_route(body, frm, recipient):
-                    continue
-                if fingerprint in replay_seen:
-                    continue
-                if et == since:
-                    seen = [i for i in seen if i]
-                    seen.append(ev.get("id"))
-                else:
-                    seen = [ev.get("id")]
-                since = et
-                with open(cf, "w", encoding="utf-8") as f:
-                    json.dump({"since": et, "seen": seen[-50:]}, f)
-                if fingerprint:
-                    replay_seen.add(fingerprint)
-                    save_replays(cfg, me, replay_seen)
-                if frm == me:
-                    continue
-                if ctl:
-                    line = _handle_control(cfg, me, frm, ctl)
-                    if line:
-                        self.deliver({"kind": "node_joined", "from": frm,
-                                      "text": line})
-                    continue
-                note_peer(cfg, frm, "message")
-                _send_ack(cfg, me, frm, ev)
-                delivery = self._delivery(frm, recipient, body, ev)
-                if delivery:
-                    self.deliver(delivery)
-        except Exception as exc:  # never let the watcher kill the server
-            print(f"mesh mcp watch loop stopped: {exc}", file=sys.stderr)
+        for ev in _stream_events(cfg, tpc, str(since), None, skip=skip):
+            if self._stop.is_set():
+                return
+            if not isinstance(ev, dict) or not isinstance(
+                    ev.get("id"), str):
+                continue
+            et = _relay_time(ev.get("time"))
+            if (et is None or et < since or
+                    (et == since and ev.get("id") in seen)):
+                continue
+            frm, recipient, body, trusted, ctl, fingerprint = \
+                _open_details(ev, cfg, me)
+            if not trusted:
+                continue
+            if not ctl and not _valid_a2a_route(body, frm, recipient):
+                continue
+            if fingerprint in replay_seen:
+                continue
+            if et == since:
+                seen = [i for i in seen if i]
+                seen.append(ev.get("id"))
+            else:
+                seen = [ev.get("id")]
+            since = et
+            with open(cf, "w", encoding="utf-8") as f:
+                json.dump({"since": et, "seen": seen[-50:]}, f)
+            if fingerprint:
+                replay_seen.add(fingerprint)
+                save_replays(cfg, me, replay_seen)
+            if frm == me:
+                continue
+            if ctl:
+                line = _handle_control(cfg, me, frm, ctl)
+                if line:
+                    self.deliver({"kind": "node_joined", "from": frm,
+                                  "text": line})
+                continue
+            note_peer(cfg, frm, "message")
+            _send_ack(cfg, me, frm, ev)
+            delivery = self._delivery(frm, recipient, body, ev)
+            if delivery:
+                self.deliver(delivery)
 
 
 def _mcp_stdin_loop(handle):

@@ -2430,6 +2430,27 @@ class ActivityFileTests(unittest.TestCase):
             self.assertIn("message from beta: hello", f.read())
 
 
+class WatchLoopResilienceTests(unittest.TestCase):
+    def test_watch_loop_resubscribes_after_unexpected_error(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._initialized.set()
+        calls = []
+
+        def fake_watch_once(cfg_, me_, tpc_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")          # unexpected error
+            srv._stop.set()                         # second pass: end test
+
+        with mock.patch.object(srv, "_watch_once", fake_watch_once), \
+             mock.patch.object(mesh.time, "sleep", lambda s: None):
+            srv.watch_loop()
+        self.assertEqual(len(calls), 2)             # it came back
+
+
 class MCPServeTests(unittest.TestCase):
     """The Copilot MCP-server watcher (mesh mcp-serve)."""
 
