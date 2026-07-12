@@ -126,8 +126,13 @@ means a missed wake can never lose a message — it is already on disk.
   loss.
 
 **Wake-strength assessment (candid):** Copilot = true idle wake (native
-push). Claude = near-true (armed from session open; wake via asyncRewake).
-Codex = spike-dependent; worst case turn-windowed in v1.
+push). Claude = **true idle wake, verified live 2026-07-12**: SessionStart
+honors `async` + `asyncRewake` hook entries, so the wake watcher arms at
+session open with zero turns taken — a never-typed-in session woke on
+message arrival and replied in 48s end-to-end (probe outcome (a); the
+SessionStart claude-hook entry in hooks/hooks.json is permanent).
+Codex = spike-dependent; worst case turn-windowed in v1 (presence
+verified live; see 2026-07-12-codex-wake-spike.md).
 
 ## Error handling & edge cases
 

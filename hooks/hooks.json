@@ -8,6 +8,14 @@
             "type": "command",
             "command": "mesh",
             "args": ["claude-session-hook"]
+          },
+          {
+            "type": "command",
+            "command": "mesh",
+            "args": ["claude-hook", "--timeout", "86370"],
+            "timeout": 86400,
+            "async": true,
+            "asyncRewake": true
           }
         ]
       }
