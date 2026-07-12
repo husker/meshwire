@@ -1997,9 +1997,14 @@ def _wait_for_activity(cfg, me, timeout):
             try:
                 with open(act, "r", encoding="utf-8") as f:
                     lines = [ln.strip() for ln in f if ln.strip()]
-                os.remove(act)
             except OSError:
                 lines = []
+            try:
+                os.remove(act)
+            except OSError:
+                pass  # locked by a writer; a re-read just re-delivers,
+                      # and duplicate delivery is harmless (mesh_pending
+                      # drains once; the summary is advisory)
             if lines:
                 n = len(lines)
                 shown = "; ".join(lines[:5])

@@ -1810,11 +1810,17 @@ class PresenceLockTests(unittest.TestCase):
 
 class BufferWaitTests(unittest.TestCase):
     def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
         self._old = os.getcwd()
         self.addCleanup(os.chdir, self._old)
+        self.addCleanup(self._restore_env)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.cfg = make_cfg(tmp.name)
+
+    def _restore_env(self):
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
 
     def test_returns_summary_when_activity_appears(self):
         act = mesh.activity_file(self.cfg, "alpha")
@@ -1857,6 +1863,8 @@ class BufferWaitTests(unittest.TestCase):
                 argparse.Namespace(timeout=3), hook_input={})
         watch.assert_not_called()                  # no second subscription
         self.assertIn("task from beta", out)
+        lock = mesh.hook_lock_file(self.cfg, "alpha")
+        self.assertFalse(os.path.exists(lock))      # lock released
 
 
 class AwaitResultTests(MembershipCmdTests):
