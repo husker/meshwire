@@ -77,6 +77,7 @@ HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
 CONFIG_LOCK_PREFIX = "mw-config-"
+TASKS_LOCK_PREFIX = "mw-tasks-"
 
 
 # ---------------------------------------------------------------- config
@@ -257,25 +258,25 @@ def _config_lock_file(cfg):
     return os.path.join(tempfile.gettempdir(), CONFIG_LOCK_PREFIX + suffix)
 
 
-def _acquire_config_lock(cfg, attempts=10, wait=0.05):
-    """Acquire the brief config-write lock. Unlike the long-lived
-    presence/supervise locks (held for a process's whole lifetime), a
-    config lock is only ever held for one read-modify-write cycle -- so,
-    when it's already held, it's worth waiting it out for a few tries
-    rather than giving up immediately. Returns the lock path, or None if
-    still unobtainable after `attempts` tries (caller falls back to an
-    unlocked best-effort write rather than losing the change)."""
-    path = _config_lock_file(cfg)
+def _acquire_path_lock(lock_path, attempts=10, wait=0.05):
+    """Acquire a brief O_CREAT|O_EXCL lock at `lock_path`. Unlike the
+    long-lived presence/supervise locks (held for a process's whole
+    lifetime), these locks are only ever held for one read-modify-write
+    cycle -- so, when one is already held, it's worth waiting it out for a
+    few tries rather than giving up immediately. Returns `lock_path`, or
+    None if still unobtainable after `attempts` tries (caller falls back
+    to an unlocked best-effort write rather than losing the change).
+    Shared retry body for `_acquire_config_lock` and `_acquire_tasks_lock`."""
     for i in range(attempts):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            if _hook_lock_is_live(path):
+            if _hook_lock_is_live(lock_path):
                 if i < attempts - 1:
                     time.sleep(wait)
                 continue
             try:
-                os.unlink(path)
+                os.unlink(lock_path)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -285,8 +286,23 @@ def _acquire_config_lock(cfg, attempts=10, wait=0.05):
             os.write(fd, json.dumps({"pid": os.getpid()}).encode())
         finally:
             os.close(fd)
-        return path
+        return lock_path
     return None
+
+
+def _acquire_config_lock(cfg, attempts=10, wait=0.05):
+    """Acquire the brief config-write lock. See `_acquire_path_lock`."""
+    return _acquire_path_lock(_config_lock_file(cfg), attempts, wait)
+
+
+def _tasks_lock_file(cfg):
+    suffix = hashlib.sha256(os.path.abspath(tasks_file(cfg)).encode()).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), TASKS_LOCK_PREFIX + suffix)
+
+
+def _acquire_tasks_lock(cfg, attempts=10, wait=0.05):
+    """Acquire the brief task-store write lock. See `_acquire_path_lock`."""
+    return _acquire_path_lock(_tasks_lock_file(cfg), attempts, wait)
 
 
 def _mutate_config(cfg, apply):
@@ -649,13 +665,28 @@ def load_tasks(cfg):
 
 
 def save_task(cfg, task_id, **fields):
-    tasks = load_tasks(cfg)
-    t = tasks.setdefault(task_id, {})
-    t.update(fields)
-    t["updated"] = int(time.time())
-    with open(tasks_file(cfg), "w", encoding="utf-8") as f:
-        json.dump(tasks, f, indent=1)
-    return t
+    """Locked, atomic read-modify-write of one task in the store.
+
+    `mesh codex-supervise` runs two writers in one process -- the exec poll
+    loop (claim/fail/retry state changes) and the receiver thread (inbound
+    task delivery). Re-reading the store fresh under a brief lock, then
+    writing through `_write_json_secure`'s atomic rename, keeps either
+    writer from dropping the other's task (lost update) or leaving a torn
+    file (which `load_tasks` would silently read back as an empty store)."""
+    lock = _acquire_tasks_lock(cfg)
+    try:
+        tasks = load_tasks(cfg)
+        t = tasks.setdefault(task_id, {})
+        t.update(fields)
+        t["updated"] = int(time.time())
+        _write_json_secure(tasks_file(cfg), tasks, indent=1)
+        return t
+    finally:
+        if lock:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
 
 def _supervise_handled_file(cfg, node):

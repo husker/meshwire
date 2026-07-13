@@ -3072,6 +3072,49 @@ class OnboardingTextTests(unittest.TestCase):
         self.assertIn("mesh_pending", out.getvalue())
 
 
+class TasksDurabilityTests(unittest.TestCase):
+    """save_task must survive concurrent writers (poll loop + receiver thread)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+
+    def test_concurrent_writers_drop_no_tasks(self):
+        # The real race: many writers doing read-modify-write on one store,
+        # exactly as the supervisor poll loop + receiver thread do. Without a
+        # lock serializing them, overlapping read-modify-write windows lose
+        # updates and the final count comes up short. With the lock, every
+        # task survives. (Deterministically fails against the old unlocked
+        # save_task; the brief write hold time makes it non-flaky here.)
+        import threading
+
+        def worker(prefix):
+            for i in range(25):
+                mesh.save_task(self.cfg, "%s%d" % (prefix, i), state="submitted")
+
+        threads = [threading.Thread(target=worker, args=(p,))
+                   for p in ("a", "b", "c", "d")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        after = mesh.load_tasks(self.cfg)
+        self.assertEqual(len(after), 100)  # 4 workers x 25, none lost
+
+    def test_save_task_writes_atomically(self):
+        with mock.patch("mesh._write_json_secure") as w:
+            mesh.save_task(self.cfg, "A", state="working")
+        w.assert_called_once()
+        path, value = w.call_args.args[0], w.call_args.args[1]
+        self.assertEqual(path, mesh.tasks_file(self.cfg))
+        self.assertIn("A", value)
+
+    def test_save_task_releases_lock(self):
+        mesh.save_task(self.cfg, "A", direction="inbound")
+        self.assertFalse(os.path.exists(mesh._tasks_lock_file(self.cfg)))
+
+
 class IdentityMigrationTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
