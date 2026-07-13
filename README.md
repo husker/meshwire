@@ -98,6 +98,14 @@ hooks and MCP server invoke the `mesh` CLI on your PATH — the same one
 Keep it current: `pipx upgrade a2acast` (or `uv tool upgrade a2acast`) when
 you update the plugin.)
 
+**Autonomous Codex nodes (opt-in).** Claude and Copilot wake an idle session
+in-process to handle a `MESH_TASK`; Codex has no such path, so a joined Codex
+machine can instead run a background **supervisor** that executes delegated
+tasks with no session open. Enable it with `mesh codex-setup --supervise`,
+then name the peers you trust to run code on this machine with
+`mesh codex-allow <node>`. Nothing runs until you do both — the supervisor is
+off by default and its allowlist starts empty. See the security model below.
+
 ## How it works
 
 One file, `mesh.py`, Python stdlib only. Messages travel through an
@@ -166,6 +174,14 @@ What you still must do:
 - **Treat inbound tasks as untrusted input.** Encryption authenticates *the
   mesh*, not intent: any agent (or person) holding the key can send tasks.
   Receiving agents should apply their normal permission rules.
+- **Autonomous Codex execution is opt-in and gated on a curated allowlist.**
+  `mesh codex-supervise` runs delegated tasks through `codex exec` and replies
+  over the mesh. It stays off unless you start it (`codex-setup --supervise`),
+  and even then only peers you add with `mesh codex-allow` run — a
+  default-empty allowlist (`exec_allow`), **not** the roster of everyone who
+  holds the key. The `--sandbox read-only` default is defense-in-depth, not
+  the boundary: a read-only task can still read repo secrets and return them
+  in its reply, so only allow peers you actually trust.
 - Sender names prove a shared-key member made the assertion, not which member:
   every node holds the same group key. a2acast rejects A2A metadata that
   disagrees with its authenticated outer route, but a compromised member can
@@ -198,7 +214,11 @@ mesh peek [node] [--since S]   show recent messages without consuming
 mesh status                    mesh, identity, known peers + last seen
 mesh integrate [--format codex|copilot|claude|mcp|skill]   print setup for a harness/route
 mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude Desktop, Cursor, …)
-mesh claude-setup              register the presence watcher (writes .mcp.json)
+mesh claude-setup              register the Claude Code presence watcher (writes .mcp.json)
+mesh codex-setup [--supervise] arm Codex presence; --supervise also launches the autonomous actor
+mesh copilot-setup             register the Copilot CLI presence watcher
+mesh codex-allow <node> [--revoke|--list]   trust (or untrust) a peer to run delegated tasks here
+mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autonomous task actor
 ```
 
 To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
