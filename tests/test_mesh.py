@@ -988,6 +988,19 @@ def fake_stream_raises(exc):
 
 
 class StreamEventsTests(unittest.TestCase):
+    def test_short_deadline_caps_relay_socket_timeout(self):
+        seen = []
+
+        def stop_after_dial(url, timeout=None):
+            seen.append(timeout)
+            raise _TestDone()
+
+        with mock.patch.object(mesh.time, "time", return_value=100):
+            gen = mesh._stream_events(make_cfg(), "tp", "0", deadline=102)
+            with mock.patch.object(mesh, "http", side_effect=stop_after_dial):
+                self.assertRaises(_TestDone, next, gen)
+        self.assertLessEqual(seen[0], 2)
+
     def test_reconnects_on_dropped_stream_errors(self):
         # A long-lived TLS stream to the relay drops with these mid-read; the
         # watcher must reconnect (our fake redial raises _TestDone), not crash
@@ -2417,6 +2430,169 @@ class AwaitResultTests(MembershipCmdTests):
             got = mesh._await_result(cfg, "alpha", "T1", timeout=60)
         self.assertEqual(got["result"]["artifacts"][0]["parts"][0]["text"],
                          "42")
+
+    def test_await_terminal_result_skips_nonterminal_updates(self):
+        cfg = make_cfg(self._tmp.name)
+        working = mesh.make_result_envelope("beta", "alpha", "T1", "C1",
+                                            "working", "halfway")
+        completed = mesh.make_result_envelope("beta", "alpha", "T1", "C1",
+                                              "completed", "done")
+        evs = []
+        for i, env in enumerate((working, completed)):
+            wire = mesh.encrypt(cfg, json.dumps(
+                {"f": "beta", "t": "alpha", "b": json.dumps(env)}))
+            evs.append({"event": "message", "id": f"r{i}",
+                        "time": 300 + i, "message": wire})
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)):
+            got = mesh._await_result(cfg, "alpha", "T1", timeout=60,
+                                     terminal_only=True)
+        self.assertEqual(got["result"]["status"]["state"], "completed")
+        self.assertEqual(mesh.load_tasks(cfg)["T1"]["result"], "done")
+
+    def test_await_rejects_result_from_wrong_recorded_peer(self):
+        cfg = make_cfg(self._tmp.name)
+        mesh.save_task(cfg, "T1", direction="outbound", state="submitted",
+                       peer="beta", text="question")
+        wrong = mesh.make_result_envelope("gamma", "alpha", "T1", "C1",
+                                          "completed", "spoofed")
+        valid = mesh.make_result_envelope("beta", "alpha", "T1", "C1",
+                                          "completed", "real")
+        evs = []
+        for i, env in enumerate((wrong, valid)):
+            sender = "gamma" if i == 0 else "beta"
+            wire = mesh.encrypt(cfg, json.dumps(
+                {"f": sender, "t": "alpha", "b": json.dumps(env)}))
+            evs.append({"event": "message", "id": f"r{i}",
+                        "time": 300 + i, "message": wire})
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)):
+            got = mesh._await_result(cfg, "alpha", "T1", timeout=60)
+        self.assertEqual(got["result"]["metadata"]["mesh"]["from"], "beta")
+        self.assertEqual(mesh.load_tasks(cfg)["T1"]["result"], "real")
+
+
+class BlockingWaitTests(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._harness_patch = mock.patch.object(
+            mesh, "_detect_harness", return_value=None)
+        self._harness_patch.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        self.cfg = mesh.load_config()
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+        self._harness_patch.stop()
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    @staticmethod
+    def _tasks_args(task_id, timeout=None):
+        return argparse.Namespace(action="list", task_id=None,
+                                  wait_task=task_id, timeout=timeout)
+
+    @staticmethod
+    def _peek_args(from_node=None, timeout=None):
+        return argparse.Namespace(node=None, since="all", as_node=None,
+                                  wait=True, from_node=from_node,
+                                  timeout=timeout)
+
+    def test_tasks_wait_prints_already_completed_result(self):
+        mesh.save_task(self.cfg, "T1", direction="outbound", state="completed",
+                       peer="beta", text="question", result="answer")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_tasks(self._tasks_args("T1"))
+        self.assertIn("MESH_TASK_RESULT", out.getvalue())
+        self.assertIn("state=completed", out.getvalue())
+        self.assertTrue(out.getvalue().rstrip().endswith("answer"))
+
+    def test_tasks_wait_terminal_failure_exits_one(self):
+        mesh.save_task(self.cfg, "T1", direction="outbound", state="failed",
+                       peer="beta", text="question", result="boom")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+             self.assertRaises(SystemExit) as cm:
+            mesh.cmd_tasks(self._tasks_args("T1"))
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("boom", out.getvalue())
+
+    def test_tasks_wait_timeout_exits_124(self):
+        mesh.save_task(self.cfg, "T1", direction="outbound", state="submitted",
+                       peer="beta", text="question")
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_await_result", return_value=None), \
+             contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as cm:
+            mesh.cmd_tasks(self._tasks_args("T1", timeout=3))
+        self.assertEqual(cm.exception.code, 124)
+        self.assertIn("MESH_TASK_TIMEOUT task=T1", err.getvalue())
+
+    def test_tasks_wait_replays_since_task_submission(self):
+        mesh.save_task(self.cfg, "T1", direction="outbound", state="submitted",
+                       peer="beta", text="question")
+        submitted = mesh.load_tasks(self.cfg)["T1"]["updated"]
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_await_result", return_value=None) as wait, \
+             contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit):
+            mesh.cmd_tasks(self._tasks_args("T1", timeout=3))
+        self.assertEqual(wait.call_args.kwargs["since"],
+                         str(max(0, submitted - 1)))
+
+    def test_peek_wait_filters_for_verified_sender(self):
+        wrong = mesh.encrypt(self.cfg, json.dumps(
+            {"f": "gamma", "t": "alpha", "b": "skip"}))
+        wanted = mesh.encrypt(self.cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "ready"}))
+        evs = [
+            {"event": "message", "id": "p1", "time": 100,
+             "message": wrong},
+            {"event": "message", "id": "p2", "time": 101,
+             "message": wanted},
+        ]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(evs)), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_peek(self._peek_args(from_node="beta", timeout=5))
+        self.assertNotIn("skip", out.getvalue())
+        self.assertIn("beta: ready", out.getvalue())
+
+    def test_peek_wait_timeout_exits_124(self):
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(())), \
+             contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as cm:
+            mesh.cmd_peek(self._peek_args(timeout=2))
+        self.assertEqual(cm.exception.code, 124)
+        self.assertIn("MESH_PEEK_TIMEOUT", err.getvalue())
+
+    def test_wait_flags_parse_for_tasks_and_peek(self):
+        calls = []
+        with mock.patch.object(mesh, "cmd_tasks",
+                               lambda args: calls.append(("tasks", args))), \
+             mock.patch.object(sys, "argv", ["mesh", "tasks", "--wait",
+                                              "T1", "--timeout", "7"]):
+            mesh.main()
+        with mock.patch.object(mesh, "cmd_peek",
+                               lambda args: calls.append(("peek", args))), \
+             mock.patch.object(sys, "argv", ["mesh", "peek", "--wait",
+                                              "--from", "beta", "--timeout",
+                                              "9"]):
+            mesh.main()
+        self.assertEqual(calls[0][1].wait_task, "T1")
+        self.assertEqual(calls[0][1].timeout, 7)
+        self.assertTrue(calls[1][1].wait)
+        self.assertEqual(calls[1][1].from_node, "beta")
+        self.assertEqual(calls[1][1].timeout, 9)
 
 
 class ControlHandlingTests(unittest.TestCase):

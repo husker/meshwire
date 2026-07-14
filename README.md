@@ -208,9 +208,11 @@ mesh ping <node> [--timeout N] liveness + round-trip time (answered by watchers)
 mesh ask <node> <text...> [--wait SECS]   delegate an A2A task
 mesh reply <task-id> <text...> [--state completed|failed|...]   answer one
 mesh tasks [get <id>]          task ledger
+mesh tasks --wait <id> [--timeout N]   wait for a terminal task result
 mesh card [node] [--name N --description D]   A2A agent card
 mesh a2a-serve [--port 4737] [--wait 60]      localhost A2A HTTP bridge
 mesh peek [node] [--since S]   show recent messages without consuming
+mesh peek --wait [--from NODE] [--timeout N]   wait for the next arrival
 mesh status                    mesh, identity, known peers + last seen
 mesh integrate [--format codex|copilot|claude|mcp|skill]   print setup for a harness/route
 mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude Desktop, Cursor, …)
@@ -220,6 +222,10 @@ mesh copilot-setup             register the Copilot CLI presence watcher
 mesh codex-allow <node> [--revoke|--list]   trust (or untrust) a peer to run delegated tasks here
 mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autonomous task actor
 ```
+
+The blocking commands use shell-friendly exit codes: `tasks --wait` exits
+`0` for `completed`, `1` for any other terminal state, and `124` on timeout;
+`peek --wait` exits `0` on an arrival and `124` on timeout.
 
 To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
 Prefer this over the `A2ACAST_NODE` env var, which is not reliably inherited
