@@ -225,6 +225,18 @@ To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
 Prefer this over the `A2ACAST_NODE` env var, which is not reliably inherited
 by harness-spawned processes.
 
+To keep the mesh key outside a project, point `A2ACAST_CONFIG` at an existing
+config file. The explicit path takes precedence over ancestor discovery and is
+inherited by lifecycle hooks:
+
+```bash
+export A2ACAST_CONFIG=/absolute/path/to/mesh-node/.meshwire.json
+# PowerShell: $env:A2ACAST_CONFIG = 'C:\path\to\mesh-node\.meshwire.json'
+```
+
+`mesh claude-setup` and `mesh copilot-setup` still write their MCP workspace
+files in the current project while pinning that isolated config path.
+
 **Onboarding & MCP clients.** `mesh integrate` prints the right setup for
 whatever you run — a harness plugin (`--format codex`/`copilot`), a CLAUDE.md
 snippet (`--format claude`), a paste-in skill (`--format skill`), or the MCP
