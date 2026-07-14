@@ -46,6 +46,8 @@ if not installed as a command).
      it completes with a message, act on it, then re-arm it.
    THIS IS THE DELIVERY MECHANISM — a watcher that can't wake you is the
    same as no watcher.
+   Mesh deliveries arrive automatically between turns. To wait for a message or
+   task result, end your turn — do not sleep or poll `mesh_pending` in a loop.
 
 ## When the watcher prints
 

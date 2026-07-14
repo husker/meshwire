@@ -299,6 +299,41 @@ class JoinHarnessTests(unittest.TestCase):
         self.assertTrue(os.path.exists(".meshwire.node"))
 
 
+class InitHarnessTests(unittest.TestCase):
+    def setUp(self):
+        self._env = os.environ.pop("A2ACAST_NODE", None)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["A2ACAST_NODE"] = self._env
+
+    def _init(self, harness):
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value=harness), \
+             mock.patch.object(mesh, "_watch_if_interactive"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_init(argparse.Namespace(
+                name="test", nodes="", as_node=None,
+                server="https://example.test"))
+
+    def test_init_inside_harness_pins_per_harness_name(self):
+        self._init("claude")
+        self.assertTrue(os.path.exists(".meshwire.node.claude"))
+        with open(".meshwire.node.claude") as f:
+            name = f.read().strip()
+        self.assertTrue(name.endswith("-claude"))
+        self.assertFalse(os.path.exists(".meshwire.node"))
+
+    def test_init_outside_harness_writes_generic_file(self):
+        self._init(None)
+        self.assertTrue(os.path.exists(".meshwire.node"))
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1010,6 +1045,29 @@ class WatchTests(MembershipCmdTests):
         with open(".meshwire.cursor-alpha", "w") as f:
             json.dump({"since": 0, "seen": []}, f)
         return cfg
+
+    def test_watch_refuses_second_subscription_when_node_lock_is_owned(self):
+        self._setup_mesh()
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=None), \
+             mock.patch.object(mesh, "_stream_events") as stream:
+            with self.assertRaisesRegex(SystemExit, "live presence"):
+                mesh.cmd_watch(argparse.Namespace(
+                    timeout=60, as_node=None, follow=False))
+        stream.assert_not_called()
+
+    def test_watch_releases_node_lock_after_one_shot_timeout(self):
+        self._setup_mesh()
+        lock = os.path.abspath("watch.lock")
+        with open(lock, "w") as f:
+            f.write("{}")
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock), \
+             mock.patch.object(mesh, "_stream_events", return_value=iter([])), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
+        self.assertFalse(os.path.exists(lock))
 
     def _msg_event(self, cfg, frm, body, eid, t, ctl=None):
         payload = {"f": frm, "t": "alpha", "b": body}
@@ -1885,6 +1943,9 @@ class CodexHookTests(MembershipCmdTests):
                       out.getvalue())
         self.assertIn("send its result with mesh reply without asking",
                       out.getvalue())
+        self.assertIn("end your turn", out.getvalue())
+        self.assertIn("do not sleep or poll mesh_pending in a loop",
+                      out.getvalue())
         self.assertIn("external side effects beyond the a2acast reply",
                       out.getvalue())
 
@@ -2136,6 +2197,29 @@ class BufferWaitTests(unittest.TestCase):
         with mock.patch.object(mesh, "_presence_is_live", return_value=True):
             got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
         self.assertIn("idle: task from beta: build it", got)
+
+    def test_presence_exit_activity_is_not_mislabeled_as_delivery(self):
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("presence server exited; relay fallback will re-arm "
+                    "on the next turn\n")
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
+        self.assertIn("presence server exited", got)
+        self.assertIn("re-arm", got)
+        self.assertNotIn("mesh_pending", got)
+
+    def test_presence_exit_note_does_not_inflate_delivery_count(self):
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("message from beta: hi\n")
+            f.write("presence server exited; relay fallback will re-arm "
+                    "on the next turn\n")
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
+        self.assertIn("1 a2acast delivery arrived", got)
+        self.assertIn("mesh_pending", got)
+        self.assertIn("presence server also exited", got)
 
     def test_times_out_quietly_when_no_activity(self):
         with mock.patch.object(mesh, "_presence_is_live", return_value=True):
@@ -2453,6 +2537,13 @@ class PluginManifestTests(unittest.TestCase):
         with open(os.path.join(self.ROOT, rel)) as f:
             return json.load(f)
 
+    def test_mesh_script_is_pinned_to_lf_in_git(self):
+        path = os.path.join(self.ROOT, ".gitattributes")
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding="utf-8") as f:
+            lines = {line.strip() for line in f if line.strip()}
+        self.assertIn("mesh.py text eol=lf", lines)
+
     def test_codex_manifest_valid(self):
         m = self._load(self.MANIFEST)
         self.assertRegex(m["name"], r"^[a-z0-9][a-z0-9-]*$")
@@ -2563,6 +2654,17 @@ class PluginManifestTests(unittest.TestCase):
         self.assertFalse(
             os.path.exists(os.path.join(self.COPILOT_PLUGIN_DIR, "mesh.py")),
             "plugin should not bundle mesh.py; it invokes the mesh CLI")
+
+    def test_agent_skills_wait_by_ending_turn_instead_of_polling(self):
+        for rel in (
+                "skills/mesh-agent/SKILL.md",
+                "plugins/a2acast/skills/mesh-agent/SKILL.md",
+                "plugins/copilot-a2acast/skills/mesh-agent/SKILL.md"):
+            with open(os.path.join(self.ROOT, rel), encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("end your turn", text, rel)
+            self.assertIn("do not sleep or poll `mesh_pending` in a loop",
+                          text, rel)
 
     def test_copilot_marketplace_points_to_plugin(self):
         market = self._load(".plugin/marketplace.json")
@@ -3210,6 +3312,8 @@ class MCPServeTests(unittest.TestCase):
                                   "mcp-serve", "")
         loop.assert_not_called()
         self.assertIn("serving tools only", err.getvalue())
+        self.assertFalse(os.path.exists(
+            mesh.activity_file(mesh.load_config(), "alpha")))
 
     def test_lock_acquired_starts_watch_thread(self):
         # first presence server for a node arms the watch loop in a thread
@@ -3230,6 +3334,25 @@ class MCPServeTests(unittest.TestCase):
         self.assertEqual(thread_cls.call_args.kwargs.get("daemon"), True)
         thread_cls.return_value.start.assert_called_once()
         self.assertNotIn("serving tools only", err.getvalue())
+
+    def test_presence_owner_writes_last_gasp_activity_note_on_exit(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._write_real_config(tmp.name)
+        fake_lock = os.path.join(tmp.name, "fake.lock")
+        with open(fake_lock, "w") as f:
+            f.write("{}")
+        with mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=fake_lock), \
+             mock.patch.object(mesh.threading, "Thread"), \
+             mock.patch.object(mesh, "_mcp_stdin_loop"), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
+                                 "mcp-serve", "")
+        activity = mesh.activity_file(mesh.load_config(), "alpha")
+        self.assertTrue(os.path.exists(activity))
+        with open(activity) as f:
+            self.assertIn("presence server exited", f.read())
 
 
 class IntegrateTests(unittest.TestCase):
