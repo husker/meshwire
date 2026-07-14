@@ -5,6 +5,7 @@ Run from the repo root:  python3 -m unittest discover -s tests -v
 import argparse
 import base64
 import contextlib
+import dataclasses
 import http.client
 import io
 import json
@@ -3944,6 +3945,72 @@ class MCPServeTests(unittest.TestCase):
         self.assertTrue(os.path.exists(activity))
         with open(activity) as f:
             self.assertIn("presence server exited", f.read())
+
+
+class HarnessSpecTests(unittest.TestCase):
+    def test_every_supported_harness_declares_the_same_integration_categories(self):
+        self.assertEqual(set(mesh.HARNESS_SPECS), {"claude", "codex", "copilot"})
+        required = (
+            "name", "display_name", "env_markers", "hook_commands",
+            "settings_path", "wake_path", "delivery_prompt", "status_source",
+            "setup_command", "identity_pin", "setup_steps", "teardown_steps",
+            "quirks",
+        )
+        for name, spec in mesh.HARNESS_SPECS.items():
+            with self.subTest(harness=name):
+                self.assertTrue(dataclasses.is_dataclass(spec))
+                self.assertEqual(spec.name, name)
+                for field in required:
+                    self.assertTrue(getattr(spec, field), field)
+
+    def test_harness_detection_uses_declared_environment_markers(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for name, spec in mesh.HARNESS_SPECS.items():
+                with self.subTest(harness=name):
+                    os.environ.clear()
+                    os.environ[spec.env_markers[0]] = "1"
+                    self.assertEqual(mesh._detect_harness(), name)
+
+    def test_onboarding_is_rendered_from_the_harness_spec(self):
+        spec = dataclasses.replace(
+            mesh.HARNESS_SPECS["codex"],
+            display_name="Test Codex",
+            setup_command="mesh test-codex-setup",
+            install_commands=("install test-codex",),
+            integration_note="Test wake note.",
+        )
+        with mock.patch.dict(mesh.HARNESS_SPECS, {"codex": spec}):
+            text = mesh._integrate_harness("codex")
+        self.assertIn("# a2acast on Test Codex", text)
+        self.assertIn("install test-codex", text)
+        self.assertIn("mesh test-codex-setup", text)
+        self.assertIn("Test wake note.", text)
+
+    def test_onboarding_includes_declared_lifecycle_and_quirks(self):
+        for name, spec in mesh.HARNESS_SPECS.items():
+            with self.subTest(harness=name):
+                text = mesh._integrate_harness(name)
+                for detail in (
+                        spec.settings_path, spec.wake_path, spec.status_source,
+                        spec.identity_pin, *spec.setup_steps,
+                        *spec.teardown_steps, *spec.quirks):
+                    self.assertIn(detail, text)
+
+    def test_workspace_setup_uses_the_declared_settings_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            with open(os.path.join(tmp, mesh.CONFIG_NAME), "w") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            spec = dataclasses.replace(
+                mesh.HARNESS_SPECS["claude"],
+                settings_path=".custom-mcp.json",
+            )
+            with mock.patch.dict(mesh.HARNESS_SPECS, {"claude": spec}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_claude_setup(argparse.Namespace(dir=tmp))
+            self.assertTrue(os.path.isfile(os.path.join(
+                tmp, ".custom-mcp.json")))
 
 
 class IntegrateTests(unittest.TestCase):

@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -103,6 +104,141 @@ MAX_FRAMING_PASSES = 32
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+@dataclass(frozen=True)
+class HarnessSpec:
+    """The integration contract for one supported agent harness.
+
+    Harness-specific glue still performs writes or invokes an owned CLI, but
+    every integration declares the same discovery, setup, wake, prompt,
+    status, lifecycle, identity, and quirk categories here.
+    """
+
+    name: str
+    display_name: str
+    env_markers: typing.Tuple[str, ...]
+    session_hook_command: typing.Optional[str]
+    delivery_hook_command: str
+    cleanup_hook_command: typing.Optional[str]
+    settings_path: str
+    settings_kind: str
+    wake_path: str
+    delivery_prompt: str
+    status_source: str
+    setup_command: str
+    setup_scope: str
+    identity_pin: str
+    setup_steps: typing.Tuple[str, ...]
+    teardown_steps: typing.Tuple[str, ...]
+    quirks: typing.Tuple[str, ...]
+    install_commands: typing.Tuple[str, ...]
+    integration_note: str
+    include_protocol: bool = False
+    migrate_identity: bool = False
+    mcp_server_type: typing.Optional[str] = None
+    mcp_all_tools: bool = False
+
+    @property
+    def hook_commands(self):
+        return tuple(command for command in (
+            self.session_hook_command,
+            self.delivery_hook_command,
+            self.cleanup_hook_command,
+        ) if command)
+
+
+HARNESS_SPECS = {
+    "claude": HarnessSpec(
+        name="claude",
+        display_name="Claude Code",
+        env_markers=("CLAUDECODE", "CLAUDE_CODE", "CLAUDE_TRANSCRIPT_PATH"),
+        session_hook_command="claude-session-hook",
+        delivery_hook_command="claude-hook",
+        cleanup_hook_command="agent-hook-cleanup --harness claude",
+        settings_path=".mcp.json",
+        settings_kind="workspace-mcp-json",
+        wake_path="MCP presence plus asyncRewake Stop hook",
+        delivery_prompt="async-rewake",
+        status_source="session-start and Stop hooks plus MCP activity",
+        setup_command="mesh claude-setup",
+        setup_scope="project",
+        identity_pin=".meshwire.node.claude",
+        setup_steps=("write workspace MCP settings", "pin the mesh config"),
+        teardown_steps=("stop the session hook watcher",),
+        quirks=("plugin hooks wake the live session; MCP alone buffers",),
+        install_commands=(),
+        integration_note=(
+            "Presence answers pings and buffers deliveries for mesh_pending. "
+            "With the plugin installed its hooks wake the live session; "
+            "without it, keep the protocol watcher step below."
+        ),
+        include_protocol=True,
+        migrate_identity=True,
+    ),
+    "codex": HarnessSpec(
+        name="codex",
+        display_name="Codex CLI",
+        env_markers=("CODEX_SANDBOX", "CODEX_HOME",
+                     "CODEX_SANDBOX_NETWORK_DISABLED"),
+        session_hook_command="codex-session-hook",
+        delivery_hook_command="codex-hook",
+        cleanup_hook_command=None,
+        settings_path="~/.codex/config.toml",
+        settings_kind="owned-cli",
+        wake_path="MCP presence plus blocking Stop hook",
+        delivery_prompt="continuation-json",
+        status_source="session-start and Stop hooks plus MCP activity",
+        setup_command="mesh codex-setup",
+        setup_scope="machine",
+        identity_pin=".meshwire.node.codex",
+        setup_steps=("register the MCP server with codex mcp add",
+                     "pin config and node identity"),
+        teardown_steps=("remove or replace the global MCP registration",),
+        quirks=("MCP servers do not inherit the session harness environment",
+                "Stop-hook waits display a working spinner"),
+        install_commands=(
+            "codex plugin marketplace add husker/a2acast",
+            "codex plugin add a2acast@a2acast",
+        ),
+        integration_note=(
+            "The plugin's Stop hook waits for messages and wakes the same "
+            "Codex session when one arrives - no manual watcher."
+        ),
+        migrate_identity=True,
+    ),
+    "copilot": HarnessSpec(
+        name="copilot",
+        display_name="GitHub Copilot CLI",
+        env_markers=("COPILOT_PROJECT_DIR", "GITHUB_COPILOT_CLI",
+                     "COPILOT_AGENT_ID"),
+        session_hook_command=None,
+        delivery_hook_command="copilot-hook",
+        cleanup_hook_command="agent-hook-cleanup --harness copilot",
+        settings_path=".github/mcp.json",
+        settings_kind="workspace-mcp-json",
+        wake_path="MCP sampling plus agentStop lifecycle hook",
+        delivery_prompt="continuation-json",
+        status_source="prompt, agentStop, and MCP sampling hooks",
+        setup_command="mesh copilot-setup",
+        setup_scope="project",
+        identity_pin=".meshwire.node.copilot",
+        setup_steps=("write workspace MCP settings", "pin the mesh config"),
+        teardown_steps=("stop the agent hook watcher",),
+        quirks=("plugin MCP processes have plugin cwd and no project context",
+                "workspace MCP config must pin the mesh config path"),
+        install_commands=(
+            "copilot plugin marketplace add husker/a2acast",
+            "copilot plugin install a2acast@a2acast",
+        ),
+        integration_note=(
+            "The plugin starts the watcher as an MCP server and wakes on a "
+            "message without a persistent working spinner."
+        ),
+        mcp_server_type="local",
+        mcp_all_tools=True,
+    ),
+}
+
+
 # ---------------------------------------------------------------- config
 
 def find_config(start=None):
@@ -151,15 +287,9 @@ def _detect_harness():
     node instead of a directory-shared one.
     """
     env = os.environ
-    if (env.get("CLAUDECODE") or env.get("CLAUDE_CODE")
-            or env.get("CLAUDE_TRANSCRIPT_PATH")):
-        return "claude"
-    if (env.get("CODEX_SANDBOX") or env.get("CODEX_HOME")
-            or env.get("CODEX_SANDBOX_NETWORK_DISABLED")):
-        return "codex"
-    if (env.get("COPILOT_PROJECT_DIR") or env.get("GITHUB_COPILOT_CLI")
-            or env.get("COPILOT_AGENT_ID")):
-        return "copilot"
+    for name, spec in HARNESS_SPECS.items():
+        if any(env.get(marker) for marker in spec.env_markers):
+            return name
     return None
 
 
@@ -2484,12 +2614,11 @@ def cmd_copilot_activity(args):
     print(json.dumps({"additionalContext": context}))
 
 
-def cmd_copilot_setup(args):
-    """Wire the Copilot MCP-server watcher for this project by writing a
-    workspace .github/mcp.json that launches `mesh mcp-serve` with an explicit
-    --config. Copilot passes a plugin MCP server no project info, so we pin the
-    path here — deterministic and identical on macOS, Linux, and Windows. Run
-    once per project (like `mesh init`/`join` are run once per machine)."""
+def _setup_workspace_mcp(args, harness):
+    """Apply a workspace-MCP HarnessSpec without clobbering other servers."""
+    spec = HARNESS_SPECS[harness]
+    if spec.settings_kind != "workspace-mcp-json":
+        raise ValueError(f"{harness} does not use workspace MCP settings")
     start = getattr(args, "dir", None)
     cfg_path = find_config(start)
     if not cfg_path:
@@ -2498,9 +2627,14 @@ def cmd_copilot_setup(args):
     project = (os.path.abspath(start or os.getcwd())
                if os.environ.get("A2ACAST_CONFIG")
                else os.path.dirname(cfg_path))
-    gh = os.path.join(project, ".github")
-    os.makedirs(gh, exist_ok=True)
-    mcp_path = os.path.join(gh, "mcp.json")
+    config_dir = os.path.dirname(cfg_path)
+    if spec.migrate_identity:
+        migrated = _migrate_identity({"_dir": config_dir}, harness)
+        if migrated:
+            print(f"  migrated established identity '{migrated}' -> "
+                  f"{spec.identity_pin}")
+    mcp_path = os.path.join(project, spec.settings_path)
+    os.makedirs(os.path.dirname(mcp_path), exist_ok=True)
     data = {}
     if os.path.isfile(mcp_path):
         try:
@@ -2513,23 +2647,30 @@ def cmd_copilot_setup(args):
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-    servers["a2acast"] = {
-        "type": "local",
-        "command": "mesh",
-        "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)],
-        "tools": ["*"],
-    }
+    server = {"command": "mesh",
+              "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)]}
+    if spec.mcp_server_type:
+        server["type"] = spec.mcp_server_type
+    if spec.mcp_all_tools:
+        server["tools"] = ["*"]
+    servers["a2acast"] = server
     data["mcpServers"] = servers
     with open(mcp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
     # the pinned path is machine-specific; keep it out of version control
-    _gitignore_add(project, [".github/mcp.json"])
+    _gitignore_add(project, [spec.settings_path])
     print(f"Wrote {mcp_path}")
     print(f"  a2acast watcher pinned to {os.path.abspath(cfg_path)}")
-    print("Start a Copilot session in this project to pick it up. The path is "
-          "machine-specific (added to .gitignore); run `mesh copilot-setup` "
-          "again on each machine and whenever the node moves.")
+    print(f"Start a {spec.display_name} session in this project to pick it up. "
+          f"The path is machine-specific (added to .gitignore); run "
+          f"`{spec.setup_command}` again on each machine and whenever the "
+          "node moves.")
+
+
+def cmd_copilot_setup(args):
+    """Apply the declarative Copilot workspace MCP setup."""
+    _setup_workspace_mcp(args, "copilot")
 
 
 def hook_lock_file(cfg, node):
@@ -2815,19 +2956,15 @@ def _emit_continuation_hook(args, harness):
     print(json.dumps(result))
 
 
-def cmd_codex_hook(args):
-    """Wait once, then translate a delivery into Codex Stop-hook JSON."""
-    _emit_continuation_hook(args, "codex")
-
-
-def cmd_copilot_hook(args):
-    """Wait once, then translate a delivery into Copilot agentStop JSON."""
-    _emit_continuation_hook(args, "copilot")
-
-
-def cmd_claude_hook(args):
-    """Wake the same Claude session through asyncRewake on a delivery."""
-    visible = _wait_for_hook_message(args, _read_hook_input(), "claude")
+def _run_harness_delivery_hook(args, harness):
+    """Route a delivery through the prompt contract declared by its spec."""
+    spec = HARNESS_SPECS[harness]
+    if spec.delivery_prompt == "continuation-json":
+        _emit_continuation_hook(args, harness)
+        return
+    if spec.delivery_prompt != "async-rewake":
+        raise ValueError(f"unknown delivery prompt: {spec.delivery_prompt}")
+    visible = _wait_for_hook_message(args, _read_hook_input(), harness)
     if not visible:
         return
     print(
@@ -2837,6 +2974,21 @@ def cmd_claude_hook(args):
         file=sys.stderr,
     )
     raise SystemExit(2)
+
+
+def cmd_codex_hook(args):
+    """Run the Codex delivery hook declared in HARNESS_SPECS."""
+    _run_harness_delivery_hook(args, "codex")
+
+
+def cmd_copilot_hook(args):
+    """Run the Copilot delivery hook declared in HARNESS_SPECS."""
+    _run_harness_delivery_hook(args, "copilot")
+
+
+def cmd_claude_hook(args):
+    """Run the Claude delivery hook declared in HARNESS_SPECS."""
+    _run_harness_delivery_hook(args, "claude")
 
 
 def cmd_agent_hook_cleanup(args):
@@ -3394,51 +3546,8 @@ This machine's identity: see `.meshwire.node` (set with `mesh iam <node>`).
 
 
 def cmd_claude_setup(args):
-    """Register the a2acast presence watcher for Claude Code by writing the
-    project's .mcp.json (idempotent). Claude Code spawns the server with
-    every session, so the node answers pings and captures messages from the
-    moment the session opens. Run once per project per machine."""
-    start = getattr(args, "dir", None)
-    cfg_path = find_config(start)
-    if not cfg_path:
-        sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
-                 f"directory. Run `mesh init` or `mesh join` first.")
-    config_dir = os.path.dirname(cfg_path)
-    project = (os.path.abspath(start or os.getcwd())
-               if os.environ.get("A2ACAST_CONFIG") else config_dir)
-    migrated = _migrate_identity({"_dir": config_dir}, "claude")
-    if migrated:
-        print(f"  migrated established identity '{migrated}' -> "
-              f".meshwire.node.claude (kept your node name under the new "
-              f"per-harness naming)")
-    mcp_path = os.path.join(project, ".mcp.json")
-    data = {}
-    if os.path.isfile(mcp_path):
-        try:
-            with open(mcp_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-    servers["a2acast"] = {
-        "command": "mesh",
-        "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)],
-    }
-    data["mcpServers"] = servers
-    with open(mcp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    # the pinned path is machine-specific; keep it out of version control
-    _gitignore_add(project, [".mcp.json"])
-    print(f"Wrote {mcp_path}")
-    print(f"  a2acast presence watcher pinned to {os.path.abspath(cfg_path)}")
-    print("Start a Claude Code session in this project to pick it up. For "
-          "the CLAUDE.md protocol snippet, run `mesh integrate --format "
-          "claude`.")
+    """Apply the declarative Claude Code workspace MCP setup."""
+    _setup_workspace_mcp(args, "claude")
 
 
 def cmd_codex_setup(args):
@@ -3447,16 +3556,20 @@ def cmd_codex_setup(args):
     compatible). The registration is global to Codex and pinned to this
     project's node; running codex-setup from another mesh project later
     repoints the single `a2acast` entry there."""
+    spec = HARNESS_SPECS["codex"]
+    if spec.settings_kind != "owned-cli":
+        raise ValueError("codex setup must use its owned CLI")
     cfg_path = find_config(getattr(args, "dir", None))
     if not cfg_path:
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
     pinned = os.path.abspath(cfg_path)
     project_dir = os.path.dirname(cfg_path)
-    migrated = _migrate_identity({"_dir": project_dir}, "codex")
+    migrated = (_migrate_identity({"_dir": project_dir}, spec.name)
+                if spec.migrate_identity else None)
     if migrated:
         print(f"  migrated established identity '{migrated}' -> "
-              f".meshwire.node.codex")
+              f"{spec.identity_pin}")
     cmd = ["codex", "mcp", "add", "a2acast", "--",
            "mesh", "mcp-serve", "--config", pinned]
     # Codex spawns MCP servers without the session's env, so the server
@@ -3465,7 +3578,7 @@ def cmd_codex_setup(args):
     # Use the pinned per-harness identity (migrated, or set via `mesh iam`)
     # so an established node keeps its name; --as is top precedence in
     # my_node, so it must carry the pin, not a raw hostname-derived name.
-    _pin = node_file({"_dir": project_dir}, "codex")
+    _pin = node_file({"_dir": project_dir}, spec.name)
     me = None
     if os.path.isfile(_pin):
         try:
@@ -3473,7 +3586,7 @@ def cmd_codex_setup(args):
                 me = f.read().strip()
         except OSError:
             me = None
-    me = me or _default_node_name("codex")
+    me = me or _default_node_name(spec.name)
     if me:
         cmd += ["--as", me]
     try:
@@ -3481,7 +3594,7 @@ def cmd_codex_setup(args):
     except FileNotFoundError:
         as_hint = f", \"--as\", \"{me}\"" if me else ""
         sys.exit("error: `codex` CLI not found on PATH. Install Codex CLI, "
-                 "or add this to ~/.codex/config.toml yourself:\n"
+                 f"or add this to {spec.settings_path} yourself:\n"
                  "  [mcp_servers.a2acast]\n"
                  "  command = \"mesh\"\n"
                  f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\""
@@ -3698,34 +3811,22 @@ Docs: https://github.com/husker/a2acast
 
 
 def _integrate_harness(harness):
-    if harness == "claude":
-        return ("# a2acast on Claude Code\n\n"
-                "mesh claude-setup      # once per project — arms presence "
-                "at session start\n"
-                "# (presence answers pings and buffers deliveries — drain "
-                "with the mesh_pending MCP tool.\n"
-                "#  With the a2acast plugin installed, skip step 1 below: "
-                "its hooks handle waking.\n"
-                "#  Without the plugin, keep step 1 — it is what wakes a "
-                "live session on each message.)\n\n"
-                + CLAUDE_SNIPPET)
-    if harness == "codex":
-        return (
-            "# a2acast on Codex CLI\n\n"
-            "codex plugin marketplace add husker/a2acast\n"
-            "codex plugin add a2acast@a2acast\n"
-            "mesh codex-setup                     # once per machine — "
-            "arms presence at session start\n\n"
-            "The plugin's Stop hook waits for messages and wakes the same Codex "
-            "session\nwhen one arrives — no manual watcher.\n")
-    return (
-        "# a2acast on GitHub Copilot CLI\n\n"
-        "copilot plugin marketplace add husker/a2acast\n"
-        "copilot plugin install a2acast@a2acast\n"
-        "mesh copilot-setup            # once per project — pins the watcher\n\n"
-        "The plugin runs the watcher as an MCP server that Copilot starts with "
-        "the\nsession and wakes when a message arrives — no \"working\" "
-        "spinner.\n")
+    spec = HARNESS_SPECS[harness]
+    commands = "\n".join(spec.install_commands + (spec.setup_command,))
+    details = "\n".join((
+        f"Setup ({spec.setup_scope}; {spec.settings_path}): "
+        + "; ".join(spec.setup_steps),
+        f"Identity: {spec.identity_pin}",
+        f"Wake: {spec.wake_path}",
+        f"Status: {spec.status_source}",
+        "Teardown: " + "; ".join(spec.teardown_steps),
+        "Known quirks: " + "; ".join(spec.quirks),
+    )) + "\n"
+    text = (f"# a2acast on {spec.display_name}\n\n{commands}\n\n"
+            f"{spec.integration_note}\n\n{details}")
+    if spec.include_protocol:
+        text += "\n" + CLAUDE_SNIPPET
+    return text
 
 
 def _integrate_mcp():
@@ -3758,7 +3859,7 @@ def cmd_integrate(args):
     """Print onboarding for a chosen route: an overview, a harness plugin,
     the MCP server config, the CLAUDE.md snippet, or a skill file."""
     fmt = getattr(args, "format", None)
-    if fmt in ("claude", "codex", "copilot"):
+    if fmt in HARNESS_SPECS:
         print(_integrate_harness(fmt), end="")
     elif fmt == "mcp":
         print(_integrate_mcp(), end="")
@@ -3840,23 +3941,18 @@ def main():
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
 
-    p = sub.add_parser("codex-hook", help=argparse.SUPPRESS)
-    p.add_argument("--timeout", type=int, default=86370)
-    p.set_defaults(fn=cmd_codex_hook)
-
-    p = sub.add_parser("codex-session-hook", help=argparse.SUPPRESS)
-    p.set_defaults(fn=cmd_codex_session_hook)
-
-    p = sub.add_parser("claude-hook", help=argparse.SUPPRESS)
-    p.add_argument("--timeout", type=int, default=86370)
-    p.set_defaults(fn=cmd_claude_hook)
-
-    p = sub.add_parser("claude-session-hook", help=argparse.SUPPRESS)
-    p.set_defaults(fn=cmd_claude_session_hook)
-
-    p = sub.add_parser("copilot-hook", help=argparse.SUPPRESS)
-    p.add_argument("--timeout", type=int, default=86370)
-    p.set_defaults(fn=cmd_copilot_hook)
+    delivery_hooks = {"claude": cmd_claude_hook, "codex": cmd_codex_hook,
+                      "copilot": cmd_copilot_hook}
+    session_hooks = {"claude": cmd_claude_session_hook,
+                     "codex": cmd_codex_session_hook}
+    for harness, spec in HARNESS_SPECS.items():
+        p = sub.add_parser(spec.delivery_hook_command, help=argparse.SUPPRESS)
+        p.add_argument("--timeout", type=int, default=86370)
+        p.set_defaults(fn=delivery_hooks[harness])
+        if spec.session_hook_command:
+            p = sub.add_parser(spec.session_hook_command,
+                               help=argparse.SUPPRESS)
+            p.set_defaults(fn=session_hooks[harness])
 
     p = sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     p.add_argument("--as", dest="as_node", default=None)
@@ -3875,7 +3971,7 @@ def main():
                        help="print setup for a harness or route "
                             "(--format codex|copilot|claude|mcp|skill)")
     p.add_argument("--format", dest="format", default=None,
-                   choices=("claude", "codex", "copilot", "mcp", "skill"),
+                   choices=tuple(HARNESS_SPECS) + ("mcp", "skill"),
                    help="a harness plugin, MCP config, CLAUDE.md snippet, or "
                         "skill file (default: overview)")
     p.set_defaults(fn=cmd_integrate)
@@ -3883,7 +3979,7 @@ def main():
     p = sub.add_parser("copilot-activity", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_copilot_activity)
 
-    p = sub.add_parser("copilot-setup",
+    p = sub.add_parser(HARNESS_SPECS["copilot"].setup_command.split()[-1],
                        help="wire the Copilot watcher for this project "
                             "(writes .github/mcp.json)")
     p.add_argument("--dir", default=None,
@@ -3891,7 +3987,10 @@ def main():
     p.set_defaults(fn=cmd_copilot_setup)
 
     p = sub.add_parser("agent-hook-cleanup", help=argparse.SUPPRESS)
-    p.add_argument("--harness", choices=("claude", "copilot"), required=True)
+    p.add_argument("--harness",
+                   choices=tuple(name for name, spec in HARNESS_SPECS.items()
+                                 if spec.cleanup_hook_command),
+                   required=True)
     p.set_defaults(fn=cmd_agent_hook_cleanup)
 
     p = sub.add_parser("peek", help="show recent pings without consuming "
@@ -3965,14 +4064,14 @@ def main():
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_a2a_serve)
 
-    p = sub.add_parser("claude-setup",
+    p = sub.add_parser(HARNESS_SPECS["claude"].setup_command.split()[-1],
                        help="wire the Claude Code presence watcher for this "
                             "project (writes .mcp.json)")
     p.add_argument("--dir", default=None,
                    help="project dir to set up (default: search from cwd)")
     p.set_defaults(fn=cmd_claude_setup)
 
-    p = sub.add_parser("codex-setup",
+    p = sub.add_parser(HARNESS_SPECS["codex"].setup_command.split()[-1],
                        help="wire the Codex CLI presence watcher "
                             "(runs `codex mcp add`)")
     p.add_argument("--dir", default=None,
