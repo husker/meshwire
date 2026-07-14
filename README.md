@@ -240,6 +240,8 @@ mesh watch --follow            stream messages forever (preferred; background ta
 mesh watch [--timeout N]       one-shot: block until one message, print, exit
 mesh ping <node> [--timeout N] liveness + round-trip time (answered by watchers)
 mesh ask <node> <text...> [--wait SECS]   delegate an A2A task
+mesh run ensemble [--timeout N] -- "<prompt>"   fan out and collate replies
+mesh run cross-review [--timeout N] -- <diff-or-ref>   two independent reviews
 mesh reply <task-id> <text...> [--state completed|failed|...]   answer one
 mesh tasks [get <id>]          task ledger
 mesh tasks --wait <id> [--timeout N]   wait for a terminal task result
@@ -260,6 +262,14 @@ mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autono
 The blocking commands use shell-friendly exit codes: `tasks --wait` exits
 `0` for `completed`, `1` for any other terminal state, and `124` on timeout;
 `peek --wait` exits `0` on an arrival and `124` on timeout.
+
+`mesh run ensemble` creates one correlated task per other node in the dynamic
+roster, waits for all terminal replies or the time window, then prints each
+answer plus a no-reply list. `mesh run cross-review` prefers two available
+peers (blocked nodes rank last), gives both the same independent review brief,
+and collates their findings. Recipes exit `0` when every task completes, `1`
+for dispatch or terminal failures, and `124` when any dispatched node does not
+reply before the timeout.
 
 New messages carry a stable message id and default to `inform` when intent is
 missing (including messages from older clients). Use `request` when a reply is

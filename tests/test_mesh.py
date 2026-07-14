@@ -2912,6 +2912,127 @@ class AskOrderTests(MembershipCmdTests):
         self.assertIn("beta is blocked", err.getvalue())
 
 
+class RecipeTests(MembershipCmdTests):
+    def _setup_recipe_mesh(self, nodes=None):
+        cfg = make_cfg()
+        cfg["nodes"] = nodes or ["alpha", "beta", "gamma"]
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump(cfg, f)
+        with open(mesh.NODE_NAME, "w") as f:
+            f.write("alpha\n")
+        return mesh.load_config()
+
+    def test_run_cli_parses_named_recipe_after_separator(self):
+        calls = []
+        with mock.patch.object(mesh, "cmd_run", calls.append), \
+             mock.patch.object(sys, "argv", [
+                 "mesh", "run", "ensemble", "--", "compare approaches"]):
+            mesh.main()
+        self.assertEqual(calls[0].recipe, "ensemble")
+        self.assertEqual(calls[0].input, ["compare approaches"])
+
+    def test_ensemble_fans_out_unique_tasks_and_reports_missing_nodes(self):
+        self._setup_recipe_mesh()
+        sent = []
+
+        def send(cfg, frm, to, body, **kwargs):
+            sent.append((to, mesh._envelope_details(json.loads(body))))
+            return {"id": f"relay-{to}"}
+
+        def collect(cfg, me, pending, timeout, first=None, since=None):
+            beta_id = next(tid for tid, node in pending.items()
+                           if node == "beta")
+            return {"beta": {"task_id": beta_id, "state": "completed",
+                              "result": "beta answer"}}
+
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_stream_open", return_value="open-first"), \
+             mock.patch.object(mesh, "send_raw", side_effect=send), \
+             mock.patch.object(mesh, "_collect_recipe_results",
+                               side_effect=collect) as wait, \
+             contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as exc:
+                mesh.cmd_run(argparse.Namespace(
+                    recipe="ensemble", input=["solve it"], timeout=5,
+                    as_node=None))
+
+        self.assertEqual(exc.exception.code, 124)
+        self.assertEqual([to for to, _ in sent], ["beta", "gamma"])
+        task_ids = [details[1] for _, details in sent]
+        self.assertEqual(len(set(task_ids)), 2)
+        wait.assert_called_once()
+        self.assertEqual(wait.call_args.kwargs["first"], "open-first")
+        self.assertIn("beta answer", out.getvalue())
+        self.assertIn("No reply", out.getvalue())
+        self.assertIn("gamma", out.getvalue())
+
+    def test_cross_review_sends_the_same_review_request_to_two_nodes(self):
+        self._setup_recipe_mesh(["alpha", "beta", "gamma", "delta"])
+        sent = []
+
+        def send(cfg, frm, to, body, **kwargs):
+            details = mesh._envelope_details(json.loads(body))
+            sent.append((to, details[-1]))
+            return {"id": f"relay-{to}"}
+
+        def collect(cfg, me, pending, timeout, first=None, since=None):
+            return {node: {"task_id": tid, "state": "completed",
+                           "result": f"{node} review"}
+                    for tid, node in pending.items()}
+
+        with mock.patch.object(mesh, "_stream_open", return_value=None), \
+             mock.patch.object(mesh, "send_raw", side_effect=send), \
+             mock.patch.object(mesh, "_collect_recipe_results",
+                               side_effect=collect), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_run(argparse.Namespace(
+                recipe="cross-review", input=["main..feature"], timeout=5,
+                as_node=None))
+
+        self.assertEqual([to for to, _ in sent], ["beta", "gamma"])
+        self.assertNotIn("delta", [to for to, _ in sent])
+        self.assertTrue(all("main..feature" in text for _, text in sent))
+        self.assertTrue(all("independently" in text.lower()
+                            for _, text in sent))
+
+    def test_target_ranking_tolerates_corrupt_peer_cache_metadata(self):
+        cfg = self._setup_recipe_mesh()
+        with open(mesh.peers_file(cfg), "w") as f:
+            json.dump({"beta": {"seen": "not-a-time", "status": "listening"},
+                       "gamma": {"seen": None, "status": "blocked"}}, f)
+
+        self.assertEqual(mesh._recipe_targets(cfg, "alpha"),
+                         ["beta", "gamma"])
+
+    def test_collector_correlates_out_of_order_results_by_task_and_peer(self):
+        cfg = self._setup_recipe_mesh()
+        pending = {"task-beta": "beta", "task-gamma": "gamma"}
+        for task_id, node in pending.items():
+            mesh.save_task(cfg, task_id, contextId=f"ctx-{node}",
+                           state="submitted", peer=node, direction="outbound")
+
+        def event(frm, task_id, text, eid):
+            env = mesh.make_result_envelope(
+                frm, "alpha", task_id, f"ctx-{frm}", "completed", text)
+            wrapper = {"f": frm, "t": "alpha", "b": json.dumps(env)}
+            return {"event": "message", "id": eid,
+                    "time": int(mesh.time.time()),
+                    "message": mesh.encrypt(cfg, json.dumps(wrapper))}
+
+        events = [
+            event("gamma", "task-beta", "spoof", "e0"),
+            event("gamma", "task-gamma", "gamma answer", "e1"),
+            event("beta", "task-beta", "beta answer", "e2"),
+        ]
+        with mock.patch.object(mesh, "_stream_events", return_value=iter(events)):
+            results = mesh._collect_recipe_results(
+                cfg, "alpha", pending, timeout=5, since="0")
+
+        self.assertEqual(results["beta"]["result"], "beta answer")
+        self.assertEqual(results["gamma"]["result"], "gamma answer")
+        self.assertNotIn("spoof", json.dumps(results))
+
+
 class _FakeConn:
     instances = []
 
