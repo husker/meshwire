@@ -100,6 +100,120 @@ class ConfigPermissionTests(unittest.TestCase):
                 os.umask(old_umask)
 
 
+class ConfigResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self._old_env = os.environ.pop("A2ACAST_CONFIG", None)
+        self._old_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(os.chdir, self._old_cwd)
+        self.addCleanup(self._restore_env)
+        self.project = os.path.join(self._tmp.name, "project")
+        self.isolated = os.path.join(self._tmp.name, "mesh-node")
+        os.makedirs(self.project)
+        os.makedirs(self.isolated)
+
+    def _restore_env(self):
+        os.environ.pop("A2ACAST_CONFIG", None)
+        if self._old_env is not None:
+            os.environ["A2ACAST_CONFIG"] = self._old_env
+
+    def _write_config(self, directory, name):
+        path = os.path.join(directory, mesh.CONFIG_NAME)
+        cfg = make_cfg(directory)
+        cfg["mesh"] = name
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+        return path
+
+    def test_env_config_overrides_ancestor_config(self):
+        self._write_config(self.project, "project-mesh")
+        isolated = self._write_config(self.isolated, "isolated-mesh")
+        os.environ["A2ACAST_CONFIG"] = isolated
+        os.chdir(self.project)
+
+        cfg = mesh.load_config()
+
+        self.assertEqual(cfg["mesh"], "isolated-mesh")
+        self.assertEqual(cfg["_path"], os.path.abspath(isolated))
+        self.assertEqual(cfg["_dir"], os.path.abspath(self.isolated))
+
+    def test_session_hook_finds_isolated_env_config(self):
+        isolated = self._write_config(self.isolated, "isolated-mesh")
+        os.environ["A2ACAST_CONFIG"] = isolated
+        os.chdir(self.project)
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_claude_session_hook(argparse.Namespace())
+
+        self.assertIn("This project is an a2acast node", out.getvalue())
+
+    def test_missing_env_config_fails_without_ancestor_fallback(self):
+        self._write_config(self.project, "wrong-mesh")
+        missing = os.path.join(self.isolated, "missing.json")
+        os.environ["A2ACAST_CONFIG"] = missing
+        os.chdir(self.project)
+
+        with self.assertRaisesRegex(SystemExit, "A2ACAST_CONFIG.*not a file"):
+            mesh.load_config()
+
+    def test_claude_setup_keeps_workspace_file_with_isolated_config(self):
+        isolated = self._write_config(self.isolated, "isolated-mesh")
+        os.environ["A2ACAST_CONFIG"] = isolated
+        os.chdir(self.project)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_claude_setup(argparse.Namespace(dir=None))
+        except SystemExit as exc:
+            self.fail(f"claude setup did not honor A2ACAST_CONFIG: {exc}")
+
+        workspace_mcp = os.path.join(self.project, ".mcp.json")
+        self.assertTrue(os.path.isfile(workspace_mcp))
+        self.assertFalse(os.path.exists(os.path.join(self.isolated,
+                                                     ".mcp.json")))
+        with open(workspace_mcp, encoding="utf-8") as f:
+            server = json.load(f)["mcpServers"]["a2acast"]
+        self.assertIn(os.path.abspath(isolated), server["args"])
+
+    def test_copilot_setup_keeps_workspace_file_with_isolated_config(self):
+        isolated = self._write_config(self.isolated, "isolated-mesh")
+        os.environ["A2ACAST_CONFIG"] = isolated
+        os.chdir(self.project)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_copilot_setup(argparse.Namespace(dir=None))
+        except SystemExit as exc:
+            self.fail(f"copilot setup did not honor A2ACAST_CONFIG: {exc}")
+
+        workspace_mcp = os.path.join(self.project, ".github", "mcp.json")
+        self.assertTrue(os.path.isfile(workspace_mcp))
+        self.assertFalse(os.path.exists(os.path.join(self.isolated, ".github",
+                                                     "mcp.json")))
+        with open(workspace_mcp, encoding="utf-8") as f:
+            server = json.load(f)["mcpServers"]["a2acast"]
+        self.assertIn(os.path.abspath(isolated), server["args"])
+
+    def test_mcp_config_path_reports_env_override_source(self):
+        isolated = self._write_config(self.isolated, "isolated-mesh")
+        os.environ["A2ACAST_CONFIG"] = isolated
+        os.chdir(self.project)
+
+        path, how = mesh._mcp_config_path(argparse.Namespace(config=None))
+
+        self.assertEqual(path, os.path.abspath(isolated))
+        self.assertEqual(how, "A2ACAST_CONFIG")
+
+    def test_readme_documents_isolated_config_override(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("A2ACAST_CONFIG", readme)
+
+
 class EnvelopeTests(unittest.TestCase):
     def test_task_emission_accepts_safe_ids_and_rejects_unsafe_values(self):
         with tempfile.TemporaryDirectory() as d:

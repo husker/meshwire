@@ -103,7 +103,14 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 # ---------------------------------------------------------------- config
 
 def find_config(start=None):
-    """Walk up from `start` (default cwd) looking for .meshwire.json."""
+    """Resolve an explicit isolated config, otherwise walk up from `start`."""
+    override = os.environ.get("A2ACAST_CONFIG")
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        if not os.path.isfile(path):
+            sys.exit(f"error: A2ACAST_CONFIG points to '{path}', which is "
+                     "not a file")
+        return path
     d = os.path.abspath(start or os.getcwd())
     while True:
         p = os.path.join(d, CONFIG_NAME)
@@ -2118,6 +2125,8 @@ def _mcp_config_path(args):
     if explicit:
         p = os.path.abspath(explicit)
         return (p if os.path.isfile(p) else None), f"--config {explicit}"
+    if os.environ.get("A2ACAST_CONFIG"):
+        return find_config(), "A2ACAST_CONFIG"
     env = os.environ.get("COPILOT_PROJECT_DIR")
     if env:
         p = find_config(env)
@@ -2234,11 +2243,14 @@ def cmd_copilot_setup(args):
     --config. Copilot passes a plugin MCP server no project info, so we pin the
     path here — deterministic and identical on macOS, Linux, and Windows. Run
     once per project (like `mesh init`/`join` are run once per machine)."""
-    cfg_path = find_config(getattr(args, "dir", None))
+    start = getattr(args, "dir", None)
+    cfg_path = find_config(start)
     if not cfg_path:
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
-    project = os.path.dirname(cfg_path)
+    project = (os.path.abspath(start or os.getcwd())
+               if os.environ.get("A2ACAST_CONFIG")
+               else os.path.dirname(cfg_path))
     gh = os.path.join(project, ".github")
     os.makedirs(gh, exist_ok=True)
     mcp_path = os.path.join(gh, "mcp.json")
@@ -3029,12 +3041,15 @@ def cmd_claude_setup(args):
     project's .mcp.json (idempotent). Claude Code spawns the server with
     every session, so the node answers pings and captures messages from the
     moment the session opens. Run once per project per machine."""
-    cfg_path = find_config(getattr(args, "dir", None))
+    start = getattr(args, "dir", None)
+    cfg_path = find_config(start)
     if not cfg_path:
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` or `mesh join` first.")
-    project = os.path.dirname(cfg_path)
-    migrated = _migrate_identity({"_dir": project}, "claude")
+    config_dir = os.path.dirname(cfg_path)
+    project = (os.path.abspath(start or os.getcwd())
+               if os.environ.get("A2ACAST_CONFIG") else config_dir)
+    migrated = _migrate_identity({"_dir": config_dir}, "claude")
     if migrated:
         print(f"  migrated established identity '{migrated}' -> "
               f".meshwire.node.claude (kept your node name under the new "
