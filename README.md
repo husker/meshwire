@@ -163,14 +163,26 @@ ciphertext.
 
 Construction (stdlib-only, standard primitives): HKDF-SHA256 key derivation
 → HMAC-SHA256 PRF in counter mode for encryption, encrypt-then-MAC with an
-independent HMAC-SHA256 key, random 128-bit nonce per message,
-constant-time tag comparison. Unauthenticated or tampered messages are
-**dropped, not displayed**.
+independent HMAC-SHA256 key, random 128-bit nonce per message, and
+constant-time tag comparison. The `mw2` authentication tag also binds the
+mesh id, exact relay topic, and send timestamp. Envelopes older than seven
+days (or implausibly far in the future) are rejected, and authenticated
+ciphertext fingerprints are persisted per node so duplicate relay deliveries
+and replays are suppressed across restarts. `mw1` remains readable during
+rolling upgrades but new sends always use `mw2`. Unauthenticated, stale,
+misrouted, replayed, or tampered messages are **dropped, not displayed**.
 
 What you still must do:
 
 - **Guard the join code and `.meshwire.json`** — they contain the key. Both
-  are auto-gitignored; share join codes over a private channel.
+  are auto-gitignored; config writes use mode `0600`; share join codes over a
+  private channel. The key is never placed in an environment variable:
+  `A2ACAST_CONFIG` contains only a path. MCP tools, agent cards, and the local
+  A2A HTTP bridge never return config or key fields.
+- A join code grants **full membership in one trust domain**: its holder can
+  decrypt traffic, publish authenticated traffic, and mint the same sender
+  names as any other member. There are no per-node cryptographic identities
+  or roles. `exec_allow` limits autonomous execution, not mesh membership.
 - **Treat inbound tasks as untrusted input.** Encryption authenticates *the
   mesh*, not intent: any agent (or person) holding the key can send tasks.
   Receiving agents should apply their normal permission rules.
@@ -194,12 +206,32 @@ What you still must do:
   it's one file. (v0.4 meshes interoperate; v0.4 clients just render the
   new join/ping control messages as odd one-off messages.)
 
+### Incident response: revoke and rotate the mesh key
+
+If a join code, config, or member machine is compromised, rotate both the key
+and topic capability from one trusted node:
+
+```
+mesh rotate-key
+```
+
+That command switches new commands on the current node to a fresh key and
+fresh topic id, then prints a private `mesh rotate-key mesh1-...` command. Run
+that exact command on every remaining trusted node over a private channel. Do
+not send it through the compromised mesh. Restart long-running `mesh watch`,
+MCP/harness, and supervisor processes on each node so they drop their in-memory
+copy of the old config. Nodes that have not applied the new code remain on the
+revoked mesh and cannot read or publish on the new topics. Compare the
+`key: sha256:...` line from `mesh status` out of band to confirm every trusted
+node completed the cutover.
+
 ## CLI reference
 
 ```
 mesh init <name> [--as NODE] [--server URL]   create a mesh; in a terminal, prints the invite block and keeps listening
 mesh join <code> [--as NODE]   join from a code, announce, and (in a terminal) keep listening
 mesh invite                    print the join code + paste-able bootstrap block
+mesh rotate-key [mesh1-code]   rotate the key/topics, or apply a peer rotation
 mesh iam <node>                set/change this machine's identity
 mesh send <node|all> <msg...>  message a node (or broadcast)
 mesh watch --follow            stream messages forever (preferred; background task)

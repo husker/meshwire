@@ -479,7 +479,12 @@ def _ago(ts):
 # The relay (ntfy) sees only ciphertext, topic id, size, and timing. Sender/
 # recipient names travel INSIDE the encrypted payload.
 
-WIRE_MAGIC = "mw1:"
+WIRE_MAGIC = "mw2:"
+LEGACY_WIRE_MAGIC = "mw1:"
+# Seven days keeps offline delivery useful while preventing an authenticated
+# envelope from being replayed indefinitely. Duplicate ciphertext is also
+# rejected by the persistent per-node replay guard.
+WIRE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def _hkdf(key, info, length=32):
@@ -507,23 +512,70 @@ def _keystream_xor(k_enc, nonce, data):
     return bytes(out)
 
 
-def encrypt(cfg, plaintext):
+def _wire_aad(cfg, relay_topic, timestamp):
+    return (cfg["id"].encode("utf-8") + b"\0" +
+            relay_topic.encode("utf-8") + b"\0" +
+            timestamp.to_bytes(8, "big"))
+
+
+def encrypt(cfg, plaintext, to=None, timestamp=None):
+    """Encrypt plaintext and authenticate its mesh, relay topic, and time."""
     k_enc, k_mac = _keys(cfg)
+    timestamp = int(time.time_ns() // 1_000_000_000
+                    if timestamp is None else timestamp)
+    if not 0 <= timestamp <= MAX_RELAY_TIME:
+        raise ValueError("invalid wire timestamp")
+    relay_topic = topic(cfg, to) if to is not None else ""
+    topic_bytes = relay_topic.encode("utf-8")
+    if len(topic_bytes) > 65535:
+        raise ValueError("relay topic is too long")
     nonce = secrets.token_bytes(16)
     ct = _keystream_xor(k_enc, nonce, plaintext.encode("utf-8"))
-    tag = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
-    return WIRE_MAGIC + base64.b64encode(nonce + ct + tag).decode("ascii")
+    aad = _wire_aad(cfg, relay_topic, timestamp)
+    tag = hmac.new(k_mac, aad + nonce + ct,
+                   hashlib.sha256).digest()[:16]
+    header = timestamp.to_bytes(8, "big") + len(topic_bytes).to_bytes(2, "big")
+    return WIRE_MAGIC + base64.b64encode(
+        header + topic_bytes + nonce + ct + tag).decode("ascii")
 
 
-def decrypt(cfg, body):
+def decrypt(cfg, body, expected_topic=None, now=None):
     """Return plaintext, or None if not-encrypted/undecryptable."""
-    if not body.startswith(WIRE_MAGIC) or not cfg.get("key"):
+    if not cfg.get("key"):
         return None
     try:
-        raw = base64.b64decode(body[len(WIRE_MAGIC):], validate=True)
-        nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
         k_enc, k_mac = _keys(cfg)
-        want = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
+        if body.startswith(LEGACY_WIRE_MAGIC):
+            raw = base64.b64decode(body[len(LEGACY_WIRE_MAGIC):],
+                                   validate=True)
+            if len(raw) < 32:
+                return None
+            nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
+            want = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
+        elif body.startswith(WIRE_MAGIC):
+            raw = base64.b64decode(body[len(WIRE_MAGIC):], validate=True)
+            if len(raw) < 42:
+                return None
+            timestamp = int.from_bytes(raw[:8], "big")
+            topic_len = int.from_bytes(raw[8:10], "big")
+            if len(raw) < 42 + topic_len:
+                return None
+            topic_end = 10 + topic_len
+            relay_topic = raw[10:topic_end].decode("utf-8")
+            nonce = raw[topic_end:topic_end + 16]
+            ct, tag = raw[topic_end + 16:-16], raw[-16:]
+            current = int(time.time_ns() // 1_000_000_000
+                          if now is None else now)
+            if (timestamp > current + RELAY_FUTURE_SKEW or
+                    current - timestamp > WIRE_MAX_AGE or
+                    (expected_topic is not None and
+                     relay_topic != expected_topic)):
+                return None
+            aad = _wire_aad(cfg, relay_topic, timestamp)
+            want = hmac.new(k_mac, aad + nonce + ct,
+                            hashlib.sha256).digest()[:16]
+        else:
+            return None
         if not hmac.compare_digest(tag, want):
             return None
         return _keystream_xor(k_enc, nonce, ct).decode("utf-8")
@@ -638,7 +690,8 @@ def _open_details(ev, cfg, me=None):
     body = _unwrap(ev, cfg)
     if not isinstance(body, str):
         return None, None, "", False, None, None
-    pt = decrypt(cfg, body)
+    relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
+    pt = decrypt(cfg, body, expected_topic=relay_topic)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
@@ -654,7 +707,7 @@ def _open_details(ev, cfg, me=None):
         fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
         return (wrapper["f"], wrapper["t"], wrapper["b"], True,
                 wrapper.get("c"), fingerprint)
-    if body.startswith(WIRE_MAGIC):
+    if body.startswith((WIRE_MAGIC, LEGACY_WIRE_MAGIC)):
         return None, None, "", False, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
@@ -1053,7 +1106,7 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
         payload = {"f": sender, "t": to, "b": body}
         if ctl:
             payload["c"] = ctl
-        wire = encrypt(cfg, json.dumps(payload))
+        wire = encrypt(cfg, json.dumps(payload), to=to)
         headers = {"Title": cfg["mesh"]}
     else:
         wire = body
@@ -1178,6 +1231,39 @@ def _print_invite(cfg):
 
 def cmd_invite(args):
     _print_invite(load_config())
+
+
+def cmd_rotate_key(args):
+    """Rotate the mesh capability (key + topic id), or apply one from a peer."""
+    cfg = load_config()
+    if args.code:
+        replacement = parse_join_code(args.code)
+        if replacement["mesh"] != cfg["mesh"]:
+            sys.exit("error: rotation code is for a different mesh")
+        if not replacement.get("key"):
+            sys.exit("error: rotation code must contain an encryption key")
+        new_id, new_key = replacement["id"], replacement["key"]
+        new_server, new_nodes = replacement["server"], replacement["nodes"]
+    else:
+        new_id, new_key = secrets.token_hex(8), secrets.token_hex(32)
+        new_server, new_nodes = cfg["server"], list(cfg["nodes"])
+
+    def _rotate(latest):
+        latest["id"] = new_id
+        latest["key"] = new_key
+        latest["server"] = new_server
+        latest["nodes"] = list(new_nodes)
+
+    _mutate_config(cfg, _rotate)
+    print(f"rotated key for mesh '{cfg['mesh']}' — new commands now reject "
+          "the old key and topics")
+    print("restart any running mesh watch, MCP, or supervisor process on "
+          "this node to load the rotation")
+    if args.code:
+        print("rotation applied; repeat on every remaining node")
+    else:
+        print("run this privately on every other node:")
+        print(f"  mesh rotate-key {join_code(cfg)}")
 
 
 def cmd_iam(args):
@@ -1492,7 +1578,7 @@ def _send_ack(cfg, me, frm, ev):
     try:
         send_raw(cfg, me, frm, "ack",
                  ctl={"mw": "ack", "of": ev.get("id")})
-    except (urllib.error.URLError, socket.timeout):
+    except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
 
 
@@ -2714,6 +2800,11 @@ def cmd_status(args):
     peers = load_peers(cfg)
     print(f"mesh:   {cfg['mesh']}")
     print(f"server: {cfg['server']}")
+    if cfg.get("key"):
+        fingerprint = hashlib.sha256(bytes.fromhex(cfg["key"])).hexdigest()[:12]
+        print(f"key:    sha256:{fingerprint}")
+    else:
+        print("key:    PLAINTEXT")
     print("nodes:")
     for n in cfg["nodes"]:
         if n == me:
@@ -3540,6 +3631,12 @@ def main():
 
     p = sub.add_parser("invite", help="print this mesh's join code")
     p.set_defaults(fn=cmd_invite)
+
+    p = sub.add_parser("rotate-key", help="rotate this mesh's key and topic "
+                                          "capability, or apply a peer code")
+    p.add_argument("code", nargs="?", default=None,
+                   help="rotation code printed by another node")
+    p.set_defaults(fn=cmd_rotate_key)
 
     p = sub.add_parser("iam", help="set this machine's node identity")
     p.add_argument("node")
