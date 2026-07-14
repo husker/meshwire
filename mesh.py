@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import typing
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,9 +97,11 @@ CODEX_TASK_TURN_GUARD = (
 PRESENCE_EXIT_ACTIVITY = (
     "presence server exited; relay fallback will re-arm on the next turn"
 )
-DELIVERY_FRAMING_RE = re.compile(
-    r"<\s*/?\s*(?:system-reminder|task-notification|a2acast-delivery)\s*>",
-    re.IGNORECASE,
+DELIVERY_FRAMING_RE = re.compile(r"<[^<>]*>")
+DELIVERY_FRAMING_TAGS = frozenset(
+    f"<{close}{name}>"
+    for name in ("system-reminder", "task-notification", "a2acast-delivery")
+    for close in ("", "/")
 )
 MAX_FRAMING_PASSES = 32
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1669,12 +1672,23 @@ def _single_line(value):
 def _sanitize_delivery_text(value):
     """Remove harness framing tokens from untrusted delivery content.
 
-    Repeat to a fixed point so nested input cannot reveal a fresh token after
-    the inner token is removed.
+    Ignore ANSI, control, format, and whitespace characters only while
+    comparing angle-bracketed candidates. This catches visually equivalent
+    framing without flattening legitimate multiline delivery content. Repeat
+    to a fixed point so nested input cannot reveal a fresh token after the
+    inner token is removed.
     """
+    def remove_framing(match):
+        candidate = ANSI_ESCAPE_RE.sub("", match.group(0))
+        canonical = "".join(
+            ch for ch in candidate
+            if not ch.isspace() and unicodedata.category(ch) not in {"Cc", "Cf"}
+        ).casefold()
+        return "" if canonical in DELIVERY_FRAMING_TAGS else match.group(0)
+
     text = str(value)
     for _ in range(MAX_FRAMING_PASSES):
-        sanitized = DELIVERY_FRAMING_RE.sub("", text)
+        sanitized = DELIVERY_FRAMING_RE.sub(remove_framing, text)
         if sanitized == text:
             return sanitized
         text = sanitized
