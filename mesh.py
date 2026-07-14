@@ -3209,6 +3209,177 @@ def _await_result(cfg, me, task_id, timeout, first=None,
     return None
 
 
+def _recipe_targets(cfg, me):
+    """Rank other roster nodes by reported availability, then recency.
+
+    Ensemble still targets the whole roster so offline nodes appear explicitly
+    in the no-reply section. Cross-review takes the first two, preferring
+    listening/working nodes and leaving blocked nodes until last.
+    """
+    peers = load_peers(cfg)
+    nodes = [node for node in cfg.get("nodes", [])
+             if node not in (me, BROADCAST)]
+    order = {node: index for index, node in enumerate(nodes)}
+    priority = {"listening": 0, "working": 1, None: 2, "blocked": 3}
+
+    def rank(node):
+        peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
+        status = peer.get("status")
+        seen = _relay_time(peer.get("seen")) or 0
+        return (priority.get(status, 2), -seen,
+                order[node])
+
+    return sorted(nodes, key=rank)
+
+
+def _collect_recipe_results(cfg, me, pending, timeout, first=None, since=None):
+    """Collect terminal replies for many task IDs over one bounded stream."""
+    results = {}
+    deadline = time.time() + max(0, timeout)
+    stream_since = since if since is not None else str(int(time.time()) - 5)
+    tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+    for ev in _stream_events(cfg, tpc, stream_since, deadline, first=first):
+        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
+        if not trusted or ctl:
+            continue
+        env = _parse_envelope(body)
+        details = _envelope_details(env) if env else None
+        if details is None:
+            continue
+        kind, task_id, ctx, state, envelope_from, envelope_to, text = details
+        if kind != "result" or task_id not in pending:
+            continue
+        if recipient is not None and (envelope_from != frm or
+                                      envelope_to != recipient):
+            continue
+        expected = pending[task_id]
+        actual = envelope_from or frm
+        if actual != expected:
+            continue
+        note_peer(cfg, actual, "message")
+        save_task(cfg, task_id, contextId=ctx, state=state, peer=actual,
+                  direction="outbound", result=text)
+        if state in TERMINAL_STATES:
+            results[actual] = {"task_id": task_id, "state": state,
+                               "result": text}
+            if len(results) == len(pending):
+                break
+
+    # A coexisting presence server may have persisted a reply at the same
+    # moment. Merge any correlated terminal records before declaring timeout.
+    stored = load_tasks(cfg)
+    for task_id, node in pending.items():
+        if node in results:
+            continue
+        task = stored.get(task_id) or {}
+        if (task.get("direction") == "outbound" and
+                task.get("peer") == node and
+                task.get("state") in TERMINAL_STATES):
+            results[node] = {"task_id": task_id,
+                             "state": task.get("state"),
+                             "result": task.get("result", "")}
+    return results
+
+
+def _recipe_task_text(recipe, value):
+    if recipe == "ensemble":
+        return value
+    return (
+        "Review this diff or ref independently. Do not coordinate with other "
+        "reviewers. Report concrete correctness, security, compatibility, and "
+        "test findings, prioritizing actionable defects.\n\n"
+        f"Diff or ref:\n{value}"
+    )
+
+
+def _print_recipe_report(recipe, targets, task_ids, results, errors, timeout):
+    print(f"\n=== mesh {recipe} report ===")
+    for node in targets:
+        result = results.get(node)
+        if result:
+            print(f"\n## {node} [{result['state']}] task={result['task_id']}")
+            print(result.get("result") or "(empty result)")
+        elif node in errors:
+            print(f"\n## {node} [dispatch failed]")
+            print(errors[node])
+    missing = [node for node in targets
+               if node not in results and node not in errors]
+    if missing:
+        print(f"\n## No reply within {timeout}s")
+        for node in missing:
+            task_id = task_ids.get(node, "?")
+            print(f"- {node} (task {task_id})")
+    return missing
+
+
+def cmd_run(args):
+    """Run a bundled multi-node workflow and print one collated report."""
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    timeout = args.timeout
+    if timeout < 0:
+        sys.exit("error: --timeout must be zero or greater")
+    value = " ".join(args.input).strip()
+    if not value:
+        sys.exit("error: recipe input cannot be empty")
+    targets = _recipe_targets(cfg, me)
+    if args.recipe == "cross-review":
+        if len(targets) < 2:
+            sys.exit("error: cross-review needs at least two other mesh nodes")
+        targets = targets[:2]
+    elif not targets:
+        sys.exit("error: ensemble needs at least one other mesh node")
+
+    text = _recipe_task_text(args.recipe, value)
+    since = str(max(0, int(time.time()) - 5))
+    first = None
+    if timeout:
+        tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        try:
+            first = _stream_open(cfg, tpc, since, min(timeout, 300))
+        except (urllib.error.URLError, socket.timeout):
+            pass
+
+    pending = {}
+    task_ids = {}
+    errors = {}
+    print(f"MESH_RUN recipe={args.recipe} targets={','.join(targets)} "
+          f"timeout={timeout}s")
+    for node in targets:
+        env = make_send_envelope(me, node, text)
+        task_id = env["params"]["message"]["taskId"]
+        context_id = env["params"]["message"]["contextId"]
+        try:
+            send_raw(cfg, me, node, json.dumps(env),
+                     title=f"{cfg['mesh']}: a2a {me} -> {node}")
+        except (urllib.error.URLError, socket.timeout, UnicodeError,
+                ValueError) as exc:
+            errors[node] = f"send failed: {exc}"
+            continue
+        save_task(cfg, task_id, contextId=context_id, state="submitted",
+                  peer=node, direction="outbound", text=text,
+                  recipe=args.recipe)
+        pending[task_id] = node
+        task_ids[node] = task_id
+        print(f"  task {task_id} -> {node}")
+
+    if pending:
+        results = _collect_recipe_results(
+            cfg, me, pending, timeout, first=first, since=since)
+    else:
+        results = {}
+        close = getattr(first, "close", None)
+        if close:
+            close()
+    missing = _print_recipe_report(
+        args.recipe, targets, task_ids, results, errors, timeout)
+    if missing:
+        raise SystemExit(124)
+    if errors or any(result["state"] != "completed"
+                     for result in results.values()):
+        raise SystemExit(1)
+
+
 def cmd_ask(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
@@ -4018,6 +4189,15 @@ def main():
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_ping)
+
+    p = sub.add_parser("run", help="run a bundled multi-node workflow")
+    p.add_argument("recipe", choices=("ensemble", "cross-review"))
+    p.add_argument("input", nargs="+",
+                   help="prompt, diff, or ref (use -- before the value)")
+    p.add_argument("--timeout", type=int, default=120,
+                   help="seconds to collect replies (default 120)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("ask", help="send an A2A task to another node")
     p.add_argument("to")
