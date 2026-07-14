@@ -19,6 +19,7 @@ Stdlib only. Works on Linux, macOS, Windows (Python 3.8+).
 import argparse
 import base64
 import contextlib
+import email.message
 import hashlib
 import hmac
 import io
@@ -34,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -78,6 +80,12 @@ PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
 CONFIG_LOCK_PREFIX = "mw-config-"
 TASKS_LOCK_PREFIX = "mw-tasks-"
+DELIVERY_FRAMING_RE = re.compile(
+    r"<\s*/?\s*(?:system-reminder|task-notification|a2acast-delivery)\s*>",
+    re.IGNORECASE,
+)
+MAX_FRAMING_PASSES = 32
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 # ---------------------------------------------------------------- config
@@ -271,7 +279,15 @@ def _acquire_path_lock(lock_path, attempts=10, wait=0.05):
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            if _hook_lock_is_live(lock_path):
+            # The creator writes PID metadata immediately after O_EXCL, but
+            # another thread can observe the file in that tiny empty/partial
+            # window. Treat a freshly-created unreadable lock as live instead
+            # of unlinking it as stale and entering the critical section too.
+            try:
+                fresh = time.time() - os.path.getmtime(lock_path) < 1
+            except OSError:
+                fresh = False
+            if _hook_lock_is_live(lock_path) or fresh:
                 if i < attempts - 1:
                     time.sleep(wait)
                 continue
@@ -954,7 +970,8 @@ def _post(cfg, tpc, data, headers):
             if resp.status >= 400:
                 raise urllib.error.HTTPError(
                     f"{cfg['server']}/{tpc}", resp.status,
-                    out.decode("utf-8", "replace")[:200], None, None)
+                    out.decode("utf-8", "replace")[:200],
+                    typing.cast(email.message.Message, None), None)
             return json.loads(out)
         except urllib.error.HTTPError:
             raise  # a real relay answer — do not retry, do not rewrap
@@ -1278,8 +1295,35 @@ def _single_line(value):
             .replace("\u2029", "\\u2029"))
 
 
+def _sanitize_delivery_text(value):
+    """Remove harness framing tokens from untrusted delivery content.
+
+    Repeat to a fixed point so nested input cannot reveal a fresh token after
+    the inner token is removed.
+    """
+    text = str(value)
+    for _ in range(MAX_FRAMING_PASSES):
+        sanitized = DELIVERY_FRAMING_RE.sub("", text)
+        if sanitized == text:
+            return sanitized
+        text = sanitized
+    # Pathological nesting can reveal one new tag per pass. Bound the work,
+    # then make any remaining tag syntax inert without discarding its text.
+    return text.replace("<", "\u2039").replace(">", "\u203a")
+
+
+def _single_line_preview(value, limit):
+    """Return a bounded preview with terminal and line controls removed."""
+    text = ANSI_ESCAPE_RE.sub("", str(value))
+    text = "".join(ch for ch in text
+                   if ord(ch) >= 32 and not 127 <= ord(ch) <= 159
+                   and ch not in "\u2028\u2029")
+    return _single_line(_sanitize_delivery_text(text))[:limit]
+
+
 def _emit_message(cfg, me, frm, body, ev, recipient=None):
     """Print one inbound message or task; return its local delivery kind."""
+    body = _sanitize_delivery_text(body)
     env = _parse_envelope(body)
     if env:
         details = _envelope_details(env)
@@ -1762,6 +1806,10 @@ class MeshMCPServer:
     # -- delivery + sampling wake -------------------------------------------
 
     def deliver(self, delivery):
+        delivery = dict(delivery)
+        for field in ("from", "text"):
+            if field in delivery:
+                delivery[field] = _sanitize_delivery_text(delivery[field])
         with self._buf_lock:
             self._buf.append(delivery)
         self._record_activity(delivery)
@@ -1771,8 +1819,8 @@ class MeshMCPServer:
         """Append a one-line record so the userPromptSubmitted hook can tell
         the user what was handled while they were away (Copilot fires no
         notification for the out-of-band sampling handler)."""
-        frm = d.get("from", "?")
-        text = _single_line(d.get("text") or "")[:60]
+        frm = _single_line_preview(d.get("from", "?"), 40)
+        text = _single_line_preview(d.get("text") or "", 90)
         kind = d.get("kind")
         if kind == "task":
             line = f"task from {frm}: {text}"
@@ -1782,6 +1830,7 @@ class MeshMCPServer:
             line = f"node joined: {frm}"
         else:
             line = f"message from {frm}: {text}"
+        line = line[:160]
         try:
             with open(activity_file(self.cfg, self.me),
                       "a", encoding="utf-8") as f:
@@ -1838,6 +1887,7 @@ class MeshMCPServer:
 
     def _delivery(self, frm, recipient, body, ev):
         """Parse one inbound event into a structured delivery (no printing)."""
+        body = _sanitize_delivery_text(body)
         env = _parse_envelope(body)
         if env:
             details = _envelope_details(env)
@@ -2713,9 +2763,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     """Localhost HTTP server speaking standard A2A JSON-RPC, bridging to
     remote mesh nodes over the ntfy transport. Lets any A2A-capable framework
     on this machine talk to agents on other machines with no open ports."""
-    cfg = None
-    me = None
-    wait = 60
+    cfg: typing.Optional[typing.Dict[str, typing.Any]] = None
+    me: typing.Optional[str] = None
+    wait: int = 60
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode("utf-8")
@@ -2725,17 +2775,19 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *a):
-        sys.stderr.write("a2a-bridge: " + fmt % a + "\n")
+    def log_message(self, format, *a):
+        sys.stderr.write("a2a-bridge: " + format % a + "\n")
 
     def do_GET(self):
         cfg, me = self.cfg, self.me
+        assert cfg is not None and me is not None
+        address = typing.cast(typing.Tuple[str, int],
+                              self.server.server_address)
         parts = [p for p in self.path.split("?")[0].split("/") if p]
         peers = [n for n in cfg["nodes"] if n != me]
         if parts == [".well-known", "agent-card.json"]:
             # the bridge itself presents the mesh as a directory agent
-            card = agent_card(cfg, me, f"http://{self.server.server_address[0]}"
-                                       f":{self.server.server_address[1]}/")
+            card = agent_card(cfg, me, f"http://{address[0]}:{address[1]}/")
             card["description"] = (f"a2acast bridge on node '{me}'. "
                                    f"Remote agents: " + ", ".join(
                                        f"/agents/{n}" for n in peers))
@@ -2745,13 +2797,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         if (len(parts) == 4 and parts[0] == "agents"
                 and parts[2:] == [".well-known", "agent-card.json"]
                 and parts[1] in peers):
-            base = (f"http://{self.server.server_address[0]}"
-                    f":{self.server.server_address[1]}/agents/{parts[1]}")
+            base = f"http://{address[0]}:{address[1]}/agents/{parts[1]}"
             return self._json(200, agent_card(cfg, parts[1], base))
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
         cfg, me = self.cfg, self.me
+        assert cfg is not None and me is not None
         parts = [p for p in self.path.split("?")[0].split("/") if p]
         if len(parts) != 2 or parts[0] != "agents" \
                 or parts[1] not in cfg["nodes"] or parts[1] == me:
@@ -2970,14 +3022,11 @@ def cmd_codex_setup(args):
         log_path = os.path.join(project_dir, ".meshwire.supervise.log")
         try:
             with open(log_path, "a", encoding="utf-8") as log:
-                kwargs = {"stdin": subprocess.DEVNULL, "stdout": log,
-                          "stderr": log}
-                if hasattr(os, "setsid"):
-                    kwargs["start_new_session"] = True
                 subprocess.Popen(
                     ["mesh", "codex-supervise", "--sandbox", sandbox,
                      "--as", me],
-                    **kwargs)
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                    start_new_session=hasattr(os, "setsid"))
         except (FileNotFoundError, OSError) as e:
             print(f"warning: could not launch codex-supervise: {e}",
                   file=sys.stderr)
@@ -3062,6 +3111,8 @@ def cmd_codex_supervise(args):
         # inbound events and both call save_task -- harmless, since
         # save_task is idempotent by task-id and double receipt just
         # re-writes the same record.
+        # The receiver intentionally keeps this startup cfg snapshot; its
+        # delivery path never reads live security policy such as exec_allow.
         receiver = MeshMCPServer(cfg, me)
         threading.Thread(target=receiver.watch_loop, daemon=True).start()
 
