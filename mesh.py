@@ -1280,8 +1280,8 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
     since = str(current_since)
     backoff = 1
     while deadline is None or time.time() < deadline:
-        chunk = (300 if deadline is None
-                 else min(300, max(5, int(deadline - time.time()))))
+        chunk = (300 if deadline is None else
+                 min(300, max(0.1, deadline - time.time())))
         started = time.time()
         try:
             r = first
@@ -1327,7 +1327,11 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
             # here makes a Copilot session stop re-arming its watcher.
             pass
         if time.time() - started < 5:
-            time.sleep(min(backoff, 30))
+            delay = min(backoff, 30)
+            if deadline is not None:
+                delay = min(delay, max(0, deadline - time.time()))
+            if delay:
+                time.sleep(delay)
             backoff = min(backoff * 2, 30)
         else:
             backoff = 1
@@ -2615,9 +2619,61 @@ def cmd_agent_hook_cleanup(args):
         pass
 
 
+def _peek_details(event, cfg, node):
+    """Validate and open one relay event for `mesh peek`."""
+    if (not isinstance(event, dict) or event.get("event") != "message" or
+            not isinstance(event.get("id"), str) or
+            _relay_time(event.get("time")) is None or
+            not isinstance(event.get("message"), str)):
+        return None
+    frm, text, trusted, ctl = _open(event, cfg, node)
+    return frm, text, trusted, ctl
+
+
+def _print_peek_event(event, cfg, node, details=None):
+    details = details or _peek_details(event, cfg, node)
+    if details is None:
+        return False
+    frm, text, trusted, ctl = details
+    if trusted and frm:
+        note_peer(cfg, frm, "message")
+    relay_time = _relay_time(event["time"])
+    ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                       time.localtime(relay_time))
+    mark = "" if trusted else " [UNVERIFIED]"
+    if ctl:
+        mark += f" [control:{ctl.get('mw')}]"
+    print(f"[{ts}] {frm or event.get('title', '')}{mark}: {text}")
+    return True
+
+
 def cmd_peek(args):
     cfg = load_config()
     node = args.node or my_node(cfg, args.as_node)
+    from_node = getattr(args, "from_node", None)
+    timeout = getattr(args, "timeout", None)
+    if timeout is not None and timeout < 0:
+        sys.exit("error: --timeout must be zero or greater")
+
+    if getattr(args, "wait", False):
+        deadline = None if timeout is None else time.time() + timeout
+        tpc = topic(cfg, node)
+        since = str(int(time.time()))
+        for event in _stream_events(cfg, tpc, since, deadline):
+            details = _peek_details(event, cfg, node)
+            if details is None:
+                continue
+            frm, _, trusted, _ = details
+            # A plaintext title is sender-controlled. A sender filter must
+            # only match the authenticated inner route.
+            if from_node and (not trusted or frm != from_node):
+                continue
+            _print_peek_event(event, cfg, node, details)
+            return
+        suffix = "" if timeout is None else f" after {timeout}s"
+        print(f"MESH_PEEK_TIMEOUT node={node}{suffix}", file=sys.stderr)
+        raise SystemExit(124)
+
     url = f"{cfg['server']}/{topic(cfg, node)}/json?poll=1&since={args.since}"
     try:
         with http(url, timeout=15) as r:
@@ -2635,25 +2691,17 @@ def cmd_peek(args):
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
                 TypeError):
             continue
-        if (not isinstance(event, dict) or event.get("event") != "message" or
-                not isinstance(event.get("id"), str) or
-                _relay_time(event.get("time")) is None or
-                not isinstance(event.get("message"), str)):
+        details = _peek_details(event, cfg, node)
+        if details is None:
             continue
-        msgs.append(event)
+        frm, _, trusted, _ = details
+        if from_node and (not trusted or frm != from_node):
+            continue
+        msgs.append((event, details))
     if not msgs:
         print(f"(no messages for '{node}' since {args.since})")
-    for m in msgs:
-        relay_time = _relay_time(m["time"])
-        ts = time.strftime("%Y-%m-%d %H:%M:%S",
-                           time.localtime(relay_time))
-        frm, text, trusted, ctl = _open(m, cfg, node)
-        if trusted and frm:
-            note_peer(cfg, frm, "message")
-        mark = "" if trusted else " [UNVERIFIED]"
-        if ctl:
-            mark += f" [control:{ctl.get('mw')}]"
-        print(f"[{ts}] {frm or m.get('title', '')}{mark}: {text}")
+    for event, details in msgs:
+        _print_peek_event(event, cfg, node, details)
 
 
 def cmd_status(args):
@@ -2720,12 +2768,17 @@ def cmd_ping(args):
     sys.exit(1)
 
 
-def _await_result(cfg, me, task_id, timeout, first=None):
+def _await_result(cfg, me, task_id, timeout, first=None,
+                  terminal_only=False, since=None):
     """Stream own inbox for a result envelope matching task_id, using an
     ephemeral cursor (does not disturb `mesh watch`'s cursor)."""
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-    deadline = time.time() + timeout
-    for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5), deadline,
+    deadline = None if timeout is None else time.time() + timeout
+    stream_since = since if since is not None else str(int(time.time()) - 5)
+    expected = load_tasks(cfg).get(task_id) or {}
+    expected_peer = (expected.get("peer")
+                     if expected.get("direction") == "outbound" else None)
+    for ev in _stream_events(cfg, tpc, stream_since, deadline,
                              first=first):
         frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
         if not trusted or ctl:
@@ -2741,9 +2794,12 @@ def _await_result(cfg, me, task_id, timeout, first=None):
             continue
         note_peer(cfg, frm, "message")
         if tid == task_id and kind == "result":
+            if expected_peer and (efrm or frm) != expected_peer:
+                continue
             save_task(cfg, tid, contextId=ctx, state=state,
                       peer=efrm or frm, direction="outbound", result=text)
-            return env
+            if not terminal_only or state in TERMINAL_STATES:
+                return env
     return None
 
 
@@ -2824,6 +2880,49 @@ def cmd_reply(args):
 def cmd_tasks(args):
     cfg = load_config()
     tasks = load_tasks(cfg)
+    wait_task = getattr(args, "wait_task", None)
+    if wait_task:
+        if args.action != "list" or args.task_id is not None:
+            sys.exit("error: --wait cannot be combined with list/get")
+        task = tasks.get(wait_task)
+        if not task:
+            sys.exit(f"error: unknown task {wait_task}")
+        timeout = getattr(args, "timeout", None)
+        if timeout is not None and timeout < 0:
+            sys.exit("error: --timeout must be zero or greater")
+        if task.get("state") not in TERMINAL_STATES:
+            if task.get("direction") == "outbound":
+                me = my_node(cfg, None)
+                submitted = _relay_time(task.get("updated"))
+                if submitted is None:
+                    submitted = max(0, int(time.time()) - 5)
+                _await_result(cfg, me, wait_task, timeout,
+                              terminal_only=True,
+                              since=str(max(0, submitted - 1)))
+            else:
+                deadline = (None if timeout is None
+                            else time.monotonic() + timeout)
+                while task.get("state") not in TERMINAL_STATES:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    delay = (0.2 if deadline is None else
+                             min(0.2, max(0, deadline - time.monotonic())))
+                    time.sleep(delay)
+                    task = load_tasks(cfg).get(wait_task) or task
+            task = load_tasks(cfg).get(wait_task) or task
+        if task.get("state") not in TERMINAL_STATES:
+            suffix = "" if timeout is None else f" after {timeout}s"
+            print(f"MESH_TASK_TIMEOUT task={wait_task}{suffix}",
+                  file=sys.stderr)
+            raise SystemExit(124)
+        state = task.get("state")
+        print(f"MESH_TASK_RESULT from={task.get('peer', '?')} "
+              f"task={wait_task} state={state}:")
+        if task.get("result"):
+            print(task["result"])
+        if state != "completed":
+            raise SystemExit(1)
+        return
     if args.action == "get":
         t = tasks.get(args.task_id)
         if not t:
@@ -3527,6 +3626,12 @@ def main():
                    help="node whose inbox to view (default: mine)")
     p.add_argument("--since", default="all",
                    help="ntfy since spec (default: all)")
+    p.add_argument("--wait", action="store_true",
+                   help="block until the next matching arrival")
+    p.add_argument("--from", dest="from_node", default=None,
+                   help="only show an arrival from this verified node")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="maximum seconds to wait (default: forever)")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_peek)
 
@@ -3563,6 +3668,10 @@ def main():
     p.add_argument("action", nargs="?", default="list",
                    choices=["list", "get"])
     p.add_argument("task_id", nargs="?", default=None)
+    p.add_argument("--wait", dest="wait_task", metavar="TASK_ID",
+                   help="block until TASK_ID reaches a terminal state")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="maximum seconds to wait (default: forever)")
     p.set_defaults(fn=cmd_tasks)
 
     p = sub.add_parser("card", help="show (or set) a node's A2A agent card")
