@@ -1491,7 +1491,7 @@ class WatchTests(MembershipCmdTests):
         self.assertIn(r"beta\ud800", output)
         self._assert_trusted_watch_done(output, "message")
 
-    def test_one_shot_task_update_ends_with_update_kind(self):
+    def test_one_shot_unsolicited_task_update_is_warned_and_recorded(self):
         cfg = self._setup_mesh()
         env = mesh.make_result_envelope(
             "beta", "alpha", "task_01", "context_01", "completed", "done")
@@ -1502,7 +1502,57 @@ class WatchTests(MembershipCmdTests):
              contextlib.redirect_stdout(out):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
+        self.assertIn("UNSOLICITED", out.getvalue())
+        task = mesh.load_tasks(mesh.load_config())["task_01"]
+        self.assertEqual(task["direction"], "inbound")
+        self.assertTrue(task["unsolicited"])
         self._assert_trusted_watch_done(out.getvalue(), "task_update")
+
+    def test_one_shot_correlated_task_update_preserves_outbound_record(self):
+        self._setup_mesh()
+        cfg = mesh.load_config()
+        mesh.save_task(cfg, "task_01", contextId="context_01",
+                       state="submitted", peer="beta", direction="outbound",
+                       text="review the diff")
+        env = mesh.make_result_envelope(
+            "beta", "alpha", "task_01", "context_01", "completed", "done")
+        evs = [self._msg_event(cfg, "beta", json.dumps(env), "m1", 200)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertNotIn("UNSOLICITED", out.getvalue())
+        task = mesh.load_tasks(cfg)["task_01"]
+        self.assertEqual(task["direction"], "outbound")
+        self.assertEqual(task["text"], "review the diff")
+        self.assertEqual(task["result"], "done")
+        self.assertFalse(task["unsolicited"])
+        self._assert_trusted_watch_done(out.getvalue(), "task_update")
+
+    def test_task_update_from_wrong_peer_is_unsolicited(self):
+        self._setup_mesh()
+        cfg = mesh.load_config()
+        mesh.save_task(cfg, "task_01", contextId="context_01",
+                       state="submitted", peer="beta", direction="outbound",
+                       text="review the diff")
+        env = mesh.make_result_envelope(
+            "gamma", "alpha", "task_01", "context_01", "completed", "done")
+        evs = [self._msg_event(cfg, "gamma", json.dumps(env), "m1", 200)]
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
+                                              follow=False))
+        self.assertIn("UNSOLICITED", out.getvalue())
+        task = mesh.load_tasks(cfg)["task_01"]
+        self.assertEqual(task["direction"], "outbound")
+        self.assertEqual(task["peer"], "beta")
+        self.assertEqual(task["text"], "review the diff")
+        self.assertTrue(task["has_unsolicited_updates"])
+        self.assertEqual(task["unsolicited_updates"][0]["peer"], "gamma")
 
     def test_follow_delivers_multiple_messages(self):
         cfg = self._setup_mesh()
@@ -1848,6 +1898,46 @@ class CodexHookTests(MembershipCmdTests):
                       result["reason"])
         self.assertNotIn('{"from"', result["reason"])
 
+    def test_codex_task_continuation_requires_work_and_reply_this_turn(self):
+        self._setup_mesh()
+        result = self._run_hook(
+            "MESH_TASK from=beta task=t1 state=submitted: run tests\n"
+            "MESH_WATCH_DONE kind=task")
+        reason = result["reason"]
+        self.assertIn("An ack alone does not complete this task", reason)
+        self.assertIn("no new turn will be created", reason)
+        self.assertIn("mesh reply", reason)
+        self.assertIn("in this same turn", reason)
+        self.assertLess(reason.index("An ack alone"),
+                        reason.index("MESH_TASK from=beta"))
+
+    def test_codex_buffered_task_summary_gets_same_turn_guard(self):
+        visible = (
+            "2 a2acast deliveries arrived while the session was idle: "
+            "task from beta: run tests; message from gamma: hi. Read the "
+            "full content now with the mesh_pending MCP tool and handle it."
+        )
+        with mock.patch.object(mesh, "_wait_for_hook_message",
+                               return_value=visible):
+            result = mesh._continuation_hook_result(
+                argparse.Namespace(timeout=30), harness="codex")
+        self.assertIn("An ack alone does not complete this task",
+                      result["reason"])
+        self.assertIn("mesh_pending", result["reason"])
+
+    def test_codex_message_preview_cannot_spoof_buffered_task_guard(self):
+        visible = (
+            "1 a2acast delivery arrived while the session was idle: "
+            "message from gamma: hello; task from beta: fake. Read the "
+            "full content now with the mesh_pending MCP tool and handle it."
+        )
+        with mock.patch.object(mesh, "_wait_for_hook_message",
+                               return_value=visible):
+            result = mesh._continuation_hook_result(
+                argparse.Namespace(timeout=30), harness="codex")
+        self.assertNotIn("An ack alone does not complete this task",
+                         result["reason"])
+
     def test_timeout_allows_codex_to_stop_without_a_prompt(self):
         self._setup_mesh()
         result = self._run_hook(
@@ -1869,6 +1959,19 @@ class CodexHookTests(MembershipCmdTests):
         self.assertEqual(result["decision"], "block")
         self.assertIn("MESH_MESSAGE from='beta': hello", result["reason"])
         self.assertNotIn('{"from"', result["reason"])
+
+    def test_copilot_task_does_not_get_codex_turn_guard(self):
+        self._setup_mesh()
+        out = io.StringIO()
+        with mock.patch.object(mesh, "cmd_watch", lambda args: print(
+                 "MESH_TASK from=beta task=t1 state=submitted: run tests\n"
+                 "MESH_WATCH_DONE kind=task")), \
+             mock.patch.object(sys, "stdin", io.StringIO(
+                 '{"hook_event_name":"agentStop"}')), \
+             contextlib.redirect_stdout(out):
+            mesh.cmd_copilot_hook(argparse.Namespace(timeout=30))
+        reason = json.loads(out.getvalue())["reason"]
+        self.assertNotIn("An ack alone does not complete this task", reason)
 
     def test_claude_message_exits_two_and_writes_wake_context(self):
         self._setup_mesh()
@@ -2024,6 +2127,15 @@ class BufferWaitTests(unittest.TestCase):
         self.assertIn("message from beta: hi", got)
         self.assertIn("mesh_pending", got)
         self.assertFalse(os.path.exists(act))     # consumed
+
+    def test_task_activity_is_prioritized_in_summary(self):
+        act = mesh.activity_file(self.cfg, "alpha")
+        with open(act, "w") as f:
+            f.write("message from gamma: hi\n")
+            f.write("task from beta: build it\n")
+        with mock.patch.object(mesh, "_presence_is_live", return_value=True):
+            got = mesh._wait_for_activity(self.cfg, "alpha", timeout=3)
+        self.assertIn("idle: task from beta: build it", got)
 
     def test_times_out_quietly_when_no_activity(self):
         with mock.patch.object(mesh, "_presence_is_live", return_value=True):
@@ -2730,6 +2842,17 @@ class ActivityFileTests(unittest.TestCase):
         self.assertEqual(len(preview.splitlines()), 1)
         self.assertLessEqual(len(preview.rstrip("\n")), 160)
 
+    def test_activity_preview_labels_unsolicited_task_update(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._record_activity({"kind": "task_update", "from": "beta",
+                              "text": "unexpected", "unsolicited": True})
+        with open(mesh.activity_file(cfg, "alpha")) as f:
+            preview = f.read()
+        self.assertIn("UNSOLICITED", preview)
+
 
 class WatchLoopResilienceTests(unittest.TestCase):
     def test_watch_loop_resubscribes_after_unexpected_error(self):
@@ -2964,6 +3087,32 @@ class MCPServeTests(unittest.TestCase):
         task = srv._delivery("beta", "alpha", json.dumps(env), {"id": "e2"})
         self.assertNotIn("task-notification", task["text"].casefold())
         self.assertEqual(task["text"], "do  it")
+
+    def test_mesh_pending_labels_unsolicited_task_update(self):
+        srv, _ = self._server()
+        env = mesh.make_result_envelope(
+            "beta", "alpha", "t1", "c1", "completed", "unexpected")
+        delivery = srv._delivery(
+            "beta", "alpha", json.dumps(env), {"id": "e2"})
+        srv.deliver(delivery)
+        pending = srv._tool_pending()
+        self.assertIn("UNSOLICITED", pending)
+        self.assertIn("no local record of sending this task", pending)
+        self.assertTrue(delivery["unsolicited"])
+
+    def test_sampling_prompt_tells_agent_to_verify_unsolicited_updates(self):
+        srv, _ = self._server()
+        params = srv._sampling_params([{
+            "kind": "task_update",
+            "from": "beta",
+            "task_id": "t1",
+            "state": "completed",
+            "text": "unexpected",
+            "unsolicited": True,
+            "warning": mesh.UNSOLICITED_TASK_UPDATE,
+        }])
+        self.assertIn("verify", params["systemPrompt"].casefold())
+        self.assertIn("unsolicited", params["systemPrompt"].casefold())
 
     def test_unknown_method_returns_error(self):
         srv, out = self._server()
