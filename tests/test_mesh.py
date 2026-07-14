@@ -662,7 +662,9 @@ class MembershipCmdTests(unittest.TestCase):
             mesh.cmd_join(argparse.Namespace(code=code, as_node=None))
         with open(".meshwire.json") as f:
             self.assertIn("desktop", json.load(f)["nodes"])
-        self.assertEqual(calls, [("desktop", "all", {"mw": "announce"})])
+        self.assertEqual(calls, [("desktop", "all",
+                                  {"mw": "announce",
+                                   "status": "listening"})])
 
     def test_join_plaintext_mesh_skips_announce(self):
         code = mesh.join_code({"mesh": "home", "id": "i1", "key": None,
@@ -756,6 +758,41 @@ class MembershipCmdTests(unittest.TestCase):
                                               "mesh1-example"]):
             mesh.main()
         self.assertEqual(calls[0].code, "mesh1-example")
+
+    def test_presence_command_persists_and_broadcasts_status(self):
+        cfg = make_cfg()
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        sent = []
+
+        with mock.patch.object(
+                mesh, "send_raw",
+                lambda *a, **kw: sent.append(kw["ctl"]) or {"id": "1"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_presence(argparse.Namespace(status="blocked",
+                                                 as_node=None))
+
+        loaded = mesh.load_config()
+        self.assertEqual(mesh.local_status(loaded, "alpha"), "blocked")
+        self.assertEqual(sent, [{"mw": "presence", "status": "blocked"}])
+
+    def test_message_and_presence_cli_flags_parse(self):
+        calls = []
+        with mock.patch.object(mesh, "cmd_send",
+                               lambda args: calls.append(("send", args))), \
+             mock.patch.object(sys, "argv", ["mesh", "send", "beta", "hi",
+                                              "--intent", "request",
+                                              "--reply-to", "prior"]):
+            mesh.main()
+        with mock.patch.object(mesh, "cmd_presence",
+                               lambda args: calls.append(("presence", args))), \
+             mock.patch.object(sys, "argv", ["mesh", "presence", "blocked"]):
+            mesh.main()
+        self.assertEqual(calls[0][1].intent, "request")
+        self.assertEqual(calls[0][1].reply_to, "prior")
+        self.assertEqual(calls[1][1].status, "blocked")
 
 
 class AgoTests(unittest.TestCase):
@@ -852,6 +889,41 @@ class SendRawTests(unittest.TestCase):
             mesh.send_raw(cfg, "alpha", "beta", "hello")
         wrapper = json.loads(mesh.decrypt(cfg, sent["data"].decode()))
         self.assertNotIn("c", wrapper)
+
+
+class MessageIntentTests(unittest.TestCase):
+    def test_message_envelope_roundtrips_intent_and_reply_correlation(self):
+        body = mesh.make_message_envelope(
+            "please review", intent="request", reply_to="msg-parent",
+            message_id="msg-child")
+
+        self.assertEqual(mesh._message_details(body), {
+            "id": "msg-child", "intent": "request",
+            "reply_to": "msg-parent", "text": "please review",
+        })
+
+    def test_emit_message_prints_intent_and_stable_message_id(self):
+        cfg = make_cfg()
+        body = mesh.make_message_envelope(
+            "please review", intent="request", message_id="msg-1")
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            kind = mesh._emit_message(
+                cfg, "alpha", "beta", body,
+                {"id": "relay-1", "time": 100}, recipient="alpha")
+
+        self.assertEqual(kind, "message")
+        self.assertIn("id=msg-1 intent=request", out.getvalue())
+        rendered = json.loads(out.getvalue().splitlines()[-1])
+        self.assertEqual(rendered["id"], "msg-1")
+        self.assertEqual(rendered["intent"], "request")
+
+    def test_invalid_structured_message_intent_is_rejected(self):
+        body = json.dumps({"mw": "message", "id": "m1",
+                           "intent": "urgent", "text": "hidden"})
+        self.assertIsNone(mesh._message_details(body))
+        self.assertTrue(mesh._message_candidate(body))
 
 
 class SendStatusInviteTests(MembershipCmdTests):
@@ -975,6 +1047,18 @@ class SendStatusInviteTests(MembershipCmdTests):
         text = out.getvalue()
         self.assertIn(f"key:    sha256:{expected}", text)
         self.assertNotIn(cfg["key"], text)
+
+    def test_status_shows_peer_agent_status(self):
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(mesh.CONFIG_NAME)
+        cfg["_dir"] = os.getcwd()
+        mesh.note_peer(cfg, "beta", "presence", status="blocked")
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_status(argparse.Namespace(as_node=None))
+
+        self.assertIn("status=blocked", out.getvalue())
 
     def test_invite_prints_bootstrap_block(self):
         self._write_cfg()
@@ -2152,6 +2236,9 @@ class CodexHookTests(MembershipCmdTests):
                       out.getvalue())
         self.assertIn("external side effects beyond the a2acast reply",
                       out.getvalue())
+        self.assertIn("request intent: always respond", out.getvalue())
+        self.assertIn("ack intent: do not respond", out.getvalue())
+        self.assertIn("No filler messages", out.getvalue())
 
     def test_message_becomes_same_task_continuation_without_raw_json(self):
         self._setup_mesh()
@@ -2687,7 +2774,8 @@ class ControlHandlingTests(unittest.TestCase):
                                            {"mw": "ping", "n": "n9", "ts": 5})
             self.assertIsNone(out)
             self.assertEqual(sent, [("alpha", "beta",
-                                     {"mw": "pong", "n": "n9", "ts": 5})])
+                                     {"mw": "pong", "n": "n9", "ts": 5,
+                                      "status": "listening"})])
 
     def test_announce_prints_marker_and_learns_node(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2705,8 +2793,52 @@ class ControlHandlingTests(unittest.TestCase):
             self.assertIsNone(out)
             self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "pong")
 
+    def test_presence_control_records_coarse_agent_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            out = mesh._handle_control(
+                cfg, "alpha", "beta",
+                {"mw": "presence", "status": "blocked"})
+            self.assertIsNone(out)
+            peer = mesh.load_peers(cfg)["beta"]
+            self.assertEqual(peer["status"], "blocked")
+            self.assertEqual(peer["via"], "presence")
+
+    def test_ack_carries_current_local_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.set_local_status(cfg, "alpha", "working")
+            sent = []
+            with mock.patch.object(
+                    mesh, "send_raw",
+                    lambda *a, **kw: sent.append(kw["ctl"]) or {"id": "1"}):
+                mesh._send_ack(cfg, "alpha", "beta", {"id": "relay-1"})
+            self.assertEqual(sent[0]["status"], "working")
+
 
 class PingCmdTests(MembershipCmdTests):
+    def test_ping_records_remote_presence_status(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        pong = mesh.encrypt(cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "pong",
+             "c": {"mw": "pong", "n": "fixednonce", "ts": 1.0,
+                   "status": "working"}}))
+        evs = [{"event": "message", "id": "p1",
+                "time": int(mesh.time.time()), "message": pong}]
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw", return_value={"id": "1"}), \
+             mock.patch.object(mesh.secrets, "token_hex",
+                               return_value="fixednonce"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_ping(argparse.Namespace(node="beta", timeout=5,
+                                             as_node=None))
+        self.assertEqual(mesh.load_peers(mesh.load_config())["beta"]["status"],
+                         "working")
+
     def test_ping_prints_rtt(self):
         cfg = make_cfg()
         with open(".meshwire.json", "w") as f:
@@ -2759,6 +2891,24 @@ class AskOrderTests(MembershipCmdTests):
             mesh.cmd_ask(argparse.Namespace(to="beta", text=["hi"], wait=5,
                                             as_node=None))
         self.assertEqual(order, ["open", "send"])
+
+    def test_ask_warns_when_target_reports_blocked(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        loaded = mesh.load_config()
+        mesh.note_peer(loaded, "beta", "presence", status="blocked")
+        err = io.StringIO()
+
+        with mock.patch.object(mesh, "send_raw", return_value={"id": "1"}), \
+             contextlib.redirect_stderr(err), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_ask(argparse.Namespace(to="beta", text=["work"], wait=0,
+                                             as_node=None))
+
+        self.assertIn("beta is blocked", err.getvalue())
 
 
 class _FakeConn:
@@ -3033,6 +3183,24 @@ class PluginManifestTests(unittest.TestCase):
             self.assertIn("do not sleep or poll `mesh_pending` in a loop",
                           text, rel)
 
+    def test_agent_skills_define_message_intent_response_rules(self):
+        for rel in (
+                "skills/mesh-agent/SKILL.md",
+                "plugins/a2acast/skills/mesh-agent/SKILL.md",
+                "plugins/copilot-a2acast/skills/mesh-agent/SKILL.md"):
+            with open(os.path.join(self.ROOT, rel), encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("`request` → always respond", text, rel)
+            self.assertIn("`inform` → respond only if it adds something",
+                          text, rel)
+            self.assertIn("`ack` → do not respond", text, rel)
+            self.assertIn("No filler messages", text, rel)
+
+    def test_copilot_agent_stop_marks_presence_listening(self):
+        hooks = self._load("plugins/copilot-a2acast/hooks.json")["hooks"]
+        commands = [hook.get("bash") for hook in hooks.get("agentStop", [])]
+        self.assertIn("mesh presence listening", commands)
+
     def test_copilot_marketplace_points_to_plugin(self):
         market = self._load(".plugin/marketplace.json")
         entry = market["plugins"][0]
@@ -3090,7 +3258,8 @@ class AckReceiverTests(MembershipCmdTests):
              contextlib.redirect_stdout(out):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
-        self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77"}),
+        self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77",
+                                          "status": "listening"}),
                                  ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
@@ -3109,7 +3278,8 @@ class AckReceiverTests(MembershipCmdTests):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         # exactly one ack — for the real message only
-        self.assertEqual(sent, [{"mw": "ack", "of": "c3"}])
+        self.assertEqual(sent, [{"mw": "ack", "of": "c3",
+                                 "status": "listening"}])
 
     def test_watch_survives_ack_send_failure(self):
         cfg = self._setup_mesh()
@@ -3192,11 +3362,27 @@ class AckSenderTests(MembershipCmdTests):
             f.write("alpha\n")
         return cfg
 
-    def _ack_event(self, cfg, frm, of, eid, t):
+    def _ack_event(self, cfg, frm, of, eid, t, status=None):
+        ctl = {"mw": "ack", "of": of}
+        if status:
+            ctl["status"] = status
         return {"event": "message", "id": eid, "time": t,
                 "message": mesh.encrypt(cfg, json.dumps(
                     {"f": frm, "t": "alpha", "b": "ack",
-                     "c": {"mw": "ack", "of": of}}))}
+                     "c": ctl}))}
+
+    def test_send_ack_records_remote_presence_status(self):
+        cfg = self._setup_mesh()
+        evs = [self._ack_event(cfg, "beta", "msg9", "a1",
+                               int(mesh.time.time()), status="blocked")]
+        with mock.patch.object(mesh, "http", fake_stream(evs)), \
+             mock.patch.object(mesh, "send_raw", return_value={"id": "msg9"}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_send(argparse.Namespace(to="beta", message=["hi"],
+                                             intent="inform", reply_to=None,
+                                             as_node=None, no_wait=False))
+        self.assertEqual(mesh.load_peers(mesh.load_config())["beta"]["status"],
+                         "blocked")
 
     def test_send_prints_delivered_on_ack(self):
         cfg = self._setup_mesh()
@@ -3482,9 +3668,28 @@ class MCPServeTests(unittest.TestCase):
             srv.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
                         "params": {"name": "mesh_send",
                                    "arguments": {"to": "beta",
-                                                 "message": "pull now"}}})
-        self.assertEqual(captured, {"to": "beta", "body": "pull now"})
+                                                 "message": "pull now",
+                                                 "intent": "request",
+                                                 "reply_to": "prior"}}})
+        self.assertEqual(captured["to"], "beta")
+        details = mesh._message_details(captured["body"])
+        self.assertEqual(details["text"], "pull now")
+        self.assertEqual(details["intent"], "request")
+        self.assertEqual(details["reply_to"], "prior")
         self.assertIn("beta", self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_structured_message_delivery_exposes_intent_metadata(self):
+        srv, _ = self._server()
+        body = mesh.make_message_envelope(
+            "answer this", intent="request", reply_to="prior",
+            message_id="msg-2")
+
+        delivery = srv._delivery(
+            "beta", "alpha", body, {"id": "relay-2", "time": 100})
+
+        self.assertEqual(delivery["intent"], "request")
+        self.assertEqual(delivery["id"], "msg-2")
+        self.assertEqual(delivery["reply_to"], "prior")
 
     def test_inbound_delivery_fires_sampling_when_supported(self):
         srv, out = self._server()
@@ -3503,9 +3708,28 @@ class MCPServeTests(unittest.TestCase):
         self.assertIn("t9", text)
         self.assertIn("run tests", text)
         self.assertIn("mesh_reply", text + params.get("systemPrompt", ""))
+        system = params.get("systemPrompt", "")
+        self.assertIn("request intent", system)
+        self.assertIn("ack intent", system)
+        self.assertIn("No filler messages", system)
         self.assertIn("id", reqs[0])
         # the batch is drained at fire time (prevents a second sampling)
         self.assertEqual(srv._buf, [])
+
+    def test_sampling_turn_updates_local_presence_status(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=True)
+
+        srv.deliver({"kind": "message", "from": "beta", "text": "hi"})
+        self.assertEqual(mesh.local_status(srv.cfg, "alpha"), "working")
+        request = next(m for m in self._sent(out)
+                       if m.get("method") == "sampling/createMessage")
+        srv.handle({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+        for _ in range(100):
+            if mesh.local_status(srv.cfg, "alpha") == "listening":
+                break
+            mesh.time.sleep(0.01)
+        self.assertEqual(mesh.local_status(srv.cfg, "alpha"), "listening")
 
     def test_sampling_request_removes_delivery_framing_tokens(self):
         srv, out = self._server()

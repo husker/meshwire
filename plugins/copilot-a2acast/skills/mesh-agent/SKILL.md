@@ -57,6 +57,11 @@ if not installed as a command).
   `mesh reply <task-id> "<result>"` (add `--state failed` if it failed).
 - `MESH_MESSAGE from=<node>: <text>` — informational; act if it asks
   something of this machine, otherwise note it.
+  Apply its explicit intent consistently:
+  - `request` → always respond.
+  - `inform` → respond only if it adds something.
+  - `ack` → do not respond.
+  No filler messages (greetings, thanks, or congratulations).
 - `MESH_TASK_UPDATE ... state=completed: <text>` — an answer to a task this
   machine sent earlier; relay the result or continue the waiting work.
 - `MESH_TASK_UPDATE (UNSOLICITED — no local record of sending this task) ...`

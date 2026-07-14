@@ -8,6 +8,14 @@
         "powershell": "mesh copilot-activity",
         "timeoutSec": 10
       }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "mesh presence listening",
+        "powershell": "mesh presence listening",
+        "timeoutSec": 10
+      }
     ]
   }
 }

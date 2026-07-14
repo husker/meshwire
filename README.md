@@ -233,7 +233,9 @@ mesh join <code> [--as NODE]   join from a code, announce, and (in a terminal) k
 mesh invite                    print the join code + paste-able bootstrap block
 mesh rotate-key [mesh1-code]   rotate the key/topics, or apply a peer rotation
 mesh iam <node>                set/change this machine's identity
-mesh send <node|all> <msg...>  message a node (or broadcast)
+mesh send <node|all> <msg...> [--intent request|inform|ack] [--reply-to ID]
+                               message a node (or broadcast) with reply intent
+mesh presence listening|working|blocked   set and broadcast agent status
 mesh watch --follow            stream messages forever (preferred; background task)
 mesh watch [--timeout N]       one-shot: block until one message, print, exit
 mesh ping <node> [--timeout N] liveness + round-trip time (answered by watchers)
@@ -258,6 +260,20 @@ mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autono
 The blocking commands use shell-friendly exit codes: `tasks --wait` exits
 `0` for `completed`, `1` for any other terminal state, and `124` on timeout;
 `peek --wait` exits `0` on an arrival and `124` on timeout.
+
+New messages carry a stable message id and default to `inform` when intent is
+missing (including messages from older clients). Use `request` when a reply is
+required, `inform` for FYI traffic, and `ack` to close a loop; `--reply-to`
+correlates a response to the displayed message id. Agent integrations follow a
+fixed rule: always answer `request`, answer `inform` only when it adds value,
+never answer `ack`, and do not send filler greetings or thanks.
+
+Presence controls carry `listening`, `working`, or `blocked` through normal
+announce/ping/pong/ack traffic and explicit `mesh presence` beacons. Session
+and stop hooks maintain `working`/`listening`; approval integrations can run
+`mesh presence blocked` while waiting for permission. `mesh status` and
+`mesh_list_agents` show the latest reported state, and `mesh ask` warns before
+sending to a blocked node.
 
 To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
 Prefer this over the `A2ACAST_NODE` env var, which is not reliably inherited
