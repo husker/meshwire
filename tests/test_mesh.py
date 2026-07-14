@@ -40,8 +40,35 @@ class CryptoTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = make_cfg()
         wire = mesh.encrypt(cfg, "hello mesh")
-        self.assertTrue(wire.startswith("mw1:"))
+        self.assertTrue(wire.startswith("mw2:"))
         self.assertEqual(mesh.decrypt(cfg, wire), "hello mesh")
+
+    def test_v2_ciphertext_is_bound_to_mesh_topic_and_freshness(self):
+        cfg = make_cfg()
+        sent_at = 1_000
+        beta_topic = mesh.topic(cfg, "beta")
+        wire = mesh.encrypt(cfg, "secret", to="beta", timestamp=sent_at)
+
+        self.assertEqual(mesh.decrypt(cfg, wire, expected_topic=beta_topic,
+                                      now=sent_at + 1), "secret")
+        self.assertIsNone(mesh.decrypt(cfg, wire,
+                                       expected_topic=mesh.topic(cfg, "alpha"),
+                                       now=sent_at + 1))
+        self.assertIsNone(mesh.decrypt(
+            cfg, wire, expected_topic=beta_topic,
+            now=sent_at + mesh.WIRE_MAX_AGE + 1))
+
+    def test_legacy_v1_ciphertext_remains_readable_during_upgrade(self):
+        cfg = make_cfg()
+        nonce = b"n" * 16
+        plaintext = b"legacy"
+        k_enc, k_mac = mesh._keys(cfg)
+        ct = mesh._keystream_xor(k_enc, nonce, plaintext)
+        tag = mesh.hmac.new(k_mac, nonce + ct,
+                            mesh.hashlib.sha256).digest()[:16]
+        wire = "mw1:" + base64.b64encode(nonce + ct + tag).decode("ascii")
+
+        self.assertEqual(mesh.decrypt(cfg, wire), "legacy")
 
     def test_wrong_key_fails_closed(self):
         wire = mesh.encrypt(make_cfg(), "secret")
@@ -692,6 +719,44 @@ class MembershipCmdTests(unittest.TestCase):
             self.assertIn("pc", json.load(f)["nodes"])
         self.assertIn("announce failed", buf.getvalue())
 
+    def test_rotate_key_changes_capability_topics_and_prints_peer_command(self):
+        cfg = make_cfg()
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump(cfg, f)
+        old_id, old_key = cfg["id"], cfg["key"]
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_rotate_key(argparse.Namespace(code=None))
+
+        rotated = mesh.load_config()
+        self.assertNotEqual(rotated["id"], old_id)
+        self.assertNotEqual(rotated["key"], old_key)
+        self.assertIn("mesh rotate-key mesh1-", out.getvalue())
+
+    def test_rotate_key_applies_same_mesh_code_on_peer(self):
+        cfg = make_cfg()
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump(cfg, f)
+        replacement = dict(cfg, id="replacement", key="ab" * 32)
+        code = mesh.join_code(replacement)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_rotate_key(argparse.Namespace(code=code))
+
+        applied = mesh.load_config()
+        self.assertEqual(applied["id"], "replacement")
+        self.assertEqual(applied["key"], "ab" * 32)
+
+    def test_rotate_key_cli_parses_optional_code(self):
+        calls = []
+        with mock.patch.object(mesh, "cmd_rotate_key",
+                               lambda args: calls.append(args)), \
+             mock.patch.object(sys, "argv", ["mesh", "rotate-key",
+                                              "mesh1-example"]):
+            mesh.main()
+        self.assertEqual(calls[0].code, "mesh1-example")
+
 
 class AgoTests(unittest.TestCase):
     def test_buckets(self):
@@ -898,6 +963,18 @@ class SendStatusInviteTests(MembershipCmdTests):
         self.assertIn("beta", text)
         self.assertIn("ago", text)          # last-seen rendered
         self.assertIn("this machine", text)  # self marked
+
+    def test_status_shows_short_key_fingerprint_without_key(self):
+        cfg = self._write_cfg()
+        expected = mesh.hashlib.sha256(bytes.fromhex(cfg["key"])).hexdigest()[:12]
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_status(argparse.Namespace(as_node=None))
+
+        text = out.getvalue()
+        self.assertIn(f"key:    sha256:{expected}", text)
+        self.assertNotIn(cfg["key"], text)
 
     def test_invite_prints_bootstrap_block(self):
         self._write_cfg()
