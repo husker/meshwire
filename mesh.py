@@ -27,8 +27,11 @@ import io
 import json
 import math
 import os
+import plistlib
 import re
 import secrets
+import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -63,6 +66,10 @@ WORKER_STATES = frozenset({
     "idle", "busy", "cooldown", "unavailable",
 })
 WORKER_BACKENDS = frozenset({"codex", "copilot", "goose"})
+WORKER_LOG_MAX_BYTES = 5 * 1024 * 1024
+WORKER_LOG_BACKUPS = 4
+WORKER_LOG_BACKUPS_MAX = 100
+LAUNCH_AGENT_PREFIX = "com.a2acast.worker."
 
 
 def activity_file(cfg, node):
@@ -7305,6 +7312,764 @@ def _stop_supervisor(cfg, node):
             os.close(pid_fd)
 
 
+def _launch_agent_label(backend):
+    if not isinstance(backend, str) or backend not in WORKER_BACKENDS:
+        raise ValueError("worker backend is invalid")
+    return LAUNCH_AGENT_PREFIX + backend
+
+
+def _absolute_managed_path(path, label):
+    if (not isinstance(path, str) or not path
+            or _worker_metadata_has_controls(path)):
+        raise ValueError(f"{label} path is invalid")
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        raise ValueError(f"{label} path must be absolute")
+    normalized = os.path.abspath(expanded)
+    if normalized != expanded or len(normalized) > WORKER_PATH_MAX:
+        raise ValueError(f"{label} path is not normalized")
+    return normalized
+
+
+def _validate_managed_file_stat(observed, label):
+    if not stat.S_ISREG(observed.st_mode):
+        raise OSError(f"{label} is not a regular file")
+    device = getattr(observed, "st_dev", 0)
+    inode = getattr(observed, "st_ino", 0)
+    links = getattr(observed, "st_nlink", 0)
+    if (not isinstance(device, int) or not isinstance(inode, int)
+            or device == 0 or inode == 0):
+        raise WorkerEvidenceUnsupported(
+            f"{label} has no stable file identity")
+    if not isinstance(links, int) or links != 1:
+        raise OSError(f"{label} must have exactly one hard link")
+    if os.name == "posix":
+        if (not hasattr(os, "geteuid")
+                or observed.st_uid != os.geteuid()):
+            raise OSError(f"{label} is not owned by the current user")
+        if stat.S_IMODE(observed.st_mode) != 0o600:
+            raise OSError(f"{label} is not private mode 0600")
+    return device, inode
+
+
+def _inspect_managed_file(path, label, missing_ok=True):
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+    identity = _validate_managed_file_stat(observed, label)
+    return identity
+
+
+def _validate_managed_directory(path, label):
+    observed = os.lstat(path)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise OSError(f"{label} is not a real directory")
+    if os.name == "posix":
+        if (not hasattr(os, "geteuid")
+                or observed.st_uid != os.geteuid()):
+            raise OSError(f"{label} is not owned by the current user")
+        if stat.S_IMODE(observed.st_mode) & 0o022:
+            raise OSError(f"{label} is group- or world-writable")
+    return (getattr(observed, "st_dev", 0),
+            getattr(observed, "st_ino", 0))
+
+
+def _ensure_managed_directory(path, parent, label):
+    path = _absolute_managed_path(path, label)
+    parent = _absolute_managed_path(parent, f"{label} parent")
+    if os.path.dirname(path) != parent:
+        raise ValueError(f"{label} is outside its trusted parent")
+    _validate_managed_directory(parent, f"{label} parent")
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    return _validate_managed_directory(path, label)
+
+
+def _launch_agents_directory():
+    home = _absolute_managed_path(
+        os.path.expanduser("~"), "current-user home")
+    if os.path.realpath(home) != home:
+        raise ValueError("current-user home must not be a symlink")
+    _validate_managed_directory(home, "current-user home")
+    library = os.path.join(home, "Library")
+    _ensure_managed_directory(library, home, "current-user Library")
+    launch_agents = os.path.join(library, "LaunchAgents")
+    _ensure_managed_directory(
+        launch_agents, library, "current-user LaunchAgents")
+    return launch_agents
+
+
+def _atomic_write_private_bytes(path, value, label):
+    path = _absolute_managed_path(path, label)
+    if not isinstance(value, bytes):
+        raise TypeError(f"{label} payload must be bytes")
+    directory = os.path.dirname(path)
+    directory_identity = _validate_managed_directory(
+        directory, f"{label} directory")
+    _inspect_managed_file(path, label)
+    fd = None
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=".%s." % os.path.basename(path), dir=directory)
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(value):
+            written = os.write(fd, value[offset:])
+            if written <= 0:
+                raise OSError(f"could not write {label}")
+            offset += written
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        if _validate_managed_directory(
+                directory, f"{label} directory") != directory_identity:
+            raise OSError(f"{label} directory changed while writing")
+        _inspect_managed_file(path, label)
+        os.replace(temporary, path)
+        temporary = None
+        identity = _inspect_managed_file(path, label, missing_ok=False)
+        if identity is None:
+            raise OSError(f"{label} write did not persist")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _launch_agent_value(cfg, pool, backend, mesh_executable, log_path):
+    mesh_executable = _absolute_managed_path(
+        mesh_executable, "mesh executable")
+    log_path = _absolute_managed_path(log_path, "worker log")
+    config_path = _absolute_managed_path(
+        os.path.realpath(cfg.get("_path", "")), "mesh config")
+    working_directory = _absolute_managed_path(
+        os.path.realpath(cfg.get("_dir", "")), "mesh directory")
+    workers = pool.get("workers") if isinstance(pool, dict) else None
+    worker = workers.get(backend) if isinstance(workers, dict) else None
+    if not isinstance(worker, dict) or not _valid_pool_node(
+            worker.get("node")):
+        raise ValueError("configured worker is invalid")
+    if pool.get("mesh_config") not in (None, config_path):
+        raise ValueError("worker pool mesh binding is invalid")
+    value = {
+        "Label": _launch_agent_label(backend),
+        "ProgramArguments": [
+            mesh_executable, "worker-supervise",
+            "--backend", backend, "--as", worker["node"],
+            "--log-path", log_path,
+        ],
+        "EnvironmentVariables": {
+            "A2ACAST_CONFIG": config_path,
+            "PATH": os.pathsep.join([
+                os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+            ]),
+            "HOME": os.path.expanduser("~"),
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 15,
+        "StandardOutPath": os.devnull,
+        "StandardErrorPath": os.devnull,
+        "WorkingDirectory": working_directory,
+    }
+    if _contains_config_secret(cfg, value):
+        raise ValueError("launch agent must not contain the mesh shared key")
+    return value
+
+
+def _valid_log_limits(max_bytes, backups):
+    if (not isinstance(max_bytes, int) or isinstance(max_bytes, bool)
+            or max_bytes <= 0):
+        raise ValueError("worker log max_bytes must be a positive integer")
+    if (not isinstance(backups, int) or isinstance(backups, bool)
+            or not 0 <= backups <= WORKER_LOG_BACKUPS_MAX):
+        raise ValueError("worker log backups value is invalid")
+
+
+def _worker_log_identity(path):
+    return _inspect_managed_file(path, "worker log")
+
+
+def _validate_worker_log_parent(path):
+    directory = os.path.dirname(
+        _absolute_managed_path(path, "worker log"))
+    return _validate_managed_directory(directory, "worker log directory")
+
+
+def _remove_managed_file(path, identity, label):
+    if identity is None:
+        return
+    if _inspect_managed_file(path, label, missing_ok=False) != identity:
+        raise OSError(f"{label} changed before removal")
+    os.unlink(path)
+
+
+def _managed_file_size(path, identity, label):
+    if identity is None:
+        return 0
+    if _inspect_managed_file(path, label, missing_ok=False) != identity:
+        raise OSError(f"{label} changed while inspecting its size")
+    return os.lstat(path).st_size
+
+
+def _prune_oversized_worker_log_backups(path, max_bytes, backups):
+    identities = {}
+    for index in range(1, backups + 1):
+        candidate = f"{path}.{index}"
+        identities[candidate] = _worker_log_identity(candidate)
+    for candidate, identity in identities.items():
+        if (identity is not None
+                and _managed_file_size(
+                    candidate, identity, "worker log backup") > max_bytes):
+            _remove_managed_file(
+                candidate, identity, "worker log backup")
+
+
+def _rotate_worker_log(path, max_bytes=WORKER_LOG_MAX_BYTES,
+                       backups=WORKER_LOG_BACKUPS, force=False):
+    _valid_log_limits(max_bytes, backups)
+    path = _absolute_managed_path(path, "worker log")
+    directory_identity = _validate_worker_log_parent(path)
+    identities = {}
+    for index in range(backups + 1):
+        candidate = path if index == 0 else f"{path}.{index}"
+        identities[candidate] = _worker_log_identity(candidate)
+    current = identities[path]
+    if current is None:
+        return False
+    if not force and os.lstat(path).st_size <= max_bytes:
+        return False
+    if backups == 0:
+        _remove_managed_file(path, current, "worker log")
+        return True
+    oldest = f"{path}.{backups}"
+    _remove_managed_file(oldest, identities[oldest], "worker log backup")
+    for index in range(backups - 1, 0, -1):
+        source = f"{path}.{index}"
+        target = f"{path}.{index + 1}"
+        if identities[source] is not None:
+            if _managed_file_size(
+                    source, identities[source], "worker log backup") \
+                    > max_bytes:
+                _remove_managed_file(
+                    source, identities[source], "worker log backup")
+                continue
+            if _inspect_managed_file(
+                    source, "worker log backup", missing_ok=False) \
+                    != identities[source]:
+                raise OSError("worker log backup changed during rotation")
+            os.replace(source, target)
+    if _managed_file_size(path, current, "worker log") > max_bytes:
+        _remove_managed_file(path, current, "worker log")
+        return True
+    if _inspect_managed_file(
+            path, "worker log", missing_ok=False) != current:
+        raise OSError("worker log changed during rotation")
+    if _validate_worker_log_parent(path) != directory_identity:
+        raise OSError("worker log directory changed during rotation")
+    os.replace(path, path + ".1")
+    return True
+
+
+def _open_worker_log(path):
+    path = _absolute_managed_path(path, "worker log")
+    directory_identity = _validate_worker_log_parent(path)
+    before = _worker_log_identity(path)
+    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not isinstance(nofollow, int) or not nofollow:
+        raise WorkerEvidenceUnsupported(
+            "reliable no-follow worker log open is unavailable")
+    flags |= nofollow
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if isinstance(cloexec, int):
+        flags |= cloexec
+    fd = os.open(path, flags, 0o600)
+    try:
+        if before is None and os.name == "posix":
+            os.fchmod(fd, 0o600)
+        identity = _validate_managed_file_stat(
+            os.fstat(fd), "worker log")
+        if before is not None and identity != before:
+            raise OSError("worker log changed while opening")
+        if _worker_log_identity(path) != identity:
+            raise OSError("worker log path changed while opening")
+        if _validate_worker_log_parent(path) != directory_identity:
+            raise OSError("worker log directory changed while opening")
+        os.set_inheritable(fd, False)
+        return os.fdopen(fd, "ab", buffering=0), identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _bounded_worker_log_bytes(text, max_bytes):
+    rendered = text.encode("utf-8", errors="replace")
+    if len(rendered) <= max_bytes:
+        return rendered
+    return rendered[:max_bytes].decode(
+        "utf-8", errors="ignore").encode("utf-8")
+
+
+class _RotatingWriter:
+    def __init__(self, path, max_bytes=WORKER_LOG_MAX_BYTES,
+                 backups=WORKER_LOG_BACKUPS):
+        _valid_log_limits(max_bytes, backups)
+        self.path = _absolute_managed_path(path, "worker log")
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self.lock = threading.Lock()
+        self.handle = None
+        self.identity = None
+        _validate_worker_log_parent(self.path)
+        _prune_oversized_worker_log_backups(
+            self.path, self.max_bytes, self.backups)
+        if _worker_log_identity(self.path) is not None \
+                and os.lstat(self.path).st_size > self.max_bytes:
+            _rotate_worker_log(
+                self.path, self.max_bytes, self.backups, force=True)
+        self.handle, self.identity = _open_worker_log(self.path)
+
+    def _close_unlocked(self):
+        if self.handle is not None and not self.handle.closed:
+            self.handle.close()
+
+    def write(self, value):
+        text = str(value)
+        if not text:
+            return 0
+        payload = _bounded_worker_log_bytes(text, self.max_bytes)
+        with self.lock:
+            if self.handle is None or self.handle.closed:
+                raise ValueError("worker log writer is closed")
+            observed = _validate_managed_file_stat(
+                os.fstat(self.handle.fileno()), "worker log")
+            if (observed != self.identity
+                    or _worker_log_identity(self.path) != self.identity):
+                raise OSError("worker log changed while writing")
+            current = os.fstat(self.handle.fileno()).st_size
+            if current and current + len(payload) > self.max_bytes:
+                self._close_unlocked()
+                _rotate_worker_log(
+                    self.path, self.max_bytes, self.backups, force=True)
+                self.handle, self.identity = _open_worker_log(self.path)
+            self.handle.write(payload)
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            if self.handle is not None and not self.handle.closed:
+                self.handle.flush()
+
+    def close(self):
+        with self.lock:
+            self._close_unlocked()
+
+    def isatty(self):
+        return False
+
+
+def _lifecycle_worker_items(cfg, pool):
+    coordinator = pool.get("coordinator") if isinstance(pool, dict) else None
+    workers = pool.get("workers") if isinstance(pool, dict) else None
+    if (not _valid_pool_node(coordinator)
+            or cfg.get("exec_allow") != [coordinator]
+            or not isinstance(workers, dict) or not workers
+            or not set(workers).issubset(WORKER_BACKENDS)):
+        raise ValueError("worker pool lifecycle trust is invalid")
+    items = []
+    nodes = []
+    for backend, worker in workers.items():
+        node = worker.get("node") if isinstance(worker, dict) else None
+        if not _valid_pool_node(node):
+            raise ValueError("configured worker identity is invalid")
+        items.append((backend, worker))
+        nodes.append(node)
+    roster = cfg.get("nodes")
+    if (len(set(nodes)) != len(nodes) or coordinator in nodes
+            or not isinstance(roster, list)
+            or coordinator not in roster
+            or any(node not in roster for node in nodes)):
+        raise ValueError("configured worker identities are not trusted")
+    return items
+
+
+def _worker_log_path(cfg, backend):
+    _launch_agent_label(backend)
+    directory = _absolute_managed_path(
+        os.path.realpath(cfg.get("_dir", "")), "mesh directory")
+    return os.path.join(directory, f".meshwire.worker.{backend}.log")
+
+
+def _launch_agent_path(backend, directory=None):
+    directory = _launch_agents_directory() if directory is None else directory
+    directory = _absolute_managed_path(
+        directory, "current-user LaunchAgents")
+    return os.path.join(
+        directory, _launch_agent_label(backend) + ".plist")
+
+
+def _write_launch_agents(cfg, pool):
+    items = _lifecycle_worker_items(cfg, pool)
+    executable = shutil.which("mesh")
+    if not executable:
+        raise ValueError("mesh executable is not on PATH")
+    executable = os.path.realpath(os.path.abspath(executable))
+    if (not os.path.isfile(executable)
+            or not os.access(executable, os.X_OK)):
+        raise ValueError("mesh executable is not an executable file")
+    directory = _launch_agents_directory()
+    paths = {}
+    values = {}
+    logs = {}
+    for backend, _worker in items:
+        path = _launch_agent_path(backend, directory=directory)
+        log_path = _worker_log_path(cfg, backend)
+        _inspect_managed_file(path, "launch agent plist")
+        _worker_log_identity(log_path)
+        paths[backend] = path
+        logs[backend] = log_path
+        values[backend] = _launch_agent_value(
+            cfg, pool, backend, executable, log_path)
+    for backend, _worker in items:
+        _rotate_worker_log(logs[backend])
+        payload = plistlib.dumps(values[backend], fmt=plistlib.FMT_XML)
+        _atomic_write_private_bytes(
+            paths[backend], payload, "launch agent plist")
+    return paths
+
+
+def _foreground_worker_commands(pool):
+    workers = pool.get("workers") if isinstance(pool, dict) else None
+    if not isinstance(workers, dict):
+        raise ValueError("worker pool has no configured workers")
+    return [
+        ["mesh", "worker-supervise", "--backend", backend,
+         "--as", worker["node"]]
+        for backend, worker in workers.items()
+    ]
+
+
+def _load_pool_lifecycle_context():
+    cfg = load_config()
+    try:
+        pool = load_pool_config(cfg)
+        _lifecycle_worker_items(cfg, pool)
+    except (OSError, TypeError, ValueError, UnicodeError) as exc:
+        sys.exit(f"error: worker pool lifecycle is unavailable: {exc}")
+    return cfg, pool
+
+
+def _launchctl_result_text(completed):
+    return ((completed.stderr or completed.stdout or "").strip()
+            or "unknown launchctl failure")
+
+
+def _run_launchctl(command, operation, backend, absent_ok=False,
+                   already_ok=False):
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True)
+    except OSError as exc:
+        sys.exit(f"error: launchctl {operation} {backend}: {exc}")
+    if completed.returncode == 0:
+        return completed
+    detail = _launchctl_result_text(completed)
+    folded = detail.casefold()
+    if already_ok and ("already" in folded or "service is loaded" in folded):
+        return completed
+    if absent_ok and any(marker in folded for marker in (
+            "could not find service", "no such process", "not found")):
+        return completed
+    sys.exit(f"error: launchctl {operation} {backend}: {detail}")
+
+
+def cmd_pool_start(_args):
+    cfg, pool = _load_pool_lifecycle_context()
+    if sys.platform != "darwin":
+        for command in _foreground_worker_commands(pool):
+            print(shlex.join(command))
+        return
+    try:
+        paths = _write_launch_agents(cfg, pool)
+    except (OSError, TypeError, ValueError, UnicodeError,
+            WorkerEvidenceUnsupported) as exc:
+        sys.exit(f"error: could not write launch agents: {exc}")
+    domain = f"gui/{os.getuid()}"
+    for backend, _worker in _lifecycle_worker_items(cfg, pool):
+        path = paths.get(backend)
+        if path is None:
+            sys.exit(f"error: launch agent for {backend} was not written")
+        _run_launchctl(
+            ["launchctl", "bootstrap", domain, path],
+            "bootstrap", backend, already_ok=True)
+        _run_launchctl(
+            ["launchctl", "kickstart", "-k",
+             f"{domain}/{_launch_agent_label(backend)}"],
+            "kickstart", backend)
+        print(f"started {backend}")
+
+
+def cmd_pool_stop(_args):
+    cfg, pool = _load_pool_lifecycle_context()
+    if sys.platform != "darwin":
+        for command in _foreground_worker_commands(pool):
+            print(shlex.join(command + ["--stop"]))
+        return
+    domain = f"gui/{os.getuid()}"
+    for backend, _worker in _lifecycle_worker_items(cfg, pool):
+        _run_launchctl(
+            ["launchctl", "bootout",
+             f"{domain}/{_launch_agent_label(backend)}"],
+            "bootout", backend, absent_ok=True)
+        print(f"stopped {backend}")
+
+
+def _supervisor_pid_status(cfg, node):
+    if not _valid_pool_node(node):
+        return None, False
+    pid_fd = None
+    lock_fd = None
+    probe_acquired = False
+    try:
+        pid_path = _supervise_pid_file(cfg, node)
+        lock_path = supervise_lock_file(cfg, node)
+        pid_fd, pid_identity = _open_supervisor_state(pid_path)
+        pid_metadata = _read_supervisor_metadata_fd(pid_fd)
+        lock_fd, lock_identity = _open_supervisor_state(
+            lock_path, writable=True)
+        lock_metadata = _read_supervisor_metadata_fd(lock_fd)
+        if pid_metadata != lock_metadata:
+            raise ValueError("supervisor owner tokens do not match")
+        probe_acquired = _try_supervisor_advisory_lock(lock_fd)
+        if probe_acquired:
+            raise ValueError("supervisor lock is not held")
+        if (not _supervisor_path_has_identity(pid_path, pid_identity)
+                or not _supervisor_path_has_identity(
+                    lock_path, lock_identity)):
+            raise ValueError("supervisor ownership path changed")
+        if (_read_supervisor_metadata_fd(lock_fd) != lock_metadata
+                or _read_supervisor_metadata_fd(pid_fd) != pid_metadata):
+            raise ValueError("supervisor ownership metadata changed")
+        pid = pid_metadata["pid"]
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass
+        except (OSError, OverflowError) as exc:
+            raise ValueError("supervisor PID is not live") from exc
+        return pid, True
+    except (OSError, TypeError, ValueError, UnicodeError,
+            WorkerEvidenceUnsupported):
+        return None, False
+    finally:
+        if probe_acquired and lock_fd is not None:
+            try:
+                _unlock_supervisor_advisory_lock(lock_fd)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if pid_fd is not None:
+            os.close(pid_fd)
+
+
+def cmd_pool_status(_args):
+    cfg, pool = _load_pool_lifecycle_context()
+    peers = load_peers(cfg)
+    rows = []
+    for backend, worker in _lifecycle_worker_items(cfg, pool):
+        node = worker["node"]
+        pid, live = _supervisor_pid_status(cfg, node)
+        health = _read_worker_health(cfg, node)
+        if (not live or health.get("backend") != backend
+                or health.get("state") not in WORKER_STATES):
+            health = {}
+        peer = peers.get(node) if isinstance(peers, dict) else None
+        peer = peer if isinstance(peer, dict) else {}
+        rows.append({
+            "backend": backend,
+            "node": node,
+            "state": health.get("state", "unavailable"),
+            "task_id": health.get("task_id", ""),
+            "error": health.get("error", ""),
+            "cooldown_until": health.get("cooldown_until", 0),
+            "pid": pid,
+            "pid_live": live,
+            "last_seen": peer.get("seen"),
+        })
+    print(json.dumps(rows, indent=2))
+
+
+def _valid_integration_ref(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 255
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}", value)
+        is not None
+        and ".." not in value
+        and "//" not in value
+        and not value.endswith(("/", ".", ".lock"))
+        and not any(part.startswith(".") for part in value.split("/"))
+    )
+
+
+def _load_cleanup_task_store(cfg):
+    value = _load_json_regular(
+        tasks_file(cfg), require_private=True,
+        max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+    if not isinstance(value, dict):
+        raise ValueError("worker task ledger is invalid")
+    return value
+
+
+def _cleanup_candidate(cfg, pool, inbound, task_id, record):
+    backend = record.get("worker_backend")
+    workers = pool["workers"]
+    worker = workers.get(backend)
+    node = worker.get("node") if isinstance(worker, dict) else None
+    if (not _valid_pool_node(node) or record.get("peer") != node
+            or record.get("state") not in TERMINAL_STATES):
+        raise ValueError("delegate task is not terminal for this pool")
+    task = inbound.get(task_id)
+    if (not isinstance(task, dict)
+            or task.get("direction") != "inbound"
+            or task.get("local_node") != node
+            or task.get("peer") != pool["coordinator"]
+            or task.get("state") not in TERMINAL_STATES
+            or task.get("worker_backend") != backend):
+        raise ValueError("worker task is active or not recipient-scoped")
+    journal = _load_worker_journal(
+        cfg, node, task_id, expected={"backend": backend})
+    if (not journal or journal.get("phase") != "replied"
+            or journal.get("terminal_state") != task.get("state")):
+        raise ValueError("worker journal is not durably replied")
+    digest = journal.get("job_digest")
+    if (task.get("worker_job_digest") != digest
+            or record.get("worker_job_digest") != digest):
+        raise ValueError("worker task and journal digests do not match")
+    text = task.get("text")
+    if (not isinstance(text, str) or record.get("text") != text
+            or hashlib.sha256(text.encode("utf-8")).hexdigest() != digest):
+        raise ValueError("worker task payload does not match its digest")
+    try:
+        job = _parse_worker_job(text)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("worker task payload is invalid") from exc
+    binding = _worker_journal_binding(journal)
+    expected_claim = _worker_execution_marker(binding)
+    claim = _load_worker_execution_marker(
+        cfg, task_id, expected=expected_claim)
+    if claim != expected_claim:
+        raise ValueError("worker execution claim is missing or invalid")
+    try:
+        result, _terminal = _validate_bound_worker_result(
+            cfg, node, task_id, journal, journal["result"])
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("worker journal result is invalid") from exc
+    info = task.get("worktree_info")
+    if not isinstance(info, dict):
+        raise ValueError("worker worktree evidence is missing")
+    info = _validate_reusable_worker_worktree(
+        pool, info, info.get("repo"), info.get("base"))
+    if journal.get("worktree") != info["path"]:
+        raise ValueError("worker journal worktree does not match ledger")
+    if result.get("worktree") != info["path"]:
+        raise ValueError("worker result worktree does not match ledger")
+    if job.get("repo") != info["repo"] or job.get("base") != info["base"]:
+        raise ValueError("worker job does not match worktree evidence")
+    if result.get("branch") != info["branch"]:
+        raise ValueError("worker result branch does not match ledger")
+    head = _resolve_worker_base(info["path"], "HEAD")
+    expected_head = result.get("commit") or info["base"]
+    if head != expected_head:
+        raise ValueError("worker result commit does not match worktree")
+    return info
+
+
+def cmd_pool_clean(args):
+    task_id = getattr(args, "task", None)
+    force = getattr(args, "force", False)
+    integrated_into = getattr(args, "integrated_into", None)
+    if not isinstance(force, bool):
+        sys.exit("error: --force value is invalid")
+    if task_id is not None and not _valid_task_id(task_id):
+        sys.exit("error: --task is invalid")
+    if force and task_id is None:
+        sys.exit("error: --force requires exactly one --task")
+    if integrated_into is None:
+        integrated_into = "HEAD"
+    if not _valid_integration_ref(integrated_into):
+        sys.exit("error: --integrated-into is invalid")
+
+    cfg, pool = _load_pool_lifecycle_context()
+    try:
+        delegated = _load_delegate_tasks(cfg, pool["coordinator"])
+    except (OSError, RuntimeError, TaskLedgerBusy, TypeError, ValueError,
+            UnicodeError) as exc:
+        sys.exit(f"error: delegate task ledger is unavailable: {exc}")
+    if task_id is not None and task_id not in delegated:
+        sys.exit(f"error: no scoped delegate task found for '{task_id}'")
+    selected = sorted(
+        candidate for candidate in delegated
+        if task_id is None or candidate == task_id)
+
+    lock = _acquire_tasks_lock(cfg)
+    if lock is None:
+        sys.exit("error: worker task ledger is busy")
+    removed = []
+    preserved = []
+    try:
+        try:
+            inbound = _load_cleanup_task_store(cfg)
+        except (OSError, TypeError, ValueError, UnicodeError,
+                WorkerEvidenceUnsupported) as exc:
+            sys.exit(f"error: worker task ledger is unavailable: {exc}")
+        candidates = []
+        for candidate in selected:
+            try:
+                info = _cleanup_candidate(
+                    cfg, pool, inbound, candidate, delegated[candidate])
+            except (OSError, subprocess.CalledProcessError, TypeError,
+                    ValueError, UnicodeError) as exc:
+                preserved.append({"task_id": candidate, "reason": str(exc)})
+                continue
+            candidates.append((candidate, info))
+        for candidate, info in candidates:
+            try:
+                _remove_worker_worktree(
+                    info, integrated_into=integrated_into, force=force)
+            except (OSError, subprocess.CalledProcessError, TypeError,
+                    ValueError, UnicodeError) as exc:
+                preserved.append({"task_id": candidate, "reason": str(exc)})
+            else:
+                removed.append(candidate)
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+    print(json.dumps({
+        "removed": sorted(set(removed)),
+        "preserved": sorted(
+            preserved, key=lambda item: (item["task_id"], item["reason"])),
+    }))
+
+
 def _unpublish_pool_config(cfg):
     """Remove any prior published pool without following its file type."""
     path = pool_config_file(cfg)
@@ -7589,7 +8354,19 @@ def _run_worker_supervisor(args):
 
 
 def cmd_worker_supervise(args):
-    return _run_worker_supervisor(args)
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    worker_log = None
+    try:
+        log_path = getattr(args, "log_path", None)
+        if log_path and not getattr(args, "stop", False):
+            worker_log = _RotatingWriter(log_path)
+            sys.stdout = worker_log
+            sys.stderr = worker_log
+        return _run_worker_supervisor(args)
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+        if worker_log is not None:
+            worker_log.close()
 
 
 def cmd_codex_allow(args):
@@ -7994,6 +8771,24 @@ def main():
     p.add_argument("--model", default="qwen3:4b")
     p.set_defaults(fn=cmd_pool_setup)
 
+    for name, fn, help_text in (
+            ("pool-start", cmd_pool_start,
+             "start configured worker services"),
+            ("pool-status", cmd_pool_status,
+             "show configured worker service health"),
+            ("pool-stop", cmd_pool_stop,
+             "stop configured worker services")):
+        p = sub.add_parser(name, help=help_text)
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser(
+        "pool-clean",
+        help="remove integrated or one explicitly forced worker worktree")
+    p.add_argument("--integrated-into", default="HEAD")
+    p.add_argument("--task", default=None)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_pool_clean)
+
     p = sub.add_parser(
         "worker-supervise",
         help="run one configured isolated worker backend")
@@ -8006,6 +8801,8 @@ def main():
                    help="process one pass of pending tasks and exit")
     p.add_argument("--stop", action="store_true",
                    help="signal this configured worker loop to stop")
+    p.add_argument("--log-path", default=None,
+                   help="write bounded private supervisor output here")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_worker_supervise)
 

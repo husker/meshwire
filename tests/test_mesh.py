@@ -11,6 +11,7 @@ import http.client
 import io
 import json
 import os
+import plistlib
 import re
 import secrets
 import signal
@@ -9239,6 +9240,806 @@ class PoolConfigTests(unittest.TestCase):
             self.cfg, "machine-worker-copilot")
         self.assertEqual(health["state"], "cooldown")
         self.assertEqual(health["error"], "quota")
+
+
+class PoolLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+        self.cfg["nodes"] = [
+            "coordinator", "worker-codex", "worker-copilot",
+            "worker-goose",
+        ]
+        self.cfg["exec_allow"] = ["coordinator"]
+        mesh._save_config(self.cfg)
+        self.workspace = os.path.join(self.tmp.name, "projects")
+        os.mkdir(self.workspace)
+        self.worktree_root = os.path.join(self.tmp.name, "worker-cache")
+        self.pool = {
+            "version": 1,
+            "mesh_config": os.path.realpath(self.cfg["_path"]),
+            "coordinator": "coordinator",
+            "workspace_roots": [os.path.realpath(self.workspace)],
+            "worktree_root": os.path.realpath(self.worktree_root),
+            "workers": {
+                "codex": {"node": "worker-codex"},
+                "copilot": {"node": "worker-copilot"},
+                "goose": {
+                    "node": "worker-goose",
+                    "provider": "ollama",
+                    "model": "qwen3:4b",
+                    "ollama_host": "http://127.0.0.1:11434",
+                },
+            },
+            "routing": ["goose", "copilot", "codex"],
+        }
+
+    @staticmethod
+    def _completed(args, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(
+            args, returncode, stdout=stdout, stderr=stderr)
+
+    def _create_cleanup_evidence(self, task_id, commit_change=False):
+        repo = os.path.join(self.workspace, "repo-" + task_id)
+        os.mkdir(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        with open(os.path.join(repo, "base.txt"), "w", encoding="utf-8") \
+                as handle:
+            handle.write("base\n")
+        subprocess.run(["git", "-C", repo, "add", "base.txt"], check=True)
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.invalid",
+        )
+        subprocess.run(
+            ["git", "-C", repo, "commit", "-qm", "base"],
+            check=True, env=env)
+        base = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True).stdout.strip()
+        backend = "copilot"
+        node = self.pool["workers"][backend]["node"]
+        info = mesh._prepare_worker_worktree(
+            self.pool, task_id, backend, repo, base)
+        commit = ""
+        changed = []
+        if commit_change:
+            with open(os.path.join(info["path"], "worker.txt"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("worker\n")
+            commit, changed = mesh._commit_worker_changes(
+                info, task_id, backend)
+        job = mesh._encode_worker_job({
+            "repo": info["repo"], "base": info["base"],
+            "task": "test cleanup",
+            "verification": [], "kind": "implementation",
+            "class": "normal",
+        })
+        digest = hashlib.sha256(job.encode("utf-8")).hexdigest()
+        binding = {
+            "version": 1, "node": node, "task_id": task_id,
+            "backend": backend, "origin_peer": "coordinator",
+            "local_node": node, "job_digest": digest, "attempt": 1,
+        }
+        result = mesh._encode_worker_result({
+            "backend": backend,
+            "outcome": "completed" if commit else "no_change",
+            "branch": info["branch"], "commit": commit,
+            "changed_files": changed, "summary": "done",
+            "verification": "not run", "runtime_seconds": 0,
+            "worktree": info["path"],
+        })
+        mesh._write_worker_execution_marker(self.cfg, task_id, binding)
+        mesh._write_worker_phase(
+            self.cfg, node, task_id, binding, "replied",
+            worktree=info["path"], result=result,
+            terminal_state="completed", reply_error=None)
+        mesh.save_task(
+            self.cfg, task_id, direction="inbound", state="completed",
+            peer="coordinator", local_node=node, text=job,
+            worker_backend=backend, worker_job_digest=digest,
+            worktree_info=info, result=result,
+            pending_result=result, pending_terminal_state="completed")
+        mesh._save_delegate_task(
+            self.cfg, "coordinator", task_id, create_only=True,
+            contextId="context-" + task_id, state="completed", peer=node,
+            direction="outbound", text=job, worker_backend=backend,
+            worker_job_digest=digest, result=result)
+        return info
+
+    def test_launch_agent_contains_absolute_paths_not_mesh_key(self):
+        log_path = os.path.join(self.tmp.name, "copilot.log")
+        value = mesh._launch_agent_value(
+            self.cfg, self.pool, "copilot",
+            mesh_executable="/usr/local/bin/mesh", log_path=log_path)
+
+        self.assertEqual(value["Label"],
+                         "com.a2acast.worker.copilot")
+        self.assertEqual(value["ProgramArguments"], [
+            "/usr/local/bin/mesh", "worker-supervise",
+            "--backend", "copilot", "--as", "worker-copilot",
+            "--log-path", log_path,
+        ])
+        self.assertTrue(value["RunAtLoad"])
+        self.assertTrue(value["KeepAlive"])
+        self.assertEqual(value["StandardOutPath"], os.devnull)
+        self.assertEqual(value["StandardErrorPath"], os.devnull)
+        serialized = plistlib.dumps(value)
+        self.assertNotIn(self.cfg["key"].encode(), serialized)
+        self.assertNotIn("key", value["EnvironmentVariables"])
+        self.assertEqual(
+            value["EnvironmentVariables"]["A2ACAST_CONFIG"],
+            os.path.realpath(self.cfg["_path"]))
+
+    def test_rotating_writer_counts_utf8_bytes_and_rotates(self):
+        path = os.path.join(self.tmp.name, "stream.log")
+        writer = mesh._RotatingWriter(path, max_bytes=5, backups=2)
+        writer.write("éé")
+        writer.write("é")
+        writer.close()
+
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "é")
+        with open(path + ".1", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "éé")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_worker_log_restores_streams_when_supervisor_raises(self):
+        path = os.path.join(self.tmp.name, "worker.log")
+        args = argparse.Namespace(log_path=path)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        boom = RuntimeError("supervisor failed")
+
+        with mock.patch.object(
+                mesh, "_run_worker_supervisor", side_effect=boom):
+            with self.assertRaises(RuntimeError) as caught:
+                mesh.cmd_worker_supervise(args)
+
+        self.assertIs(caught.exception, boom)
+        self.assertIs(sys.stdout, old_stdout)
+        self.assertIs(sys.stderr, old_stderr)
+
+    def test_pool_start_bootstraps_and_kickstarts_each_exact_label(self):
+        plists = {
+            backend: os.path.join(
+                self.tmp.name, f"com.a2acast.worker.{backend}.plist")
+            for backend in ("codex", "copilot", "goose")
+        }
+        completed = self._completed(["launchctl"])
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_write_launch_agents",
+                               return_value=plists), \
+             mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.subprocess, "run",
+                               return_value=completed) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_start(argparse.Namespace())
+
+        domain = f"gui/{os.getuid()}"
+        expected = []
+        for backend, path in plists.items():
+            expected.extend([
+                mock.call(
+                    ["launchctl", "bootstrap", domain, path],
+                    capture_output=True, text=True),
+                mock.call(
+                    ["launchctl", "kickstart", "-k",
+                     f"{domain}/com.a2acast.worker.{backend}"],
+                    capture_output=True, text=True),
+            ])
+        self.assertEqual(run.call_args_list, expected)
+
+    def test_pool_start_reports_bootstrap_failure_without_kickstart(self):
+        plists = {
+            backend: os.path.join(
+                self.tmp.name, f"com.a2acast.worker.{backend}.plist")
+            for backend in self.pool["workers"]
+        }
+        failed = self._completed(
+            ["launchctl"], returncode=5, stderr="permission denied")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_write_launch_agents",
+                               return_value=plists), \
+             mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.subprocess, "run",
+                               return_value=failed) as run:
+            with self.assertRaisesRegex(SystemExit, "permission denied"):
+                mesh.cmd_pool_start(argparse.Namespace())
+        self.assertEqual(run.call_count, 1)
+
+    def test_pool_stop_boots_out_exact_labels_and_reports_failure(self):
+        results = [
+            self._completed(["launchctl"]),
+            self._completed(["launchctl"], returncode=3,
+                            stderr="not permitted"),
+        ]
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.subprocess, "run",
+                               side_effect=results) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, "not permitted"):
+                mesh.cmd_pool_stop(argparse.Namespace())
+        domain = f"gui/{os.getuid()}"
+        self.assertEqual(run.call_args_list, [
+            mock.call(
+                ["launchctl", "bootout",
+                 f"{domain}/com.a2acast.worker.codex"],
+                capture_output=True, text=True),
+            mock.call(
+                ["launchctl", "bootout",
+                 f"{domain}/com.a2acast.worker.copilot"],
+                capture_output=True, text=True),
+        ])
+
+    def test_non_macos_start_prints_shell_quoted_foreground_commands(self):
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(
+                 mesh, "_foreground_worker_commands", create=True,
+                 return_value=[["mesh", "worker-supervise", "--as",
+                                "worker with space"]]), \
+             mock.patch.object(mesh.sys, "platform", "linux"), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_start(argparse.Namespace())
+        self.assertIn("'worker with space'", output.getvalue())
+
+    def test_pool_status_uses_fail_closed_pid_and_health_helpers(self):
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "load_peers", return_value={}), \
+             mock.patch.object(mesh, "_read_worker_health",
+                               return_value={}), \
+             mock.patch.object(mesh, "_supervisor_pid_status",
+                               return_value=(None, False)), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_status(argparse.Namespace())
+        rows = json.loads(output.getvalue())
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["state"] == "unavailable" for row in rows))
+        self.assertTrue(all(row["pid_live"] is False for row in rows))
+
+    def test_pool_clean_force_requires_exactly_one_valid_task_first(self):
+        for task in (None, "bad/task"):
+            with self.subTest(task=task), \
+                 mock.patch.object(mesh, "load_config",
+                                   return_value=self.cfg), \
+                 mock.patch.object(mesh, "load_pool_config",
+                                   return_value=self.pool), \
+                 mock.patch.object(mesh, "_load_delegate_tasks") as load:
+                with self.assertRaises(SystemExit):
+                    mesh.cmd_pool_clean(argparse.Namespace(
+                        integrated_into=None, task=task, force=True))
+                load.assert_not_called()
+
+    def test_cli_parses_pool_commands_and_worker_log_path(self):
+        called = []
+        cases = [
+            (["mesh", "pool-start"], "pool-start"),
+            (["mesh", "pool-status"], "pool-status"),
+            (["mesh", "pool-stop"], "pool-stop"),
+            (["mesh", "pool-clean", "--task", "task-1", "--force"],
+             "pool-clean"),
+            (["mesh", "worker-supervise", "--backend", "copilot",
+              "--log-path", "/tmp/worker.log", "--once"],
+             "worker-supervise"),
+        ]
+        for argv, name in cases:
+            with self.subTest(name=name), \
+                 mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(mesh, "cmd_pool_start", called.append,
+                                   create=True), \
+                 mock.patch.object(mesh, "cmd_pool_status", called.append,
+                                   create=True), \
+                 mock.patch.object(mesh, "cmd_pool_stop", called.append,
+                                   create=True), \
+                 mock.patch.object(mesh, "cmd_pool_clean", called.append,
+                                   create=True), \
+                 mock.patch.object(mesh, "cmd_worker_supervise",
+                                   called.append):
+                mesh.main()
+        self.assertEqual(called[-1].log_path, "/tmp/worker.log")
+
+    def test_launch_agent_rejects_relative_executable_and_log_paths(self):
+        absolute_log = os.path.join(self.tmp.name, "worker.log")
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            mesh._launch_agent_value(
+                self.cfg, self.pool, "codex", "mesh", absolute_log)
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            mesh._launch_agent_value(
+                self.cfg, self.pool, "codex", "/usr/bin/mesh", "worker.log")
+
+    def test_write_launch_agents_is_private_and_rejects_symlink_plist(self):
+        launch_dir = os.path.join(self.tmp.name, "LaunchAgents")
+        os.mkdir(launch_dir, 0o700)
+        target = os.path.join(self.tmp.name, "target.plist")
+        mesh._write_text_secure(target, "preserve\n")
+        symlink_path = os.path.join(
+            launch_dir, "com.a2acast.worker.copilot.plist")
+        os.symlink(target, symlink_path)
+
+        with mock.patch.object(mesh, "_launch_agents_directory",
+                               return_value=launch_dir), \
+             mock.patch.object(mesh.shutil, "which",
+                               return_value="/bin/echo"):
+            with self.assertRaisesRegex(OSError, "regular file"):
+                mesh._write_launch_agents(self.cfg, self.pool)
+
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "preserve\n")
+        self.assertTrue(os.path.islink(symlink_path))
+        self.assertEqual(
+            [name for name in os.listdir(launch_dir)
+             if name.endswith(".plist")],
+            ["com.a2acast.worker.copilot.plist"])
+
+        os.unlink(symlink_path)
+        with mock.patch.object(mesh, "_launch_agents_directory",
+                               return_value=launch_dir), \
+             mock.patch.object(mesh.shutil, "which",
+                               return_value="/bin/echo"):
+            paths = mesh._write_launch_agents(self.cfg, self.pool)
+        self.assertEqual(set(paths), set(self.pool["workers"]))
+        for backend, path in paths.items():
+            with self.subTest(backend=backend):
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                with open(path, "rb") as handle:
+                    value = plistlib.load(handle)
+                self.assertEqual(value["Label"],
+                                 f"com.a2acast.worker.{backend}")
+                self.assertNotIn(self.cfg["key"], repr(value))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership/mode semantics")
+    def test_worker_log_rejects_unsafe_parent_symlink_hardlink_and_mode(self):
+        unsafe = os.path.join(self.tmp.name, "unsafe")
+        os.mkdir(unsafe, 0o777)
+        os.chmod(unsafe, 0o777)
+        with self.assertRaisesRegex(OSError, "writable"):
+            mesh._RotatingWriter(os.path.join(unsafe, "worker.log"))
+
+        safe = os.path.join(self.tmp.name, "safe")
+        os.mkdir(safe, 0o700)
+        target = os.path.join(safe, "target.log")
+        mesh._write_text_secure(target, "preserve\n")
+        symlink_path = os.path.join(safe, "symlink.log")
+        os.symlink(target, symlink_path)
+        with self.assertRaisesRegex(OSError, "regular file"):
+            mesh._RotatingWriter(symlink_path)
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "preserve\n")
+
+        hardlink_path = os.path.join(safe, "hardlink.log")
+        os.link(target, hardlink_path)
+        with self.assertRaisesRegex(OSError, "hard link"):
+            mesh._RotatingWriter(hardlink_path)
+        os.unlink(hardlink_path)
+        os.chmod(target, 0o644)
+        with self.assertRaisesRegex(OSError, "0600"):
+            mesh._RotatingWriter(target)
+
+    def test_worker_log_backups_zero_and_single_oversized_write_stay_bounded(self):
+        path = os.path.join(self.tmp.name, "bounded.log")
+        writer = mesh._RotatingWriter(path, max_bytes=7, backups=0)
+        self.assertEqual(writer.write("é" * 20), 20)
+        writer.write("next")
+        writer.close()
+        self.assertLessEqual(os.path.getsize(path), 7)
+        self.assertFalse(os.path.lexists(path + ".1"))
+        with open(path, encoding="utf-8") as handle:
+            handle.read()
+
+    def test_worker_log_discards_preexisting_oversized_files_to_bound_total(self):
+        path = os.path.join(self.tmp.name, "preexisting.log")
+        for candidate in (path, path + ".1"):
+            mesh._write_text_secure(candidate, "x" * 100)
+        writer = mesh._RotatingWriter(path, max_bytes=8, backups=2)
+        writer.write("ok")
+        writer.close()
+        sizes = [
+            os.path.getsize(candidate)
+            for candidate in (path, path + ".1", path + ".2")
+            if os.path.exists(candidate)
+        ]
+        self.assertLessEqual(sum(sizes), 8 * 3)
+        self.assertTrue(all(size <= 8 for size in sizes))
+
+    def test_worker_log_discards_orphan_oversized_backup(self):
+        path = os.path.join(self.tmp.name, "orphan.log")
+        mesh._write_text_secure(path + ".1", "x" * 100)
+        writer = mesh._RotatingWriter(path, max_bytes=8, backups=2)
+        writer.write("ok")
+        writer.close()
+        sizes = [
+            os.path.getsize(candidate)
+            for candidate in (path, path + ".1", path + ".2")
+            if os.path.exists(candidate)
+        ]
+        self.assertTrue(all(size <= 8 for size in sizes))
+
+    def test_worker_log_rejects_invalid_limits_without_creating_file(self):
+        path = os.path.join(self.tmp.name, "invalid.log")
+        for max_bytes, backups in (
+                (0, 1), (-1, 1), (True, 1), (1, -1), (1, True),
+                (1, mesh.WORKER_LOG_BACKUPS_MAX + 1)):
+            with self.subTest(max_bytes=max_bytes, backups=backups), \
+                 self.assertRaises(ValueError):
+                mesh._RotatingWriter(
+                    path, max_bytes=max_bytes, backups=backups)
+        self.assertFalse(os.path.lexists(path))
+
+    def test_worker_log_constructor_failure_does_not_replace_streams(self):
+        args = argparse.Namespace(
+            log_path=os.path.join(self.tmp.name, "missing", "worker.log"),
+            stop=False)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        with mock.patch.object(mesh, "_run_worker_supervisor") as run:
+            with self.assertRaises(OSError):
+                mesh.cmd_worker_supervise(args)
+        run.assert_not_called()
+        self.assertIs(sys.stdout, old_stdout)
+        self.assertIs(sys.stderr, old_stderr)
+
+    def test_pool_start_treats_already_loaded_as_idempotent(self):
+        paths = {
+            backend: os.path.join(self.tmp.name, backend + ".plist")
+            for backend in self.pool["workers"]
+        }
+        already = self._completed(
+            ["launchctl"], returncode=5, stderr="Service already loaded")
+        ok = self._completed(["launchctl"])
+        results = []
+        for _backend in self.pool["workers"]:
+            results.extend((already, ok))
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_write_launch_agents",
+                               return_value=paths), \
+             mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.subprocess, "run",
+                               side_effect=results) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_start(argparse.Namespace())
+        self.assertEqual(run.call_count, 6)
+
+    def test_pool_stop_treats_missing_services_as_idempotent(self):
+        missing = self._completed(
+            ["launchctl"], returncode=3,
+            stderr="Could not find service")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.subprocess, "run",
+                               return_value=missing) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_stop(argparse.Namespace())
+        self.assertEqual(run.call_count, 3)
+
+    def test_lifecycle_validation_failure_has_no_launchctl_or_plist_effect(self):
+        untrusted = dict(self.cfg, exec_allow=["coordinator", "intruder"])
+        for command in (mesh.cmd_pool_start, mesh.cmd_pool_stop):
+            with self.subTest(command=command.__name__), \
+                 mock.patch.object(mesh, "load_config",
+                                   return_value=untrusted), \
+                 mock.patch.object(mesh, "load_pool_config",
+                                   return_value=self.pool), \
+                 mock.patch.object(mesh, "_write_launch_agents") as write, \
+                 mock.patch.object(mesh.subprocess, "run") as run:
+                with self.assertRaisesRegex(SystemExit, "trust"):
+                    command(argparse.Namespace())
+                write.assert_not_called()
+                run.assert_not_called()
+
+    def test_supervisor_pid_status_requires_live_matching_lock_ownership(self):
+        lock = mesh._acquire_supervise_lock(self.cfg, "worker-copilot")
+        self.assertIsNotNone(lock)
+        pid_owner = mesh._write_supervisor_pid(
+            self.cfg, "worker-copilot", lock)
+        self.addCleanup(mesh._release_supervise_lock, lock, pid_owner)
+
+        with mock.patch.object(mesh.os, "kill") as kill:
+            self.assertEqual(
+                mesh._supervisor_pid_status(self.cfg, "worker-copilot"),
+                (os.getpid(), True))
+        kill.assert_called_once_with(os.getpid(), 0)
+
+        mesh._release_supervise_lock(lock)
+        with mock.patch.object(mesh.os, "kill") as kill:
+            self.assertEqual(
+                mesh._supervisor_pid_status(self.cfg, "worker-copilot"),
+                (None, False))
+        kill.assert_not_called()
+
+    def test_supervisor_pid_status_rejects_symlink_and_malformed_evidence(self):
+        path = mesh._supervise_pid_file(self.cfg, "worker-goose")
+        mesh._write_text_secure(path, "not-json\n")
+        self.assertEqual(
+            mesh._supervisor_pid_status(self.cfg, "worker-goose"),
+            (None, False))
+        os.unlink(path)
+        target = path + ".target"
+        mesh._write_json_secure(target, {
+            "version": 1, "pid": 4242, "token": "a" * 64,
+        })
+        os.symlink(target, path)
+        self.assertEqual(
+            mesh._supervisor_pid_status(self.cfg, "worker-goose"),
+            (None, False))
+
+    def test_supervisor_pid_status_fails_closed_on_unrepresentable_pid(self):
+        metadata = {
+            "version": 1, "pid": 10 ** 100, "token": "f" * 64,
+        }
+        mesh._write_json_secure(
+            mesh._supervise_pid_file(self.cfg, "worker-codex"), metadata)
+        mesh._write_json_secure(
+            mesh.supervise_lock_file(self.cfg, "worker-codex"), metadata)
+        with mock.patch.object(mesh, "_try_supervisor_advisory_lock",
+                               return_value=False), \
+             mock.patch.object(mesh.os, "kill",
+                               side_effect=OverflowError("too large")):
+            self.assertEqual(
+                mesh._supervisor_pid_status(self.cfg, "worker-codex"),
+                (None, False))
+
+    def test_supervisor_pid_status_rechecks_same_inode_metadata(self):
+        metadata = {
+            "version": 1, "pid": 4242, "token": "b" * 64,
+        }
+        changed = {**metadata, "token": "c" * 64}
+        mesh._write_json_secure(
+            mesh._supervise_pid_file(self.cfg, "worker-codex"), metadata)
+        mesh._write_json_secure(
+            mesh.supervise_lock_file(self.cfg, "worker-codex"), metadata)
+        with mock.patch.object(
+                mesh, "_read_supervisor_metadata_fd",
+                side_effect=[metadata, metadata, changed]), \
+             mock.patch.object(mesh, "_try_supervisor_advisory_lock",
+                               return_value=False), \
+             mock.patch.object(mesh.os, "kill") as kill:
+            self.assertEqual(
+                mesh._supervisor_pid_status(self.cfg, "worker-codex"),
+                (None, False))
+        kill.assert_not_called()
+
+    def test_pool_clean_validation_failure_has_no_load_or_remove_side_effect(self):
+        cases = [
+            argparse.Namespace(task="bad/task", force=False,
+                               integrated_into="HEAD"),
+            argparse.Namespace(task="task-1", force=False,
+                               integrated_into="--upload-pack=x"),
+            argparse.Namespace(task=None, force=True,
+                               integrated_into="HEAD"),
+        ]
+        for args in cases:
+            with self.subTest(args=args), \
+                 mock.patch.object(mesh, "load_config") as load, \
+                 mock.patch.object(mesh, "_remove_worker_worktree") as remove:
+                with self.assertRaises(SystemExit):
+                    mesh.cmd_pool_clean(args)
+                load.assert_not_called()
+                remove.assert_not_called()
+
+    def test_pool_clean_uses_scoped_ledgers_and_preserves_working_task(self):
+        task_id = "task-working"
+        delegate = {
+            task_id: {
+                "worker_backend": "copilot", "peer": "worker-copilot",
+                "state": "completed",
+            },
+        }
+        inbound = {
+            task_id: {
+                "direction": "inbound", "local_node": "worker-copilot",
+                "peer": "coordinator", "state": "working",
+                "worker_backend": "copilot",
+            },
+        }
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_load_delegate_tasks",
+                               return_value=delegate) as scoped, \
+             mock.patch.object(mesh, "_load_cleanup_task_store",
+                               return_value=inbound), \
+             mock.patch.object(mesh, "load_tasks",
+                               side_effect=AssertionError("unscoped load")), \
+             mock.patch.object(mesh, "_remove_worker_worktree") as remove, \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=False, integrated_into="HEAD"))
+        scoped.assert_called_once_with(self.cfg, "coordinator")
+        remove.assert_not_called()
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["preserved"][0]["task_id"], task_id)
+
+    def test_pool_clean_deduplicates_and_reports_partial_removal(self):
+        delegated = {
+            "task-a": {"worker_backend": "codex"},
+            "task-b": {"worker_backend": "copilot"},
+        }
+        info_a = {"path": "/work/a"}
+        info_b = {"path": "/work/b"}
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_load_delegate_tasks",
+                               return_value=delegated), \
+             mock.patch.object(mesh, "_load_cleanup_task_store",
+                               return_value={}), \
+             mock.patch.object(
+                 mesh, "_cleanup_candidate",
+                 side_effect=[info_a, info_b]), \
+             mock.patch.object(
+                 mesh, "_remove_worker_worktree",
+                 side_effect=[None, ValueError("not integrated")]) as remove, \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=None, force=False, integrated_into=None))
+        self.assertEqual(remove.call_args_list, [
+            mock.call(info_a, integrated_into="HEAD", force=False),
+            mock.call(info_b, integrated_into="HEAD", force=False),
+        ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["removed"], ["task-a"])
+        self.assertEqual(result["preserved"], [{
+            "task_id": "task-b", "reason": "not integrated",
+        }])
+
+    def test_cleanup_candidate_requires_matching_global_claim_and_result(self):
+        task_id = "task-claim"
+        job = mesh._encode_worker_job({
+            "repo": "/repo", "base": "b" * 40, "task": "cleanup",
+            "verification": [], "kind": "implementation",
+            "class": "normal",
+        })
+        digest = hashlib.sha256(job.encode("utf-8")).hexdigest()
+        encoded = mesh._encode_worker_result(
+            mesh._empty_worker_result(
+                "copilot", "completed", "done", "/work/task"))
+        info = {
+            "repo": "/repo", "base": "b" * 40, "branch": "worker",
+            "path": "/work/task", "root": "/work",
+        }
+        record = {
+            "worker_backend": "copilot", "peer": "worker-copilot",
+            "state": "completed", "worker_job_digest": digest,
+            "text": job,
+        }
+        inbound = {
+            task_id: {
+                "direction": "inbound", "local_node": "worker-copilot",
+                "peer": "coordinator", "state": "completed",
+                "worker_backend": "copilot", "worker_job_digest": digest,
+                "worktree_info": info, "text": job,
+            },
+        }
+        journal = {
+            "version": 1, "node": "worker-copilot", "task_id": task_id,
+            "backend": "copilot", "origin_peer": "coordinator",
+            "local_node": "worker-copilot", "job_digest": digest,
+            "attempt": 1, "phase": "replied", "worktree": "/work/task",
+            "result": encoded, "terminal_state": "completed",
+            "reply_error": None,
+        }
+        with mock.patch.object(mesh, "_load_worker_journal",
+                               return_value=journal), \
+             mock.patch.object(mesh, "_load_worker_execution_marker",
+                               return_value={}), \
+             mock.patch.object(mesh, "_validate_reusable_worker_worktree",
+                               return_value=info):
+            with self.assertRaisesRegex(ValueError, "claim"):
+                mesh._cleanup_candidate(
+                    self.cfg, self.pool, inbound, task_id, record)
+
+    def test_cleanup_candidate_rejects_mismatched_job_and_result_branch(self):
+        task_id = "task-binding"
+        job = mesh._encode_worker_job({
+            "repo": "/repo", "base": "b" * 40, "task": "cleanup",
+            "verification": [], "kind": "implementation",
+            "class": "normal",
+        })
+        digest = hashlib.sha256(job.encode("utf-8")).hexdigest()
+        encoded = mesh._encode_worker_result({
+            "backend": "copilot", "outcome": "no_change",
+            "branch": "wrong-branch", "commit": "", "changed_files": [],
+            "summary": "done", "verification": "not run",
+            "runtime_seconds": 0, "worktree": "/work/task",
+        })
+        info = {
+            "repo": "/repo", "base": "b" * 40,
+            "branch": "expected-branch", "path": "/work/task",
+            "root": "/work",
+        }
+        record = {
+            "worker_backend": "copilot", "peer": "worker-copilot",
+            "state": "completed", "worker_job_digest": digest,
+            "text": job,
+        }
+        inbound = {
+            task_id: {
+                "direction": "inbound", "local_node": "worker-copilot",
+                "peer": "coordinator", "state": "completed",
+                "worker_backend": "copilot", "worker_job_digest": digest,
+                "worktree_info": info, "text": job,
+            },
+        }
+        journal = {
+            "version": 1, "node": "worker-copilot", "task_id": task_id,
+            "backend": "copilot", "origin_peer": "coordinator",
+            "local_node": "worker-copilot", "job_digest": digest,
+            "attempt": 1, "phase": "replied", "worktree": "/work/task",
+            "result": encoded, "terminal_state": "completed",
+            "reply_error": None,
+        }
+        with mock.patch.object(mesh, "_load_worker_journal",
+                               return_value=journal), \
+             mock.patch.object(
+                 mesh, "_load_worker_execution_marker",
+                 side_effect=lambda _cfg, _task, expected=None: expected), \
+             mock.patch.object(mesh, "_validate_reusable_worker_worktree",
+                               return_value=info):
+            with self.assertRaisesRegex(ValueError, "branch"):
+                mesh._cleanup_candidate(
+                    self.cfg, self.pool, inbound, task_id, record)
+
+    def test_pool_clean_real_integrated_evidence_removes_worktree(self):
+        task_id = "task-integrated"
+        info = self._create_cleanup_evidence(task_id)
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=False, integrated_into=None))
+        self.assertFalse(os.path.exists(info["path"]))
+        self.assertEqual(json.loads(output.getvalue())["removed"], [task_id])
+
+    def test_pool_clean_real_unintegrated_evidence_is_preserved_by_default(self):
+        task_id = "task-unintegrated"
+        info = self._create_cleanup_evidence(task_id, commit_change=True)
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=False, integrated_into=None))
+        self.assertTrue(os.path.isdir(info["path"]))
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["removed"], [])
+        self.assertIn("not integrated", result["preserved"][0]["reason"])
+
+    def test_pool_clean_real_force_removes_one_terminal_unintegrated_task(self):
+        task_id = "task-forced"
+        info = self._create_cleanup_evidence(task_id, commit_change=True)
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=True, integrated_into=None))
+        self.assertFalse(os.path.exists(info["path"]))
+        self.assertEqual(json.loads(output.getvalue())["removed"], [task_id])
 
 
 class WorkerSuperviseTests(unittest.TestCase):
