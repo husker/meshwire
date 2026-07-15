@@ -2112,7 +2112,7 @@ def _worker_environment(backend, pool, source=None):
         "codex": "CODEX_HOME",
         "copilot": "COPILOT_HOME",
     }.get(backend)
-    if config_home in source:
+    if config_home is not None and config_home in source:
         env[config_home] = source[config_home]
     env["A2ACAST_WORKER"] = backend
     if backend == "goose":

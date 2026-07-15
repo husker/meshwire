@@ -321,7 +321,7 @@ mesh pool-start|pool-status|pool-stop   manage or inspect worker supervisors
 mesh delegate auto|codex|copilot|goose <task...> --repo ABS [--base COMMIT]
   [--kind implementation|analysis] [--class normal|security|integration]
   [--verify TEXT (repeatable)] [--wait 0..300] [--as NODE]   run an isolated task
-mesh pool-clean [--integrated-into REF] [--task ID --force]   remove eligible worktrees
+mesh pool-clean [--integrated-into REF] [--task ID [--force]]   remove eligible worktrees
 ```
 
 The blocking commands use shell-friendly exit codes: `tasks --wait` exits

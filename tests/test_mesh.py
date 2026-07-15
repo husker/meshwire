@@ -6583,6 +6583,21 @@ class WorkerBackendTests(unittest.TestCase):
         self.assertNotIn("CODEX_HOME", goose)
         self.assertNotIn("COPILOT_HOME", goose)
 
+    def test_goose_environment_accepts_real_process_environment(self):
+        with mock.patch.dict(os.environ, {"PATH": "/bin"}, clear=True):
+            env = mesh._worker_environment("goose", self.pool)
+
+        self.assertEqual(env, {
+            "PATH": "/bin",
+            "A2ACAST_WORKER": "goose",
+            "GOOSE_PROVIDER": "ollama",
+            "GOOSE_MODEL": "qwen3:4b",
+            "OLLAMA_HOST": "http://127.0.0.1:11434",
+            "GOOSE_CONTEXT_LIMIT": "8192",
+            "GOOSE_INPUT_LIMIT": "8192",
+            "GOOSE_MAX_TOKENS": "4096",
+        })
+
     def test_worker_environment_preserves_windows_cli_essentials_only(self):
         source = {
             "PATH": r"C:\Windows\System32",
