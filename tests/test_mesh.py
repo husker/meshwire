@@ -6,6 +6,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import hashlib
 import http.client
 import io
 import json
@@ -14,6 +15,7 @@ import re
 import secrets
 import signal
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -4946,6 +4948,217 @@ class WorkerProtocolTests(unittest.TestCase):
                 self.assertRegex(str(exc), "invalid worker job JSON")
             else:
                 self.fail("deeply nested worker JSON was accepted")
+
+
+class WorkerWorktreeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = os.path.join(self.tmp.name, "workspace")
+        self.repo = os.path.join(self.workspace, "repo")
+        self.cache = os.path.join(self.tmp.name, "cache")
+        os.makedirs(self.repo)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        with open(os.path.join(self.repo, "base.txt"), "w") as handle:
+            handle.write("base\n")
+        subprocess.run(
+            ["git", "-C", self.repo, "add", "base.txt"], check=True)
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="Test",
+            GIT_AUTHOR_EMAIL="test@example.invalid",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.invalid",
+        )
+        subprocess.run(
+            ["git", "-C", self.repo, "commit", "-qm", "base"],
+            check=True, env=env)
+        self.base = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        self.pool = {
+            "workspace_roots": [self.workspace],
+            "worktree_root": self.cache,
+        }
+
+    def git(self, *args, **kwargs):
+        return subprocess.run(
+            ["git", "-C", self.repo, *args], check=True,
+            capture_output=True, text=True, **kwargs).stdout
+
+    def test_rejects_sibling_prefix_escape(self):
+        sibling = self.workspace + "-outside"
+        os.makedirs(sibling)
+        with self.assertRaisesRegex(ValueError, "workspace roots"):
+            mesh._canonical_worker_repo(self.pool, sibling)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_rejects_symlink_escape(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        link = os.path.join(self.workspace, "linked-outside")
+        os.symlink(outside, link)
+        with self.assertRaisesRegex(ValueError, "workspace roots"):
+            mesh._canonical_worker_repo(self.pool, link)
+
+    def test_requires_exact_git_worktree_root(self):
+        child = os.path.join(self.repo, "child")
+        os.makedirs(child)
+        with self.assertRaisesRegex(ValueError, "worktree root"):
+            mesh._canonical_worker_repo(self.pool, child)
+
+    def test_resolves_base_to_full_commit(self):
+        resolved = mesh._resolve_worker_base(self.repo, "HEAD")
+        self.assertEqual(resolved, self.base)
+        self.assertRegex(resolved, r"^[0-9a-f]{40}$")
+
+    def test_worker_commit_does_not_change_active_checkout_or_index(self):
+        with open(os.path.join(self.repo, "base.txt"), "a") as handle:
+            handle.write("active-only\n")
+        subprocess.run(
+            ["git", "-C", self.repo, "add", "base.txt"], check=True)
+        with open(os.path.join(self.repo, "base.txt")) as handle:
+            active_before = handle.read()
+        index_before = self.git("write-tree").strip()
+        status_before = self.git("status", "--porcelain=v1", "-z")
+
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-123", "copilot", self.repo, self.base)
+        with open(os.path.join(info["path"], "worker.txt"), "w") as handle:
+            handle.write("worker\n")
+        commit, changed = mesh._commit_worker_changes(
+            info, "task-123", "copilot")
+
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertEqual(changed, ["worker.txt"])
+        with open(os.path.join(self.repo, "base.txt")) as handle:
+            self.assertEqual(handle.read(), active_before)
+        self.assertEqual(self.git("write-tree").strip(), index_before)
+        self.assertEqual(
+            self.git("status", "--porcelain=v1", "-z"), status_before)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.repo, "worker.txt")))
+        identity = subprocess.run(
+            ["git", "-C", info["path"], "show", "-s",
+             "--format=%an <%ae>%n%cn <%ce>", commit],
+            check=True, capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual(identity, [
+            "a2acast worker <worker@a2acast.local>",
+            "a2acast worker <worker@a2acast.local>",
+        ])
+
+    def test_no_change_returns_empty_commit_and_files(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-456", "goose", self.repo, self.base)
+        self.assertEqual(
+            mesh._commit_worker_changes(info, "task-456", "goose"),
+            ("", []))
+
+    def test_task_id_is_hashed_for_paths_and_git_refs(self):
+        task_id = "task:with:colons"
+        info = mesh._prepare_worker_worktree(
+            self.pool, task_id, "codex", self.repo, self.base)
+        self.assertNotIn(task_id, info["path"])
+        self.assertNotIn(task_id, info["branch"])
+        self.assertRegex(
+            os.path.basename(os.path.dirname(info["path"])),
+            r"^[0-9a-f]{20}$")
+
+    def test_rejects_invalid_task_id_and_backend(self):
+        with self.assertRaisesRegex(ValueError, "invalid task id"):
+            mesh._worker_task_token("../task")
+        for backend in ("../escape", []):
+            with self.subTest(backend=backend), \
+                    self.assertRaisesRegex(ValueError, "invalid backend"):
+                mesh._prepare_worker_worktree(
+                    self.pool, "task-safe", backend, self.repo, self.base)
+
+    def test_existing_worker_path_gets_a_non_destructive_suffix(self):
+        token = mesh._worker_task_token("task-collision")
+        fingerprint = hashlib.sha256(
+            os.path.realpath(self.repo).encode("utf-8")
+        ).hexdigest()[:16]
+        occupied = os.path.join(
+            os.path.realpath(self.cache), fingerprint, token, "goose")
+        os.makedirs(occupied)
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-collision", "goose", self.repo, self.base)
+        self.assertEqual(info["path"], occupied + "-2")
+        self.assertTrue(os.path.isdir(occupied))
+
+    def test_existing_worker_branch_gets_a_non_destructive_suffix(self):
+        token = mesh._worker_task_token("task-branch-collision")
+        occupied = "codex/a2acast-{}-copilot".format(token)
+        subprocess.run(
+            ["git", "-C", self.repo, "branch", occupied, self.base],
+            check=True)
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-branch-collision", "copilot",
+            self.repo, self.base)
+        self.assertEqual(info["branch"], occupied + "-2")
+        self.assertEqual(
+            self.git("rev-parse", occupied).strip(), self.base)
+
+    def test_rejects_worktree_root_inside_active_checkout(self):
+        pool = dict(
+            self.pool,
+            worktree_root=os.path.join(self.repo, ".worker-cache"),
+        )
+        with self.assertRaisesRegex(ValueError, "active checkout"):
+            mesh._prepare_worker_worktree(
+                pool, "task-nested-cache", "codex", self.repo, self.base)
+
+    def test_remove_rejects_path_outside_worker_root(self):
+        info = {
+            "path": self.repo,
+            "root": self.cache,
+            "repo": self.repo,
+        }
+        with self.assertRaisesRegex(ValueError, "outside worker root"):
+            mesh._remove_worker_worktree(info, force=True)
+
+    def test_remove_refuses_unintegrated_commit(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-789", "copilot", self.repo, self.base)
+        with open(os.path.join(info["path"], "worker.txt"), "w") as handle:
+            handle.write("worker\n")
+        mesh._commit_worker_changes(info, "task-789", "copilot")
+        with self.assertRaisesRegex(ValueError, "not integrated"):
+            mesh._remove_worker_worktree(
+                info, integrated_into=self.base)
+
+    def test_remove_refuses_uncommitted_changes_without_force(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-dirty", "codex", self.repo, self.base)
+        with open(os.path.join(info["path"], "worker.txt"), "w") as handle:
+            handle.write("uncommitted\n")
+        with self.assertRaisesRegex(ValueError, "uncommitted changes"):
+            mesh._remove_worker_worktree(
+                info, integrated_into=self.base)
+        self.assertTrue(os.path.exists(info["path"]))
+
+    def test_remove_accepts_commit_reachable_from_integration_ref(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-abc", "goose", self.repo, self.base)
+        with open(os.path.join(info["path"], "worker.txt"), "w") as handle:
+            handle.write("worker\n")
+        commit, _changed = mesh._commit_worker_changes(
+            info, "task-abc", "goose")
+        subprocess.run(
+            ["git", "-C", self.repo, "branch", "integrated", commit],
+            check=True)
+        mesh._remove_worker_worktree(
+            info, integrated_into="integrated")
+        self.assertFalse(os.path.exists(info["path"]))
+
+    def test_remove_force_accepts_unintegrated_commit(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-force", "copilot", self.repo, self.base)
+        with open(os.path.join(info["path"], "worker.txt"), "w") as handle:
+            handle.write("worker\n")
+        mesh._commit_worker_changes(info, "task-force", "copilot")
+        mesh._remove_worker_worktree(info, force=True)
+        self.assertFalse(os.path.exists(info["path"]))
 
 
 class CodexAllowTests(unittest.TestCase):
