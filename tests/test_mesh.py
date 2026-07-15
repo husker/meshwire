@@ -8321,6 +8321,61 @@ class PoolConfigTests(unittest.TestCase):
         self.assertEqual(stale_permissive_cfg["exec_allow"],
                          ["coordinator"])
 
+    def test_large_mesh_config_loads_and_mutation_preserves_large_field(self):
+        large_description = "x" * (mesh.POOL_CONFIG_MAX_BYTES + 4096)
+        self.cfg["cards"] = {
+            "coordinator": {"description": large_description},
+        }
+        mesh._save_config(self.cfg)
+
+        with mock.patch.object(mesh, "find_config",
+                               return_value=self.cfg["_path"]):
+            try:
+                loaded = mesh.load_config()
+            except SystemExit as exc:
+                self.fail(f"valid large mesh config was rejected: {exc}")
+        self.assertEqual(
+            loaded["cards"]["coordinator"]["description"],
+            large_description)
+
+        mesh._mutate_config(
+            loaded, lambda latest: latest.__setitem__("probe", "updated"))
+        with mock.patch.object(mesh, "find_config",
+                               return_value=self.cfg["_path"]):
+            reloaded = mesh.load_config()
+        self.assertEqual(reloaded["probe"], "updated")
+        self.assertEqual(
+            reloaded["cards"]["coordinator"]["description"],
+            large_description)
+
+    def test_mesh_config_fallback_without_nofollow_rejects_unsafe_types(self):
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
+             mock.patch.object(mesh, "find_config",
+                               return_value=self.cfg["_path"]):
+            try:
+                loaded = mesh.load_config()
+            except SystemExit as exc:
+                self.fail(
+                    "regular mesh config was rejected without "
+                    f"O_NOFOLLOW: {exc}")
+        self.assertEqual(loaded["mesh"], self.cfg["mesh"])
+
+        config_link = self.cfg["_path"] + ".link"
+        os.symlink(self.cfg["_path"], config_link)
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
+             mock.patch.object(mesh, "find_config",
+                               return_value=config_link):
+            with self.assertRaisesRegex(SystemExit, "trusted regular file"):
+                mesh.load_config()
+
+        non_regular = os.path.join(self.tmp.name, "config-directory")
+        os.mkdir(non_regular)
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
+             mock.patch.object(mesh, "find_config",
+                               return_value=non_regular):
+            with self.assertRaisesRegex(SystemExit, "trusted regular file"):
+                mesh.load_config()
+
     def test_pool_setup_does_not_publish_when_config_mutation_fails(self):
         self._write_pool()
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \

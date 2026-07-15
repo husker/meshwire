@@ -397,8 +397,7 @@ def load_config():
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` first.")
     try:
-        cfg = _load_json_regular(
-            p, require_private=False, max_bytes=POOL_CONFIG_MAX_BYTES)
+        cfg = _load_mesh_config_json(p, require_private=False)
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
             WorkerEvidenceUnsupported) as exc:
         sys.exit(
@@ -520,7 +519,8 @@ def _validate_pool_config(cfg, pool):
     config_path = os.path.abspath(config_path)
     canonical_config = os.path.realpath(config_path)
     try:
-        config_fd = _open_regular_readonly(config_path)
+        config_fd = _open_mesh_config_readonly(
+            config_path, require_private=True)
     except (OSError, TypeError, ValueError, WorkerEvidenceUnsupported) as exc:
         raise ValueError("mesh config binding is not trusted") from exc
     else:
@@ -598,9 +598,7 @@ def load_pool_config(cfg=None):
         if lock is None:
             raise RuntimeError("config lock is unavailable")
         path = os.path.abspath(cfg.get("_path") or CONFIG_NAME)
-        latest = _load_json_regular(
-            path, require_private=False,
-            max_bytes=POOL_CONFIG_MAX_BYTES)
+        latest = _load_mesh_config_json(path, require_private=False)
         if not isinstance(latest, dict):
             raise ValueError("mesh configuration must be an object")
         latest["_path"] = path
@@ -865,9 +863,8 @@ def _mutate_config(cfg, apply, publish=None):
         raise RuntimeError("config lock is unavailable")
     try:
         try:
-            latest = _load_json_regular(
-                path, require_private=False,
-                max_bytes=POOL_CONFIG_MAX_BYTES)
+            latest = _load_mesh_config_json(
+                path, require_private=False)
         except FileNotFoundError:
             latest = {k: v for k, v in cfg.items() if not k.startswith("_")}
         if not isinstance(latest, dict):
@@ -2010,6 +2007,49 @@ def _open_regular_readonly(path, require_private=True):
     except BaseException:
         os.close(fd)
         raise
+
+
+def _open_mesh_config_readonly(path, require_private=False):
+    """Open mesh config safely, with a stable-identity compatibility path.
+
+    Worker evidence requires kernel-enforced no-follow and remains strict.
+    Ordinary mesh configuration predates that worker boundary and must remain
+    usable on platforms without ``O_NOFOLLOW``. The fallback rejects a
+    final-component symlink/non-regular file, requires same-user identity, and
+    verifies the same device/inode before, during, and after opening.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if isinstance(nofollow, int) and nofollow:
+        return _open_regular_readonly(
+            path, require_private=require_private)
+
+    before = os.lstat(path)
+    identity = _validate_regular_stat(before, require_private)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        opened = os.fstat(fd)
+        if _validate_regular_stat(opened, require_private) != identity:
+            raise OSError("mesh configuration changed while opening")
+        after = os.lstat(path)
+        if _validate_regular_stat(after, require_private) != identity:
+            raise OSError("mesh configuration path changed while opening")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _load_mesh_config_json(path, require_private=False):
+    """Read an unbounded-by-pool-policy mesh config from a trusted file."""
+    fd = _open_mesh_config_readonly(
+        path, require_private=require_private)
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            return json.load(handle)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _load_json_regular(path, require_private=True, max_bytes=None):
