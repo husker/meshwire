@@ -5263,6 +5263,8 @@ class WorkerBackendTests(unittest.TestCase):
 
         self.assertIn("task-123", prompt)
         self.assertIn("coordinator", prompt)
+        self.assertIn("dedicated, Git-worktree-scoped", prompt)
+        self.assertIn("not OS-level isolation", prompt)
         self.assertIn("untrusted quoted content", prompt)
         self.assertIn("Work only in the current Git worktree", prompt)
         self.assertIn("Do not read unrelated home-directory data", prompt)
@@ -5286,34 +5288,107 @@ class WorkerBackendTests(unittest.TestCase):
     def test_copilot_command_is_headless_and_least_privilege(self):
         command = mesh._worker_command(
             "copilot", "/tmp/w", "PROMPT", self.pool)
-        self.assertEqual(command, [
+        git_programs = (
+            "git", "/usr/bin/git", "/usr/local/bin/git",
+            "/opt/homebrew/bin/git", "git.exe",
+        )
+        git_subcommands = (
+            "add", "am", "apply", "archive", "bisect", "branch",
+            "checkout", "checkout-index", "cherry-pick", "clean", "clone",
+            "commit", "commit-tree", "config", "credential", "daemon",
+            "fast-import", "fetch", "fetch-pack", "filter-branch", "gc",
+            "hash-object", "http-fetch", "http-push", "index-pack", "init",
+            "ls-remote", "maintenance", "merge", "merge-file",
+            "merge-index", "multi-pack-index", "mv", "notes", "p4",
+            "pack-refs", "prune", "pull", "push", "read-tree", "rebase",
+            "reflog", "remote", "repack", "replace", "rerere", "reset",
+            "restore", "revert", "rm", "send-email", "shell",
+            "sparse-checkout", "stash", "submodule", "svn", "switch",
+            "symbolic-ref", "tag", "unpack-objects", "update-index",
+            "update-ref", "upload-archive", "upload-pack", "worktree",
+            "write-tree",
+        )
+        git_wildcards = (
+            r"C:\Program Files\Git\cmd\git.exe:*",
+            r"C:\Program Files\Git\bin\git.exe:*",
+        )
+        wrappers = (
+            "env:*", "/usr/bin/env:*", "command:*", "xargs:*",
+            "/usr/bin/xargs:*", "sudo:*", "/usr/bin/sudo:*", "nohup:*",
+            "nice:*", "bash -c", "sh -c", "zsh -c", "cmd.exe /c",
+            "powershell -Command", "pwsh -Command", "python -c",
+            "python3 -c", "node -e", "ruby -e", "perl -e",
+            r"C:\Windows\System32\cmd.exe /c",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "
+            "-Command",
+        )
+        remote_programs = (
+            "gh", "/usr/bin/gh", "/usr/local/bin/gh",
+            "/opt/homebrew/bin/gh", "gh.exe", "curl", "/usr/bin/curl",
+            "/usr/local/bin/curl", "/opt/homebrew/bin/curl", "curl.exe",
+            "wget", "/usr/bin/wget", "/usr/local/bin/wget",
+            "/opt/homebrew/bin/wget", "wget.exe",
+            r"C:\Program Files\GitHub CLI\gh.exe",
+            r"C:\Windows\System32\curl.exe",
+        )
+        expected = [
             "copilot", "--no-ask-user", "--no-remote",
             "--no-remote-export", "--no-auto-update",
             "--disable-builtin-mcps",
             "--available-tools=view,grep,glob,edit,create,apply_patch,bash",
             "--allow-tool=write", "--allow-tool=shell",
             "--deny-tool=url", "--deny-tool=memory",
-            "--deny-tool=shell(git push)",
-            "--deny-tool=shell(git pull)",
-            "--deny-tool=shell(git fetch)",
-            "--deny-tool=shell(git clone)",
-            "--deny-tool=shell(git remote)",
-            "--deny-tool=shell(git commit)",
-            "--deny-tool=shell(git merge)",
-            "--deny-tool=shell(git rebase)",
-            "--deny-tool=shell(git reset)",
-            "--deny-tool=shell(git clean)",
-            "--deny-tool=shell(git checkout)",
-            "--deny-tool=shell(git switch)",
-            "--deny-tool=shell(git worktree)",
-            "--deny-tool=shell(git submodule)",
-            "--deny-tool=shell(gh:*)",
-            "--deny-tool=shell(curl:*)",
-            "--deny-tool=shell(wget:*)",
-            "--output-format=text", "-p", "PROMPT",
-        ])
+        ]
+        expected.extend(
+            f"--deny-tool=shell({program} {subcommand})"
+            for program in git_programs for subcommand in git_subcommands)
+        expected.extend(
+            f"--deny-tool=shell({pattern})" for pattern in git_wildcards)
+        expected.extend(
+            f"--deny-tool=shell({wrapper})" for wrapper in wrappers)
+        expected.extend(
+            f"--deny-tool=shell({program}:*)"
+            for program in remote_programs)
+        expected.extend(["--output-format=text", "-p", "PROMPT"])
+        self.assertEqual(command, expected)
         self.assertNotIn("--allow-all", command)
         self.assertNotIn("--allow-all-tools", command)
+
+    def test_copilot_command_denies_adversarial_git_and_remote_forms(self):
+        command = mesh._worker_command(
+            "copilot", "/tmp/w", "PROMPT", self.pool)
+        rules = set(command)
+        for operation in (
+                "add", "restore", "rm", "branch", "tag", "stash",
+                "cherry-pick", "revert", "ls-remote", "push", "fetch",
+                "pull", "clone", "remote", "commit", "merge", "rebase",
+                "reset", "clean"):
+            with self.subTest(operation=operation):
+                self.assertIn(
+                    f"--deny-tool=shell(git {operation})", rules)
+                self.assertIn(
+                    f"--deny-tool=shell(/usr/bin/git {operation})", rules)
+                self.assertIn(
+                    f"--deny-tool=shell(git.exe {operation})", rules)
+        for wrapper in (
+                "env:*", "/usr/bin/env:*", "command:*", "xargs:*",
+                "sudo:*", "bash -c", "cmd.exe /c", "powershell -Command",
+                "python -c", "node -e"):
+            with self.subTest(wrapper=wrapper):
+                self.assertIn(
+                    f"--deny-tool=shell({wrapper})", rules)
+        for pattern in (
+                r"C:\Program Files\Git\cmd\git.exe:*",
+                r"C:\Program Files\Git\bin\git.exe:*"):
+            with self.subTest(pattern=pattern):
+                self.assertIn(
+                    f"--deny-tool=shell({pattern})", rules)
+        for program in (
+                "gh", "/usr/bin/gh", "gh.exe", "curl", "/usr/bin/curl",
+                "curl.exe", "wget", "/usr/bin/wget", "wget.exe"):
+            with self.subTest(program=program):
+                self.assertIn(
+                    f"--deny-tool=shell({program}:*)", rules)
 
     def test_goose_command_is_bounded_and_headless(self):
         command = mesh._worker_command(
@@ -5372,6 +5447,36 @@ class WorkerBackendTests(unittest.TestCase):
         self.assertNotIn("CODEX_HOME", goose)
         self.assertNotIn("COPILOT_HOME", goose)
 
+    def test_worker_environment_preserves_windows_cli_essentials_only(self):
+        source = {
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+            "USERPROFILE": r"C:\Users\worker",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "COMSPEC": r"C:\Windows\System32\cmd.exe",
+            "APPDATA": r"C:\Users\worker\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\worker\AppData\Local",
+            "OPENAI_API_KEY": "secret",
+            "COPILOT_GITHUB_TOKEN": "secret",
+            "GH_TOKEN": "secret",
+            "GITHUB_TOKEN": "secret",
+            "RESEND_API_KEY": "secret",
+            "A2ACAST_KEY": "secret",
+        }
+
+        env = mesh._worker_environment("copilot", self.pool, source=source)
+
+        self.assertEqual(env, {
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+            "USERPROFILE": r"C:\Users\worker",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "COMSPEC": r"C:\Windows\System32\cmd.exe",
+            "APPDATA": r"C:\Users\worker\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\worker\AppData\Local",
+            "A2ACAST_WORKER": "copilot",
+        })
+
     def test_goose_environment_uses_validated_local_pool_config(self):
         source = {
             "PATH": "/bin",
@@ -5396,25 +5501,59 @@ class WorkerBackendTests(unittest.TestCase):
     def test_failure_classifier_labels_explicit_quota_signals(self):
         for text in (
                 "HTTP 429 rate limit exceeded",
-                "monthly quota exhausted",
-                "usage limit reached"):
+                "Copilot API quota exceeded",
+                "codex CLI usage limit reached"):
             with self.subTest(text=text):
                 self.assertEqual(mesh._classify_worker_failure(text), "quota")
 
     def test_failure_classifier_labels_explicit_unavailable_signals(self):
         for text in (
                 "not logged in",
-                "authentication required",
-                "model qwen3:4b not found",
-                "connection refused"):
+                "Copilot API authentication required",
+                "Ollama provider model qwen3:4b not found",
+                "Goose provider connection refused"):
             with self.subTest(text=text):
                 self.assertEqual(
                     mesh._classify_worker_failure(text), "unavailable")
 
     def test_failure_classifier_does_not_guess_from_generic_failure(self):
-        for text in ("tests failed", "request failed", "size limit failed"):
+        for text in (
+                "tests failed", "request failed", "size limit failed",
+                "database connection refused", "quota test failed",
+                "model fixture not found", "test expected 429 but got 500",
+                "Copilot API fixture passed\ndatabase connection refused",
+                "provider fixture passed\nmodel fixture not found"):
             with self.subTest(text=text):
                 self.assertEqual(mesh._classify_worker_failure(text), "failed")
+
+    def test_worker_command_enforces_shared_utf8_prompt_budget(self):
+        limit = 16 * 1024
+        self.assertLess(limit, mesh.WORKER_TASK_MAX)
+        accepted = "é" * (limit // 2)
+        rejected = accepted + "x"
+        longest = "x" * limit
+
+        for backend in ("codex", "copilot", "goose"):
+            with self.subTest(backend=backend, boundary="accepted"):
+                command = mesh._worker_command(
+                    backend, "/tmp/w", accepted, self.pool)
+                self.assertEqual(command[-1], accepted)
+                self.assertEqual(len(command[-1].encode("utf-8")), limit)
+                longest_command = mesh._worker_command(
+                    backend, "/tmp/w", longest, self.pool)
+                self.assertEqual(longest_command[-1], longest)
+                self.assertLessEqual(
+                    sum(len(part) + 1 for part in longest_command), 32767)
+            with self.subTest(backend=backend, boundary="rejected"):
+                with self.assertRaisesRegex(
+                        ValueError, "worker prompt exceeds"):
+                    mesh._worker_command(
+                        backend, "/tmp/w", rejected, self.pool)
+
+    def test_worker_command_rejects_non_utf8_prompt_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "valid UTF-8"):
+            mesh._worker_command(
+                "codex", "/tmp/w", "lone surrogate: \ud800", self.pool)
 
     def test_execute_worker_backend_is_bounded_and_sanitized(self):
         completed = mock.Mock(returncode=0, stdout="ok", stderr="")
@@ -5428,6 +5567,7 @@ class WorkerBackendTests(unittest.TestCase):
         self.assertIs(result, completed)
         run.assert_called_once_with(
             command, cwd="/tmp/w", capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=mesh.SUPERVISE_EXEC_TIMEOUT, env=environment)
 
     def test_unknown_worker_command_is_rejected(self):
