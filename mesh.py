@@ -603,6 +603,31 @@ def _write_json_secure(path, value, indent=None):
             pass
 
 
+def _write_text_secure(path, value):
+    """Atomically write UTF-8 text through a mode-0600 temp file."""
+    destination = os.path.abspath(path)
+    directory = os.path.dirname(destination)
+    prefix = f".{os.path.basename(destination)}."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(
+                fd, "w", encoding="utf-8", errors="replace") as handle:
+            fd = None
+            handle.write(str(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, destination)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
 def peers_file(cfg):
     return os.path.join(cfg["_dir"], PEERS_NAME)
 
@@ -1461,6 +1486,438 @@ def _execute_worker_backend(command, worktree, environment):
         command, cwd=worktree, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
         timeout=SUPERVISE_EXEC_TIMEOUT, env=environment)
+
+
+def _worker_node_token(node):
+    if not isinstance(node, str) or not node:
+        raise ValueError("invalid worker node")
+    try:
+        encoded = node.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("invalid worker node") from exc
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def _worker_journal_file(cfg, node, task_id):
+    return os.path.join(
+        cfg["_dir"],
+        ".meshwire.worker-journal.{}.{}.json".format(
+            _worker_node_token(node), _worker_task_token(task_id)),
+    )
+
+
+def _write_worker_journal(cfg, node, task_id, value):
+    if not isinstance(value, dict):
+        raise ValueError("worker journal must be an object")
+    _write_json_secure(
+        _worker_journal_file(cfg, node, task_id), value, indent=1)
+
+
+def _load_worker_journal(cfg, node, task_id):
+    try:
+        with open(
+                _worker_journal_file(cfg, node, task_id),
+                "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, RecursionError):
+        return {}
+
+
+def _worker_output_file(cfg, node, task_id):
+    return os.path.join(
+        cfg["_dir"],
+        ".meshwire.worker-output.{}.{}.log".format(
+            _worker_node_token(node), _worker_task_token(task_id)),
+    )
+
+
+def _worker_utf8_text(value):
+    """Return a deterministic UTF-8-safe rendering of backend text."""
+    return str(value).encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _write_worker_output(cfg, node, task_id, output):
+    path = _worker_output_file(cfg, node, task_id)
+    _write_text_secure(path, _worker_utf8_text(output))
+    return path
+
+
+def _write_worker_phase(cfg, node, task_id, phase, **fields):
+    journal = _load_worker_journal(cfg, node, task_id)
+    journal.update(fields)
+    journal["phase"] = phase
+    _write_worker_journal(cfg, node, task_id, journal)
+    return journal
+
+
+def _bounded_worker_text(value, fallback="worker produced no output",
+                         limit=8192):
+    text = _sanitize_worker_human_text(_worker_utf8_text(value)).strip()
+    if not text:
+        text = fallback
+    encoded = text.encode("utf-8")
+    if len(encoded) > limit:
+        text = encoded[-limit:].decode("utf-8", errors="ignore")
+    return text
+
+
+def _worker_result_summary(output, output_path, fallback):
+    # Keep the supervisor-owned log pointer unambiguous even when backend
+    # output tries to mimic it.
+    preview = _bounded_worker_text(output, fallback=fallback).replace(
+        "Full output:", "Full output (backend):")
+    path = _sanitize_worker_human_text(_worker_utf8_text(output_path)).strip()
+    return f"{preview}\nFull output: {path}"
+
+
+def _empty_worker_result(backend, outcome, summary, worktree="",
+                         verification="not run", runtime_seconds=0):
+    summary = _bounded_worker_text(summary, fallback="worker failed")
+    verification = _bounded_worker_text(
+        verification, fallback="not run")
+    return {
+        "backend": backend,
+        "outcome": outcome,
+        "branch": "",
+        "commit": "",
+        "changed_files": [],
+        "summary": summary,
+        "verification": verification,
+        "runtime_seconds": runtime_seconds,
+        "worktree": worktree if isinstance(worktree, str) else "",
+    }
+
+
+def _worker_task_is_addressed(task, me, expected_state):
+    return (
+        isinstance(task, dict)
+        and task.get("direction") == "inbound"
+        and task.get("local_node") == me
+        and task.get("state") == expected_state
+        and isinstance(task.get("peer"), str)
+        and bool(task.get("peer"))
+    )
+
+
+def _save_worker_task_snapshot(cfg, task_id, task, **updates):
+    fields = {
+        key: value for key, value in task.items()
+        if key != "updated"
+    }
+    fields.update(updates)
+    return save_task(cfg, task_id, **fields)
+
+
+def _validate_reusable_worker_worktree(pool, info, repo, base):
+    if not isinstance(info, dict):
+        raise ValueError("worker worktree state is invalid")
+    required = {"repo", "base", "branch", "path", "root"}
+    if not required.issubset(info):
+        raise ValueError("worker worktree state is incomplete")
+    if info["repo"] != repo or info["base"] != base:
+        raise ValueError("worker worktree does not match the validated job")
+    configured_root = os.path.realpath(
+        os.path.abspath(os.path.expanduser(pool["worktree_root"])))
+    root = os.path.realpath(info["root"])
+    path = os.path.realpath(info["path"])
+    if root != configured_root or not _path_is_within(path, root):
+        raise ValueError("worker worktree is outside configured root")
+    if path == root or not os.path.isdir(path):
+        raise ValueError("worker worktree is unavailable")
+    if (not isinstance(info["branch"], str)
+            or _worker_metadata_has_controls(info["branch"])):
+        raise ValueError("worker branch is invalid")
+    top = _git("-C", path, "rev-parse", "--show-toplevel").stdout.strip()
+    if os.path.realpath(top) != path:
+        raise ValueError("worker worktree path is not its Git root")
+    return dict(info)
+
+
+def _queue_worker_result(cfg, me, task_id, result, terminal_state):
+    """Persist an encoded result before making it eligible for delivery."""
+    if terminal_state not in {"completed", "failed"}:
+        raise ValueError("invalid worker terminal state")
+    try:
+        encoded = _encode_worker_result(result)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        backend = result.get("backend") if isinstance(result, dict) else None
+        if backend not in {"codex", "copilot", "goose"}:
+            backend = "codex"
+        summary = f"worker result encoding failed: {exc}"
+        original_summary = (
+            result.get("summary") if isinstance(result, dict) else None)
+        if isinstance(original_summary, str) and "Full output:" in original_summary:
+            output_path = original_summary.rsplit(
+                "Full output:", 1)[1].splitlines()[0].strip()
+            if output_path:
+                summary = _worker_result_summary(
+                    summary, output_path,
+                    fallback="worker result encoding failed")
+        fallback = _empty_worker_result(
+            backend,
+            "failed",
+            summary,
+            result.get("worktree", "")
+            if isinstance(result, dict) else "",
+        )
+        encoded = _encode_worker_result(fallback)
+        terminal_state = "failed"
+    _write_worker_phase(
+        cfg, me, task_id, "committed", result=encoded,
+        terminal_state=terminal_state)
+    save_task(
+        cfg, task_id, state="reply_pending",
+        pending_result=encoded,
+        pending_terminal_state=terminal_state,
+        reply_error=None)
+    _write_worker_phase(
+        cfg, me, task_id, "reply_pending", result=encoded,
+        terminal_state=terminal_state)
+    return encoded, terminal_state
+
+
+def _retry_worker_reply(cfg, me, task_id, task):
+    if not _worker_task_is_addressed(task, me, "reply_pending"):
+        return False
+    encoded = task.get("pending_result")
+    terminal_state = task.get("pending_terminal_state", "failed")
+    if (not isinstance(encoded, str)
+            or terminal_state not in {"completed", "failed"}):
+        return False
+    try:
+        _parse_worker_result(encoded)
+    except ValueError:
+        return False
+    try:
+        _send_reply(cfg, me, task_id, terminal_state, encoded)
+    except (urllib.error.URLError, socket.timeout, HTTPException, OSError) as exc:
+        save_task(
+            cfg, task_id, state="reply_pending",
+            pending_result=encoded,
+            pending_terminal_state=terminal_state,
+            reply_error=_bounded_worker_text(exc, fallback="reply failed"))
+        _write_worker_phase(
+            cfg, me, task_id, "reply_pending", result=encoded,
+            terminal_state=terminal_state,
+            reply_error=_bounded_worker_text(exc, fallback="reply failed"))
+        return False
+    save_task(
+        cfg, task_id, state=terminal_state, result=encoded,
+        pending_result=encoded,
+        pending_terminal_state=terminal_state,
+        reply_error=None)
+    _mark_handled(cfg, me, task_id)
+    _write_worker_phase(
+        cfg, me, task_id, "replied", result=encoded,
+        terminal_state=terminal_state, reply_error=None)
+    return True
+
+
+def _reply_worker_result(cfg, me, task_id, result, terminal_state):
+    encoded, terminal_state = _queue_worker_result(
+        cfg, me, task_id, result, terminal_state)
+    pending = load_tasks(cfg).get(task_id) or {}
+    pending["pending_result"] = encoded
+    pending["pending_terminal_state"] = terminal_state
+    pending["state"] = "reply_pending"
+    return _retry_worker_reply(cfg, me, task_id, pending)
+
+
+def _worker_attempt_count(task):
+    attempts = task.get("attempts", 0)
+    if (not isinstance(attempts, int) or isinstance(attempts, bool)
+            or attempts < 0):
+        return 0
+    return attempts
+
+
+def _run_worker_task(cfg, pool, me, backend, task_id, task):
+    """Execute one isolated job without coupling delivery retries to work."""
+    try:
+        _worker_task_token(task_id)
+    except ValueError:
+        return False
+    if task.get("state") == "reply_pending":
+        return _retry_worker_reply(cfg, me, task_id, task)
+    if not _worker_task_is_addressed(task, me, "submitted"):
+        return False
+    worker = pool.get("workers", {}).get(backend)
+    if not isinstance(worker, dict) or worker.get("node") != me:
+        return False
+
+    _save_worker_task_snapshot(cfg, task_id, task, state="submitted")
+    sender = task["peer"]
+    try:
+        job = _parse_worker_job(task.get("text", ""))
+        job["repo"] = _canonical_worker_repo(pool, job["repo"])
+        job["base"] = _resolve_worker_base(job["repo"], job["base"])
+    except (ValueError, subprocess.CalledProcessError, OSError) as exc:
+        result = _empty_worker_result(
+            backend, "failed", f"job rejected: {exc}")
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+
+    _write_worker_phase(
+        cfg, me, task_id, "validated", backend=backend,
+        repo=job["repo"], base=job["base"])
+    _save_worker_task_snapshot(cfg, task_id, task, state="working")
+
+    info = task.get("worktree_info")
+    try:
+        if isinstance(info, dict):
+            info = _validate_reusable_worker_worktree(
+                pool, info, job["repo"], job["base"])
+        else:
+            info = _prepare_worker_worktree(
+                pool, task_id, backend, job["repo"], job["base"])
+    except (ValueError, subprocess.CalledProcessError, OSError, KeyError) as exc:
+        path = info.get("path", "") if isinstance(info, dict) else ""
+        result = _empty_worker_result(
+            backend, "failed", f"worker preparation failed: {exc}", path)
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+
+    save_task(cfg, task_id, state="working", worktree_info=info)
+    _write_worker_phase(
+        cfg, me, task_id, "prepared", backend=backend,
+        worktree=info["path"], info=info)
+    try:
+        prompt = _worker_prompt(task_id, sender, job)
+        command = _worker_command(backend, info["path"], prompt, pool)
+        environment = _worker_environment(backend, pool)
+    except (ValueError, UnicodeError, KeyError, TypeError) as exc:
+        result = _empty_worker_result(
+            backend, "failed", f"worker command rejected: {exc}",
+            info["path"])
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+
+    started = time.monotonic()
+    _write_worker_phase(
+        cfg, me, task_id, "running", backend=backend,
+        worktree=info["path"], info=info)
+    try:
+        completed = _execute_worker_backend(
+            command, info["path"], environment)
+    except FileNotFoundError:
+        completed = subprocess.CompletedProcess(
+            command, 127, stdout="",
+            stderr=f"{backend} executable not found")
+    except subprocess.TimeoutExpired:
+        completed = subprocess.CompletedProcess(
+            command, 124, stdout="", stderr="worker timed out")
+    except subprocess.CalledProcessError as exc:
+        completed = subprocess.CompletedProcess(
+            command, exc.returncode,
+            stdout=getattr(exc, "stdout", "") or "",
+            stderr=getattr(exc, "stderr", "") or str(exc))
+    except (OSError, ValueError, UnicodeError) as exc:
+        completed = subprocess.CompletedProcess(
+            command, 1, stdout="", stderr=f"worker execution failed: {exc}")
+
+    runtime = max(0, int(time.monotonic() - started))
+    output = _worker_utf8_text(
+        (completed.stdout or "") + "\n" + (completed.stderr or "")
+    ).strip()
+    try:
+        output_path = _write_worker_output(cfg, me, task_id, output)
+    except (OSError, ValueError, UnicodeError) as exc:
+        result = _empty_worker_result(
+            backend, "failed",
+            f"worker output persistence failed after execution: {exc}",
+            info["path"], runtime_seconds=runtime)
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+    _write_worker_phase(
+        cfg, me, task_id, "executed", backend=backend,
+        worktree=info["path"], info=info, output_path=output_path,
+        returncode=completed.returncode, runtime_seconds=runtime)
+
+    if completed.returncode != 0:
+        outcome = _classify_worker_failure(output)
+        attempts = _worker_attempt_count(task) + 1
+        if outcome == "failed" and attempts < SUPERVISE_MAX_ATTEMPTS:
+            save_task(
+                cfg, task_id, state="submitted", attempts=attempts,
+                worktree_info=info)
+            return False
+        summary = _worker_result_summary(
+            output, output_path, fallback="worker failed")
+        result = _empty_worker_result(
+            backend, outcome, summary, info["path"],
+            verification=_bounded_worker_text(
+                output, fallback="worker failed"),
+            runtime_seconds=runtime)
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+
+    try:
+        commit, changed = _commit_worker_changes(info, task_id, backend)
+    except (ValueError, subprocess.CalledProcessError, OSError,
+            UnicodeError, KeyError, TypeError) as exc:
+        summary = _worker_result_summary(
+            f"worker commit failed: {exc}", output_path,
+            fallback="worker commit failed")
+        result = _empty_worker_result(
+            backend, "failed", summary, info["path"],
+            verification=_bounded_worker_text(
+                output, fallback="commit failed"),
+            runtime_seconds=runtime)
+        return _reply_worker_result(cfg, me, task_id, result, "failed")
+
+    outcome = "completed" if commit or job["kind"] == "analysis" \
+        else "no_change"
+    result = {
+        "backend": backend,
+        "outcome": outcome,
+        "branch": info["branch"],
+        "commit": commit,
+        "changed_files": changed,
+        "summary": _worker_result_summary(
+            output, output_path, fallback=outcome),
+        "verification": _bounded_worker_text(output, fallback=outcome),
+        "runtime_seconds": runtime,
+        "worktree": info["path"],
+    }
+    return _reply_worker_result(cfg, me, task_id, result, "completed")
+
+
+def _recover_worker_tasks(cfg, pool, me, backend):
+    """Fail closed for ambiguous executions and restore durable replies."""
+    del pool  # Reserved for future worktree inspection; never auto-rerun here.
+    for task_id, task in load_tasks(cfg).items():
+        if not _worker_task_is_addressed(task, me, "working"):
+            continue
+        journal = _load_worker_journal(cfg, me, task_id)
+        encoded = journal.get("result")
+        if isinstance(encoded, str):
+            try:
+                result = _parse_worker_result(encoded)
+            except ValueError:
+                encoded = None
+            else:
+                terminal_state = journal.get("terminal_state")
+                if terminal_state not in {"completed", "failed"}:
+                    terminal_state = (
+                        "completed" if result["outcome"]
+                        in {"completed", "no_change"} else "failed")
+                save_task(
+                    cfg, task_id, state="reply_pending",
+                    pending_result=encoded,
+                    pending_terminal_state=terminal_state,
+                    reply_error=None)
+                _write_worker_phase(
+                    cfg, me, task_id, "reply_pending", result=encoded,
+                    terminal_state=terminal_state)
+                continue
+
+        info = journal.get("info")
+        worktree = journal.get("worktree", "")
+        if (not isinstance(worktree, str) or not worktree) \
+                and isinstance(info, dict):
+            worktree = info.get("path", "")
+        if not isinstance(worktree, str):
+            worktree = ""
+        result = _empty_worker_result(
+            backend, "failed",
+            "worker process exited before recording a result", worktree)
+        _queue_worker_result(cfg, me, task_id, result, "failed")
 
 
 def _supervise_preamble(task_id, sender):
