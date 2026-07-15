@@ -3339,7 +3339,8 @@ def _relay_time(value, now=None):
     return relay_time if relay_time <= current + RELAY_FUTURE_SKEW else None
 
 
-def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
+def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None,
+                   stop_event=None, response_hook=None):
     """Yield ntfy message events from `tpc` until `deadline` (None = forever).
 
     Dedupes via the shared, mutated `skip` set; advances `since` internally
@@ -3353,7 +3354,8 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
         skip.clear()
     since = str(current_since)
     backoff = 1
-    while deadline is None or time.time() < deadline:
+    while ((deadline is None or time.time() < deadline)
+           and not (stop_event is not None and stop_event.is_set())):
         chunk = (300 if deadline is None else
                  min(300, max(0.1, deadline - time.time())))
         started = time.time()
@@ -3363,36 +3365,45 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
             if r is None:
                 r = http(f"{cfg['server']}/{tpc}/json?since={since}",
                          timeout=chunk)
-            with r:
-                for raw in r:
-                    try:
-                        ev = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError,
-                            ValueError):
-                        continue
-                    if not isinstance(ev, dict):
-                        continue
-                    if ev.get("event") != "message":
-                        backoff = 1  # keepalives prove the link is healthy
+            if response_hook is not None:
+                response_hook(r)
+            try:
+                with r:
+                    for raw in r:
+                        if (stop_event is not None
+                                and stop_event.is_set()):
+                            return
+                        try:
+                            ev = json.loads(raw.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError,
+                                ValueError):
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+                        if ev.get("event") != "message":
+                            backoff = 1  # keepalives prove the link is healthy
+                            if deadline and time.time() >= deadline:
+                                return
+                            continue
+                        if not isinstance(ev.get("id"), str):
+                            continue
+                        relay_time = _relay_time(ev.get("time"))
+                        if relay_time is None or relay_time < current_since:
+                            continue
+                        backoff = 1
+                        if ev.get("id") in skip:
+                            continue
+                        if relay_time > current_since:
+                            skip.clear()
+                            current_since = relay_time
+                            since = str(relay_time)
+                        skip.add(ev.get("id"))
+                        yield ev
                         if deadline and time.time() >= deadline:
                             return
-                        continue
-                    if not isinstance(ev.get("id"), str):
-                        continue
-                    relay_time = _relay_time(ev.get("time"))
-                    if relay_time is None or relay_time < current_since:
-                        continue
-                    backoff = 1
-                    if ev.get("id") in skip:
-                        continue
-                    if relay_time > current_since:
-                        skip.clear()
-                        current_since = relay_time
-                        since = str(relay_time)
-                    skip.add(ev.get("id"))
-                    yield ev
-                    if deadline and time.time() >= deadline:
-                        return
+            finally:
+                if response_hook is not None:
+                    response_hook(None)
         except (urllib.error.URLError, HTTPException, OSError):
             # Any transient network/TLS/stream failure on this long-lived
             # connection (URLError, ssl.SSLError, http IncompleteRead, socket
@@ -3400,12 +3411,18 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None):
             # a reconnect, never crash the watcher process. Exiting nonzero
             # here makes a Copilot session stop re-arming its watcher.
             pass
+        if stop_event is not None and stop_event.is_set():
+            return
         if time.time() - started < 5:
             delay = min(backoff, 30)
             if deadline is not None:
                 delay = min(delay, max(0, deadline - time.time()))
             if delay:
-                time.sleep(delay)
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        return
+                else:
+                    time.sleep(delay)
             backoff = min(backoff * 2, 30)
         else:
             backoff = 1
@@ -4023,6 +4040,7 @@ MESH_MCP_VERSION = VERSION
 # consumed by reasoning before any answer, yielding an empty/incomplete stream.
 MESH_MCP_SAMPLING_MAX_TOKENS = 8192
 MESH_MCP_SAMPLING_TIMEOUT = 300
+MESH_MCP_STOP_POLL_INTERVAL = 0.1
 
 _MCP_HANDLE_SYSTEM = (
     "You are the a2acast delivery handler for this machine. Inbound mesh "
@@ -4059,6 +4077,40 @@ class MeshMCPServer:
         self._initialized = threading.Event()
         self._stop = threading.Event()
         self._sampling_flag = threading.Lock()
+        self._active_response = None
+        self._active_response_lock = threading.Lock()
+
+    @staticmethod
+    def _interrupt_response(response):
+        """Wake a response iterator blocked in a socket read, best effort."""
+        try:
+            fp = getattr(response, "fp", None)
+            raw = getattr(fp, "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass
+        try:
+            response.close()
+        except (AttributeError, OSError):
+            pass
+
+    def _set_active_response(self, response):
+        close_now = False
+        with self._active_response_lock:
+            self._active_response = response
+            close_now = response is not None and self._stop.is_set()
+        if close_now:
+            self._interrupt_response(response)
+
+    def stop(self):
+        """Stop initialization/backoff waits and interrupt an active read."""
+        self._stop.set()
+        with self._active_response_lock:
+            response = self._active_response
+        if response is not None:
+            self._interrupt_response(response)
 
     # -- JSON-RPC I/O --------------------------------------------------------
 
@@ -4405,7 +4457,9 @@ class MeshMCPServer:
     def watch_loop(self):
         cfg, me = self.cfg, self.me
         tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
-        self._initialized.wait(30)
+        while not self._initialized.is_set():
+            if self._stop.wait(MESH_MCP_STOP_POLL_INTERVAL):
+                return
         backoff = 1
         while not self._stop.is_set():
             try:
@@ -4423,7 +4477,10 @@ class MeshMCPServer:
         since, seen = _load_cursor(cf)
         skip = set(seen)
         replay_seen = load_replays(cfg, me)
-        for ev in _stream_events(cfg, tpc, str(since), None, skip=skip):
+        for ev in _stream_events(
+                cfg, tpc, str(since), None, skip=skip,
+                stop_event=self._stop,
+                response_hook=self._set_active_response):
             if self._stop.is_set():
                 return
             if not isinstance(ev, dict) or not isinstance(
@@ -4570,7 +4627,7 @@ def _run_mcp_server(args, label, idle_hint):
     try:
         _mcp_stdin_loop(server.handle)
     finally:
-        server._stop.set()
+        server.stop()
         if plock:
             try:
                 with open(activity_file(cfg, me), "a",
@@ -4810,6 +4867,21 @@ class _SupervisorPidOwnership:
     token: str
     pid: int
     identity: typing.Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _RetainedSupervisorOwnership:
+    lock: _SupervisorLockOwnership
+    pid_owner: typing.Optional[_SupervisorPidOwnership]
+    receiver: object
+    receiver_thread: object
+    node: str
+
+
+# A daemon receiver that outlives the bounded shutdown join must not let its
+# advisory-lock descriptor be garbage-collected.  These entries deliberately
+# live until process exit; the OS then releases the descriptor atomically.
+_SUPERVISOR_LIFETIME_OWNERS = []
 
 
 def _validate_supervisor_stat(observed):
@@ -5070,6 +5142,52 @@ def _release_supervise_lock(lock, pid_owner=None):
             finally:
                 lock.fd = -1
                 lock.released = True
+
+
+def _shutdown_supervisor_receiver(receiver, receiver_thread,
+                                  receiver_started, lock, pid_owner,
+                                  node, label):
+    """Stop a receiver and release ownership only after it has terminated."""
+    if not receiver_started:
+        _release_supervise_lock(lock, pid_owner)
+        return True
+
+    problems = []
+    try:
+        receiver.stop()
+    except Exception as exc:
+        problems.append(f"stop failed: {exc}")
+        try:
+            receiver._stop.set()
+        except Exception as fallback_exc:
+            problems.append(f"stop fallback failed: {fallback_exc}")
+    try:
+        receiver_thread.join(timeout=SUPERVISE_RECEIVER_JOIN_TIMEOUT)
+    except Exception as exc:
+        problems.append(f"join failed: {exc}")
+    try:
+        terminated = receiver_thread.is_alive() is False
+    except Exception as exc:
+        problems.append(f"liveness check failed: {exc}")
+        terminated = False
+
+    if not terminated:
+        _SUPERVISOR_LIFETIME_OWNERS.append(
+            _RetainedSupervisorOwnership(
+                lock=lock, pid_owner=pid_owner, receiver=receiver,
+                receiver_thread=receiver_thread, node=node))
+        detail = f" ({'; '.join(problems)})" if problems else ""
+        print(
+            f"a2acast {label}: receiver thread for node '{node}' did not "
+            f"terminate within {SUPERVISE_RECEIVER_JOIN_TIMEOUT}s; retaining "
+            "singleton ownership and PID evidence until process exit. "
+            "Resolve the blocked relay read and restart this process."
+            f"{detail}",
+            file=sys.stderr)
+        return False
+
+    _release_supervise_lock(lock, pid_owner)
+    return True
 
 
 def _presence_is_live(cfg, node):
@@ -6156,16 +6274,9 @@ def cmd_codex_supervise(args):
                 return
             time.sleep(args.interval)
     finally:
-        try:
-            if receiver is not None:
-                try:
-                    receiver._stop.set()
-                finally:
-                    if receiver_started:
-                        receiver_thread.join(
-                            timeout=SUPERVISE_RECEIVER_JOIN_TIMEOUT)
-        finally:
-            _release_supervise_lock(lock, pid_owner)
+        _shutdown_supervisor_receiver(
+            receiver, receiver_thread, receiver_started,
+            lock, pid_owner, me, "supervise")
 
 
 def _stop_supervisor(cfg, node):
@@ -6346,16 +6457,9 @@ def _run_worker_supervisor(args):
                 return
             time.sleep(interval)
     finally:
-        try:
-            if receiver is not None:
-                try:
-                    receiver._stop.set()
-                finally:
-                    if receiver_started:
-                        receiver_thread.join(
-                            timeout=SUPERVISE_RECEIVER_JOIN_TIMEOUT)
-        finally:
-            _release_supervise_lock(lock, pid_owner)
+        _shutdown_supervisor_receiver(
+            receiver, receiver_thread, receiver_started,
+            lock, pid_owner, me, "worker")
 
 
 def cmd_worker_supervise(args):

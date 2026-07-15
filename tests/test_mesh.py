@@ -7951,6 +7951,81 @@ class SupervisorOwnershipTests(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE(os.stat(self.lock_path).st_mode), 0o600)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory-lock integration")
+    def test_advisory_lock_recovers_cross_process_after_abrupt_exit(self):
+        script = "\n".join([
+            "import json, os, sys",
+            "import mesh",
+            "cfg = {'_dir': sys.argv[1]}",
+            "lock = mesh._acquire_supervise_lock(cfg, sys.argv[2])",
+            "print(json.dumps({'pid': lock.pid, 'token': lock.token}), "
+            "flush=True)",
+            "sys.stdin.buffer.read()",
+        ])
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, self.tmp.name, self.node],
+            cwd=os.path.dirname(mesh.__file__), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def stop_child():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+        self.addCleanup(stop_child)
+        line = proc.stdout.readline()
+        if not line:
+            self.fail("subprocess owner did not start: " + proc.stderr.read())
+        owner = json.loads(line)
+
+        self.assertIsNone(
+            mesh._acquire_supervise_lock(self.cfg, self.node))
+        with open(self.lock_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {
+                "version": 1,
+                "pid": owner["pid"],
+                "token": owner["token"],
+            })
+
+        proc.kill()
+        proc.wait(timeout=5)
+        with open(self.lock_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["token"], owner["token"])
+
+        replacement = self._track_lock(
+            mesh._acquire_supervise_lock(self.cfg, self.node))
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(replacement.token, owner["token"])
+        with open(self.lock_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["token"], replacement.token)
+
+    @unittest.skipIf(os.name == "nt", "mocked Windows path is for non-Windows")
+    def test_windows_first_byte_lock_unlock_and_busy_paths(self):
+        class FakeMSVCRT:
+            LK_NBLCK = 11
+            LK_UNLCK = 12
+
+        fake = FakeMSVCRT()
+        fake.locking = mock.Mock()
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        with mock.patch.object(mesh.os, "name", "nt"), \
+             mock.patch.dict(sys.modules, {"msvcrt": fake}):
+            self.assertTrue(mesh._try_supervisor_advisory_lock(fd))
+            mesh._unlock_supervisor_advisory_lock(fd)
+            self.assertEqual(fake.locking.call_args_list, [
+                mock.call(fd, fake.LK_NBLCK, 1),
+                mock.call(fd, fake.LK_UNLCK, 1),
+            ])
+
+            fake.locking.reset_mock()
+            fake.locking.side_effect = OSError(13, "busy")
+            self.assertFalse(mesh._try_supervisor_advisory_lock(fd))
+            fake.locking.assert_called_once_with(fd, fake.LK_NBLCK, 1)
+
     def test_unlocked_stale_metadata_is_taken_over(self):
         stale_token = "a" * 64
         mesh._write_json_secure(self.lock_path, {
@@ -8199,11 +8274,12 @@ class WorkerSuperviseTests(unittest.TestCase):
 
         events = []
         receiver = mock.Mock()
-        receiver._stop.set.side_effect = lambda: events.append("stop")
+        receiver.stop.side_effect = lambda: events.append("stop")
         thread = mock.Mock()
         thread.start.side_effect = lambda: events.append("start")
         thread.join.side_effect = lambda timeout: events.append(
             ("join", timeout))
+        thread.is_alive.return_value = False
 
         def make_receiver(cfg, node):
             self.assertIs(cfg, self.cfg)
@@ -8241,6 +8317,138 @@ class WorkerSuperviseTests(unittest.TestCase):
         self.assertIs(thread_cls.call_args.kwargs["daemon"], True)
         self.assertFalse(os.path.exists(
             mesh._supervise_pid_file(self.cfg, "worker-copilot")))
+
+    def test_blocked_receiver_retains_singleton_and_preserves_replacements(self):
+        class StopLoop(Exception):
+            pass
+
+        entered = threading.Event()
+        release = threading.Event()
+        receiver = mesh.MeshMCPServer(
+            self.cfg, "worker-copilot", out=lambda _line: None)
+
+        def blocked_watch():
+            entered.set()
+            release.wait()
+
+        receiver.watch_loop = blocked_watch
+        lock_path = mesh.supervise_lock_file(
+            self.cfg, "worker-copilot")
+        pid_path = mesh._supervise_pid_file(
+            self.cfg, "worker-copilot")
+        owned_lock_path = lock_path + ".blocked-owned"
+        owned_pid_path = pid_path + ".blocked-owned"
+
+        def cleanup_retained():
+            release.set()
+            retained = getattr(
+                mesh, "_SUPERVISOR_LIFETIME_OWNERS", [])
+            for owner in list(retained):
+                if owner.lock.path != lock_path:
+                    continue
+                owner.receiver_thread.join(timeout=1)
+                mesh._release_supervise_lock(owner.lock, owner.pid_owner)
+                retained.remove(owner)
+            for path in (lock_path, pid_path,
+                         owned_lock_path, owned_pid_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        self.addCleanup(cleanup_retained)
+
+        def stop_main_loop(_seconds):
+            self.assertTrue(entered.wait(timeout=1))
+            raise StopLoop
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(
+                 mesh, "MeshMCPServer", return_value=receiver), \
+             mock.patch.object(mesh.time, "sleep",
+                               side_effect=stop_main_loop), \
+             mock.patch.object(mesh.signal, "signal"), \
+             mock.patch.object(
+                 mesh, "SUPERVISE_RECEIVER_JOIN_TIMEOUT", 0.05), \
+             contextlib.redirect_stderr(stderr):
+            with self.assertRaises(StopLoop):
+                mesh.cmd_worker_supervise(
+                    self._args(once=False, interval=1))
+
+        contender = mesh._acquire_supervise_lock(
+            self.cfg, "worker-copilot")
+        if contender is not None:
+            self.addCleanup(mesh._release_supervise_lock, contender)
+        self.assertIsNone(contender)
+        self.assertTrue(os.path.exists(pid_path))
+        self.assertIn("receiver thread", stderr.getvalue())
+        self.assertIn("retaining singleton ownership", stderr.getvalue())
+
+        os.replace(lock_path, owned_lock_path)
+        os.replace(pid_path, owned_pid_path)
+        replacement_lock = {
+            "version": 1, "pid": 999999, "token": "a" * 64,
+        }
+        replacement_pid = {
+            "version": 1, "pid": 999998, "token": "b" * 64,
+        }
+        mesh._write_json_secure(lock_path, replacement_lock)
+        mesh._write_json_secure(pid_path, replacement_pid)
+        release.set()
+
+        retained = mesh._SUPERVISOR_LIFETIME_OWNERS[-1]
+        retained.receiver_thread.join(timeout=1)
+        mesh._release_supervise_lock(retained.lock, retained.pid_owner)
+        mesh._SUPERVISOR_LIFETIME_OWNERS.remove(retained)
+
+        with open(lock_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), replacement_lock)
+        with open(pid_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), replacement_pid)
+
+    def test_stoppable_real_receiver_terminates_and_releases_ownership(self):
+        class StopLoop(Exception):
+            pass
+
+        entered = threading.Event()
+        receiver = mesh.MeshMCPServer(
+            self.cfg, "worker-copilot", out=lambda _line: None)
+
+        def stoppable_watch():
+            entered.set()
+            receiver._stop.wait()
+
+        receiver.watch_loop = stoppable_watch
+
+        def stop_main_loop(_seconds):
+            self.assertTrue(entered.wait(timeout=1))
+            raise StopLoop
+
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(
+                 mesh, "MeshMCPServer", return_value=receiver), \
+             mock.patch.object(mesh.time, "sleep",
+                               side_effect=stop_main_loop), \
+             mock.patch.object(mesh.signal, "signal"):
+            with self.assertRaises(StopLoop):
+                mesh.cmd_worker_supervise(
+                    self._args(once=False, interval=1))
+
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "worker-copilot")))
+        lock = mesh._acquire_supervise_lock(
+            self.cfg, "worker-copilot")
+        self.addCleanup(mesh._release_supervise_lock, lock)
+        self.assertIsNotNone(lock)
 
     def test_configured_worker_node_is_authoritative(self):
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
@@ -8344,6 +8552,7 @@ class WorkerSuperviseTests(unittest.TestCase):
             handle.write("keep")
         receiver = mock.Mock()
         thread = mock.Mock()
+        thread.is_alive.return_value = False
         with mock.patch.object(
                 mesh, "load_config", return_value=self.cfg), \
              mock.patch.object(
@@ -8359,7 +8568,7 @@ class WorkerSuperviseTests(unittest.TestCase):
              mock.patch.object(mesh.signal, "signal"):
             with self.assertRaises(mesh.TaskLedgerBusy):
                 mesh.cmd_worker_supervise(self._args(once=False))
-        receiver._stop.set.assert_called_once_with()
+        receiver.stop.assert_called_once_with()
         thread.join.assert_called_once_with(
             timeout=mesh.SUPERVISE_RECEIVER_JOIN_TIMEOUT)
         self.assertFalse(os.path.exists(
@@ -8384,7 +8593,8 @@ class SuperviseLoopTests(unittest.TestCase):
         # thread that attempts real network I/O. SuperviseReceiverTests
         # covers the receiver wiring itself.
         self._thread_patch = mock.patch.object(mesh.threading, "Thread")
-        self._thread_patch.start()
+        self._thread_mock = self._thread_patch.start()
+        self._thread_mock.return_value.is_alive.return_value = False
         self._tmp = tempfile.TemporaryDirectory()
         self._old = os.getcwd()
         os.chdir(self._tmp.name)
@@ -8539,6 +8749,9 @@ class _ImmediateThread:
     def join(self, timeout=None):
         del timeout
 
+    def is_alive(self):
+        return False
+
 
 class SuperviseReceiverTests(unittest.TestCase):
     # #32: cmd_codex_supervise must be self-contained -- it starts its own
@@ -8575,7 +8788,7 @@ class SuperviseReceiverTests(unittest.TestCase):
         # The supervisor constructs its own MeshMCPServer for this node and
         # runs its watch_loop on a daemon thread, unconditionally (no
         # presence-lock coordination -- see the comment in mesh.py). On
-        # exit, it must tear the receiver down via _stop.set() so no
+        # exit, it must stop the receiver so no
         # thread/subscription is leaked.
         class StopLoop(Exception):
             pass
@@ -8587,6 +8800,7 @@ class SuperviseReceiverTests(unittest.TestCase):
              mock.patch.object(mesh.threading, "Thread") as thread_cls, \
              mock.patch.object(
                  mesh.time, "sleep", side_effect=StopLoop):
+            thread_cls.return_value.is_alive.return_value = False
             with self.assertRaises(StopLoop):
                 mesh.cmd_codex_supervise(ns)
 
@@ -8602,7 +8816,7 @@ class SuperviseReceiverTests(unittest.TestCase):
         thread_cls.return_value.start.assert_called_once()
 
         # Torn down on exit -- no leaked thread/subscription.
-        receiver._stop.set.assert_called_once()
+        receiver.stop.assert_called_once()
         thread_cls.return_value.join.assert_called_once_with(
             timeout=mesh.SUPERVISE_RECEIVER_JOIN_TIMEOUT)
 
@@ -8661,7 +8875,74 @@ class SuperviseReceiverTests(unittest.TestCase):
 
         run.assert_called_once()
         self.assertEqual(run.call_args[0][2], "t1")   # task_id
-        mcp_cls.return_value._stop.set.assert_called_once()
+        mcp_cls.return_value.stop.assert_called_once()
+
+    def test_initialization_wait_stops_without_waiting_thirty_seconds(self):
+        server = mesh.MeshMCPServer(
+            self.cfg, "mynode", out=lambda _line: None)
+        watch_thread = threading.Thread(
+            target=server.watch_loop, daemon=True)
+        self.addCleanup(server._initialized.set)
+        self.addCleanup(server._stop.set)
+        self.addCleanup(watch_thread.join, 1)
+
+        watch_thread.start()
+        server._stop.set()
+        watch_thread.join(timeout=0.5)
+
+        self.assertFalse(watch_thread.is_alive())
+
+    def test_active_stream_read_is_closed_by_stop_without_shorter_timeout(self):
+        entered = threading.Event()
+        closed = threading.Event()
+        seen_timeouts = []
+
+        class BlockingResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                entered.set()
+                closed.wait(timeout=10)
+                if not closed.is_set():
+                    raise AssertionError("stream response was not closed")
+                raise OSError("response closed")
+
+            def close(self):
+                closed.set()
+
+        response = BlockingResponse()
+
+        def fake_http(_url, data=None, headers=None, timeout=15):
+            del data, headers
+            seen_timeouts.append(timeout)
+            return response
+
+        server = mesh.MeshMCPServer(
+            self.cfg, "mynode", out=lambda _line: None)
+        server._initialized.set()
+        watch_thread = threading.Thread(
+            target=server.watch_loop, daemon=True)
+        self.addCleanup(response.close)
+        self.addCleanup(server._stop.set)
+        self.addCleanup(watch_thread.join, 1)
+
+        with mock.patch.object(mesh, "http", side_effect=fake_http):
+            watch_thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+            stop = getattr(server, "stop", server._stop.set)
+            stop()
+            watch_thread.join(timeout=1)
+
+        self.assertFalse(watch_thread.is_alive())
+        self.assertEqual(seen_timeouts, [300])
 
 
 if __name__ == "__main__":
