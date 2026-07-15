@@ -120,6 +120,7 @@ WORKER_PROMPT_MAX = 16 * 1024
 WORKER_WINDOWS_COMMAND_MAX = 30000
 WORKER_PATH_MAX = 4096
 WORKER_JOURNAL_MAX = 256 * 1024
+WORKER_CLAIM_MAX = 16 * 1024
 WORKER_VERIFY_MAX = 16
 WORKER_VERIFY_ITEM_MAX = 2048
 WORKER_JOB_FIELDS = frozenset(
@@ -131,6 +132,10 @@ WORKER_RESULT_FIELDS = frozenset({
 WORKER_OUTCOMES = frozenset(
     {"completed", "no_change", "failed", "unavailable", "quota"})
 WORKER_JOURNAL_VERSION = 1
+WORKER_CLAIM_FIELDS = frozenset({
+    "version", "node", "task_id", "backend", "origin_peer",
+    "local_node", "job_digest",
+})
 WORKER_JOURNAL_PHASES = frozenset({
     "validated", "prepared", "running", "executed", "committed",
     "reply_pending", "replied",
@@ -515,14 +520,15 @@ def _config_lock_file(cfg):
     return os.path.join(tempfile.gettempdir(), CONFIG_LOCK_PREFIX + suffix)
 
 
-def _acquire_path_lock(lock_path, attempts=10, wait=0.05):
+def _acquire_path_lock(lock_path, attempts=10, wait=0.05,
+                       reclaim_stale=True):
     """Acquire a brief O_CREAT|O_EXCL lock at `lock_path`. Unlike the
     long-lived presence/supervise locks (held for a process's whole
     lifetime), these locks are only ever held for one read-modify-write
     cycle -- so, when one is already held, it's worth waiting it out for a
     few tries rather than giving up immediately. Returns `lock_path`, or
-    None if still unobtainable after `attempts` tries (caller falls back
-    to an unlocked best-effort write rather than losing the change).
+    None if still unobtainable after `attempts` tries. Callers decide how to
+    fail explicitly; ownership-sensitive writes must never continue unlocked.
     Shared retry body for `_acquire_config_lock` and `_acquire_tasks_lock`."""
     for i in range(attempts):
         try:
@@ -536,7 +542,8 @@ def _acquire_path_lock(lock_path, attempts=10, wait=0.05):
                 fresh = time.time() - os.path.getmtime(lock_path) < 1
             except OSError:
                 fresh = False
-            if _hook_lock_is_live(lock_path) or fresh:
+            if (not reclaim_stale
+                    or _hook_lock_is_live(lock_path) or fresh):
                 if i < attempts - 1:
                     time.sleep(wait)
                 continue
@@ -566,8 +573,9 @@ def _tasks_lock_file(cfg):
 
 
 def _acquire_tasks_lock(cfg, attempts=10, wait=0.05):
-    """Acquire the brief task-store write lock. See `_acquire_path_lock`."""
-    return _acquire_path_lock(_tasks_lock_file(cfg), attempts, wait)
+    """Acquire task-store ownership without racing stale-lock deletion."""
+    return _acquire_path_lock(
+        _tasks_lock_file(cfg), attempts, wait, reclaim_stale=False)
 
 
 def _mutate_config(cfg, apply):
@@ -1062,16 +1070,23 @@ def tasks_file(cfg):
     return os.path.join(cfg["_dir"], TASKS_NAME)
 
 
-def _worker_task_has_journal(cfg, task_id):
-    """Fail closed when any worker identity has journaled this task."""
+def _worker_execution_marker_file(cfg, task_id):
+    return os.path.join(
+        cfg["_dir"],
+        f".meshwire.worker-claim.{_worker_task_token(task_id)}.json",
+    )
+
+
+def _worker_task_has_execution_evidence(cfg, local_node, task_id):
+    """Probe only constant-time, exact paths for execution evidence."""
     try:
-        suffix = f".{_worker_task_token(task_id)}.json"
-        with os.scandir(cfg["_dir"]) as entries:
-            return any(
-                entry.name.startswith(".meshwire.worker-journal.")
-                and entry.name.endswith(suffix)
-                for entry in entries
-            )
+        paths = [_worker_execution_marker_file(cfg, task_id)]
+        if isinstance(local_node, str):
+            paths.extend((
+                _worker_journal_file(cfg, local_node, task_id),
+                _worker_output_file(cfg, local_node, task_id),
+            ))
+        return any(os.path.lexists(path) for path in paths)
     except (OSError, TypeError, ValueError, UnicodeError):
         return True
 
@@ -1094,6 +1109,8 @@ def save_task(cfg, task_id, **fields):
     writer from dropping the other's task (lost update) or leaving a torn
     file (which `load_tasks` would silently read back as an empty store)."""
     lock = _acquire_tasks_lock(cfg)
+    if lock is None:
+        raise TimeoutError("task ledger lock acquisition timed out")
     try:
         tasks = load_tasks(cfg)
         t = tasks.setdefault(task_id, {})
@@ -1102,11 +1119,10 @@ def save_task(cfg, task_id, **fields):
         _write_json_secure(tasks_file(cfg), tasks, indent=1)
         return t
     finally:
-        if lock:
-            try:
-                os.unlink(lock)
-            except OSError:
-                pass
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def _record_received_task(cfg, kind, task_id, context_id, state, peer,
@@ -1140,11 +1156,12 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
                 isinstance(local_node, str)
                 and task_id in _load_handled(cfg, local_node)
             )
-            journaled = _worker_task_has_journal(cfg, task_id)
+            execution_evidence = _worker_task_has_execution_evidence(
+                cfg, local_node, task_id)
             pristine_keys = set(fields) | {"updated"}
             duplicate = (
                 not handled
-                and not journaled
+                and not execution_evidence
                 and isinstance(existing, dict)
                 and set(existing).issubset(pristine_keys)
                 and set(fields).issubset(existing)
@@ -1152,7 +1169,7 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
                 and all(existing.get(key) == value
                         for key, value in fields.items())
             )
-            if existing is not None or handled or journaled:
+            if existing is not None or handled or execution_evidence:
                 return (TASK_RECORD_DUPLICATE if duplicate
                         else TASK_RECORD_COLLISION)
             fields["updated"] = int(time.time())
@@ -1632,11 +1649,10 @@ def _open_regular_readonly(path):
     """Open private worker state with stable no-follow identity checks."""
     before = os.lstat(path)
     identity = _validate_private_worker_stat(before)
-    flags = os.O_RDONLY
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if nofollow:
-        flags |= nofollow
-    fd = os.open(path, flags)
+    if not isinstance(nofollow, int) or not nofollow:
+        raise OSError("reliable no-follow open is unavailable")
+    fd = os.open(path, os.O_RDONLY | nofollow)
     try:
         after = os.fstat(fd)
         if _validate_private_worker_stat(after) != identity:
@@ -1692,6 +1708,54 @@ def _worker_binding(me, backend, task_id, task):
         "job_digest": digest,
         "attempt": _worker_attempt_count(task) + 1,
     }
+
+
+def _validate_worker_execution_marker(task_id, value, expected=None):
+    if (not isinstance(value, dict)
+            or set(value) != WORKER_CLAIM_FIELDS
+            or value.get("version") != WORKER_JOURNAL_VERSION
+            or value.get("task_id") != task_id
+            or not _valid_task_id(task_id)
+            or value.get("backend") not in {"codex", "copilot", "goose"}
+            or not _valid_worker_identity(value.get("node"))
+            or value.get("local_node") != value.get("node")
+            or not _valid_worker_identity(value.get("origin_peer"))
+            or re.fullmatch(r"[0-9a-f]{64}", value.get("job_digest", ""))
+            is None):
+        raise ValueError("worker execution marker binding is invalid")
+    if expected is not None and value != expected:
+        raise ValueError("worker execution marker binding does not match")
+    return dict(value)
+
+
+def _worker_execution_marker(binding):
+    value = {
+        field: binding[field]
+        for field in WORKER_CLAIM_FIELDS
+    }
+    return _validate_worker_execution_marker(value["task_id"], value)
+
+
+def _write_worker_execution_marker(cfg, task_id, binding):
+    value = _worker_execution_marker(binding)
+    _write_json_secure(
+        _worker_execution_marker_file(cfg, task_id), value, indent=1)
+    return value
+
+
+def _load_worker_execution_marker(cfg, task_id, expected=None):
+    try:
+        fd = _open_regular_readonly(
+            _worker_execution_marker_file(cfg, task_id))
+        if os.fstat(fd).st_size > WORKER_CLAIM_MAX:
+            os.close(fd)
+            raise ValueError("worker execution marker is too large")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return _validate_worker_execution_marker(
+            task_id, value, expected=expected)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        return {}
 
 
 def _validate_worker_journal(cfg, node, task_id, value, expected=None):
@@ -1842,6 +1906,16 @@ def _bounded_worker_text(value, fallback="worker produced no output",
     return text
 
 
+def _worker_result_verification(output, fallback):
+    """Defang backend-owned output markers before applying the byte bound."""
+    text = _sanitize_worker_human_text(_worker_utf8_text(output)).strip()
+    fallback_text = _sanitize_worker_human_text(
+        _worker_utf8_text(fallback)).strip()
+    text = (text or fallback_text or "not run").replace(
+        "Full output:", "Full output (backend):")
+    return _bounded_worker_text(text, fallback="not run")
+
+
 def _worker_result_summary(output, output_path, fallback):
     # Keep the supervisor-owned log pointer unambiguous even when backend
     # output tries to mimic it.
@@ -1867,7 +1941,7 @@ def _worker_result_summary(output, output_path, fallback):
 def _empty_worker_result(backend, outcome, summary, worktree="",
                          verification="not run", runtime_seconds=0):
     summary = _bounded_worker_text(summary, fallback="worker failed")
-    verification = _bounded_worker_text(
+    verification = _worker_result_verification(
         verification, fallback="not run")
     return {
         "backend": backend,
@@ -1932,6 +2006,20 @@ def _validate_worker_result_text(result, expected_output):
         if len(result[field].encode("utf-8")) > WORKER_RESULT_TEXT_MAX:
             raise ValueError(
                 f"worker result {field} exceeds {WORKER_RESULT_TEXT_MAX} bytes")
+    def has_output_marker(value):
+        if isinstance(value, str):
+            return "Full output:" in value
+        if isinstance(value, list):
+            return any(has_output_marker(item) for item in value)
+        if isinstance(value, dict):
+            return any(has_output_marker(item) for item in value.values())
+        return False
+
+    if any(
+            has_output_marker(value)
+            for field, value in result.items()
+            if field != "summary"):
+        raise ValueError("worker result has output marker outside summary")
     summary = result["summary"]
     occurrences = summary.count("Full output:")
     if expected_output is None:
@@ -2175,7 +2263,7 @@ def _same_worker_binding(left, right, include_attempt=True):
 
 def _claim_worker_execution(cfg, me, task_id, task, binding, job,
                             prior_journal=None):
-    """Atomically claim the ledger and durable journal before execution."""
+    """Claim the ledger and write global evidence before execution."""
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
         return False
@@ -2188,12 +2276,23 @@ def _claim_worker_execution(cfg, me, task_id, task, binding, job,
                     or any(current.get(field) != task.get(field) for field in (
                         "peer", "text", "direction", "local_node"))):
                 return False
+        marker_path = _worker_execution_marker_file(cfg, task_id)
+        marker_present = os.path.lexists(marker_path)
+        expected_marker = _worker_execution_marker(binding)
+        marker = _load_worker_execution_marker(
+            cfg, task_id, expected=expected_marker)
         present = os.path.lexists(_worker_journal_file(cfg, me, task_id))
         latest = _load_worker_journal(cfg, me, task_id)
         if prior_journal is None:
-            if present:
+            if marker_present or present:
+                return False
+            _write_worker_execution_marker(cfg, task_id, binding)
+            if _load_worker_execution_marker(
+                    cfg, task_id, expected=expected_marker) != expected_marker:
                 return False
         elif not latest or latest != prior_journal:
+            return False
+        elif marker != expected_marker:
             return False
         _write_worker_phase(
             cfg, me, task_id, binding, "validated",
@@ -2393,7 +2492,7 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
             output, output_path, fallback="worker failed")
         result = _empty_worker_result(
             backend, outcome, summary, info["path"],
-            verification=_bounded_worker_text(
+            verification=_worker_result_verification(
                 output, fallback="worker failed"),
             runtime_seconds=runtime)
         return _reply_worker_result(
@@ -2409,7 +2508,7 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
             fallback="worker commit failed")
         result = _empty_worker_result(
             backend, "failed", summary, info["path"],
-            verification=_bounded_worker_text(
+            verification=_worker_result_verification(
                 output, fallback="commit failed"),
             runtime_seconds=runtime)
         return _reply_worker_result(
@@ -2426,7 +2525,8 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
         "changed_files": changed,
         "summary": _worker_result_summary(
             output, output_path, fallback=outcome),
-        "verification": _bounded_worker_text(output, fallback=outcome),
+        "verification": _worker_result_verification(
+            output, fallback=outcome),
         "runtime_seconds": runtime,
         "worktree": info["path"],
     }
@@ -2449,8 +2549,26 @@ def _recover_worker_tasks(cfg, pool, me, backend):
                 cfg, task_id, state="failed",
                 worker_error="invalid task id; recovery cannot reply safely")
             continue
+        try:
+            recovery_binding = _worker_binding(
+                me, backend, task_id, task)
+            expected_marker = _worker_execution_marker(recovery_binding)
+        except ValueError:
+            save_task(
+                cfg, task_id, state="failed",
+                worker_error="worker recovery binding is invalid")
+            continue
+        marker = _load_worker_execution_marker(
+            cfg, task_id, expected=expected_marker)
+        if marker != expected_marker:
+            result = _empty_worker_result(
+                backend, "failed",
+                "worker execution marker is missing or invalid")
+            _queue_worker_result(
+                cfg, me, task_id, recovery_binding, result, "failed")
+            continue
         journal = _load_worker_journal(
-            cfg, me, task_id, expected={"backend": backend})
+            cfg, me, task_id, expected=recovery_binding)
         if journal and isinstance(journal.get("result"), str):
             binding = _worker_journal_binding(journal)
             encoded = journal["result"]
@@ -2480,13 +2598,7 @@ def _recover_worker_tasks(cfg, pool, me, backend):
         if journal:
             binding = _worker_journal_binding(journal)
         else:
-            try:
-                binding = _worker_binding(me, backend, task_id, task)
-            except ValueError:
-                save_task(
-                    cfg, task_id, state="failed",
-                    worker_error="worker recovery binding is invalid")
-                continue
+            binding = recovery_binding
         result, output_path = _safe_worker_failure(
             binding, "worker process exited before recording a result",
             journal)

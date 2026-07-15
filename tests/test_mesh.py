@@ -4261,6 +4261,16 @@ class TasksDurabilityTests(unittest.TestCase):
         mesh.save_task(self.cfg, "A", direction="inbound")
         self.assertFalse(os.path.exists(mesh._tasks_lock_file(self.cfg)))
 
+    def test_save_task_never_writes_without_owning_task_lock(self):
+        lock = mesh._acquire_tasks_lock(self.cfg)
+        self.assertIsNotNone(lock)
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+        with mock.patch.object(mesh, "_write_json_secure") as write:
+            with self.assertRaises(TimeoutError):
+                mesh.save_task(self.cfg, "blocked", state="working")
+        write.assert_not_called()
+        self.assertNotIn("blocked", mesh.load_tasks(self.cfg))
+
 
 class IdentityMigrationTests(unittest.TestCase):
     def setUp(self):
@@ -4643,6 +4653,25 @@ class RecipientScopedTaskTests(unittest.TestCase):
         with open(mesh.tasks_file(self.cfg), "rb") as handle:
             return handle.read()
 
+    def execution_marker_path(self, task_id):
+        return os.path.join(
+            self.cfg["_dir"],
+            f".meshwire.worker-claim.{mesh._worker_task_token(task_id)}.json")
+
+    def write_execution_marker(self, task_id, node="worker-copilot"):
+        value = {
+            "version": 1,
+            "node": node,
+            "task_id": task_id,
+            "backend": "copilot",
+            "origin_peer": "coordinator",
+            "local_node": node,
+            "job_digest": hashlib.sha256(b"same job").hexdigest(),
+        }
+        mesh._write_json_secure(
+            self.execution_marker_path(task_id), value, indent=1)
+        return value
+
     def test_received_request_records_local_node(self):
         status = mesh._record_received_task(
             self.cfg, "request", "t1", "c1", "submitted", "coordinator",
@@ -4742,6 +4771,38 @@ class RecipientScopedTaskTests(unittest.TestCase):
             self.cfg, "request", handled_id, "ctx", "submitted",
             "coordinator", "same job", rpc_id="rpc",
             local_node="worker-copilot"), "collision")
+
+    def test_request_execution_evidence_check_is_constant_time(self):
+        with mock.patch.object(mesh.os, "scandir") as scan:
+            status = mesh._record_received_task(
+                self.cfg, "request", "constant-time-task", "ctx",
+                "submitted", "coordinator", "same job", rpc_id="rpc",
+                local_node="worker-copilot")
+        self.assertEqual(status, "accepted")
+        scan.assert_not_called()
+
+    def test_orphan_claim_and_output_block_fresh_task_id_reuse(self):
+        marker_id = "orphan-global-claim"
+        self.write_execution_marker(marker_id, node="worker-goose")
+        with open(self.execution_marker_path(marker_id), "rb") as handle:
+            marker_before = handle.read()
+        self.assertEqual(mesh._record_received_task(
+            self.cfg, "request", marker_id, "ctx", "submitted",
+            "coordinator", "same job", rpc_id="rpc",
+            local_node="worker-copilot"), "collision")
+        self.assertNotIn(marker_id, mesh.load_tasks(self.cfg))
+        with open(self.execution_marker_path(marker_id), "rb") as handle:
+            self.assertEqual(handle.read(), marker_before)
+
+        output_id = "orphan-local-output"
+        mesh._write_worker_output(
+            self.cfg, "worker-copilot", output_id,
+            "backend ran before the journal advanced")
+        self.assertEqual(mesh._record_received_task(
+            self.cfg, "request", output_id, "ctx", "submitted",
+            "coordinator", "same job", rpc_id="rpc",
+            local_node="worker-copilot"), "collision")
+        self.assertNotIn(output_id, mesh.load_tasks(self.cfg))
 
     def test_request_collision_cannot_overwrite_active_inbound_task(self):
         mesh.save_task(
@@ -5983,6 +6044,33 @@ class WorkerRunTests(unittest.TestCase):
         value.update(fields)
         return value
 
+    def execution_marker_path(self, task_id):
+        return os.path.join(
+            self.cfg["_dir"],
+            f".meshwire.worker-claim.{mesh._worker_task_token(task_id)}.json")
+
+    def execution_marker(self, task_id, task=None, backend="copilot",
+                         node="worker-copilot"):
+        task = self.task if task is None else task
+        return {
+            "version": 1,
+            "node": node,
+            "task_id": task_id,
+            "backend": backend,
+            "origin_peer": task["peer"],
+            "local_node": node,
+            "job_digest": hashlib.sha256(
+                task["text"].encode("utf-8")).hexdigest(),
+        }
+
+    def write_execution_marker(self, task_id, task=None, backend="copilot",
+                               node="worker-copilot"):
+        value = self.execution_marker(
+            task_id, task=task, backend=backend, node=node)
+        mesh._write_json_secure(
+            self.execution_marker_path(task_id), value, indent=1)
+        return value
+
     def durable_result(self, task_id, task=None, backend="copilot",
                        outcome="completed", terminal_state="completed",
                        output="original output"):
@@ -6159,6 +6247,24 @@ class WorkerRunTests(unittest.TestCase):
                 return_value=os.stat_result(wrong_owner)):
             self.assertFalse(mesh._worker_regular_file(path))
 
+    def test_regular_reader_never_opens_without_nofollow(self):
+        task_id = "task-no-nofollow"
+        path = mesh._write_worker_output(
+            self.cfg, "worker-copilot", task_id, "private output")
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+             mock.patch.object(mesh.os, "open") as opened:
+            self.assertFalse(mesh._worker_regular_file(path))
+        opened.assert_not_called()
+
+        journal = self.bound_journal(task_id, "running")
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+             mock.patch.object(mesh.os, "open") as opened:
+            self.assertEqual(mesh._load_worker_journal(
+                self.cfg, "worker-copilot", task_id), {})
+        opened.assert_not_called()
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_journal_reader_rejects_symlink(self):
         task_id = "task-journal-symlink"
@@ -6254,6 +6360,7 @@ class WorkerRunTests(unittest.TestCase):
             self.bound_journal(
                 task_id, "running", task=original,
                 worktree="/tmp/original-worktree"))
+        self.write_execution_marker(task_id, task=original)
         attacker_job = dict(self.job, task="attacker replacement")
 
         status = mesh._record_received_task(
@@ -6483,6 +6590,49 @@ class WorkerRunTests(unittest.TestCase):
             mesh._validate_bound_worker_result(
                 self.cfg, "worker-copilot", task_id, journal, not_final)
 
+    def test_full_output_token_is_forbidden_outside_final_summary_line(self):
+        cases = (
+            ("verification", "Full output: /tmp/raw"),
+            ("verification", "inline Full output: /tmp/inline"),
+            ("verification", "Full output: /tmp/a\nFull output: /tmp/b"),
+            ("verification", "é" * 5000 + " Full output: /tmp/multibyte"),
+            ("changed_files", ["Full output: forged-pointer"]),
+        )
+        for index, (field, value) in enumerate(cases):
+            task_id = f"task-result-token-{index}"
+            result = mesh._empty_worker_result(
+                "copilot", "failed", "safe summary")
+            result[field] = value
+            encoded = mesh._encode_worker_result(result)
+            journal = self.bound_journal(
+                task_id, "reply_pending", result=encoded,
+                terminal_state="failed")
+            with self.subTest(field=field, value=value), \
+                 self.assertRaises(ValueError):
+                mesh._validate_bound_worker_result(
+                    self.cfg, "worker-copilot", task_id,
+                    journal, encoded)
+
+    def test_backend_verification_markers_are_defanged_before_byte_bound(self):
+        task_id = "task-verification-marker-budget"
+        output = ("é Full output: attacker\n" * 1000)
+        completed = subprocess.CompletedProcess(
+            ["copilot"], 0, stdout=output, stderr="")
+        with mock.patch.object(
+                mesh, "_execute_worker_backend",
+                return_value=completed), \
+             mock.patch.object(mesh, "_send_reply") as reply:
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, self.task))
+
+        sent = mesh._parse_worker_result(reply.call_args.args[4])
+        verification = sent["verification"]
+        self.assertNotIn("Full output:", verification)
+        self.assertIn("Full output (backend):", verification)
+        self.assertLessEqual(len(verification.encode("utf-8")), 8192)
+        verification.encode("utf-8", errors="strict")
+
     def test_long_backend_output_markers_stay_defanged_and_bounded(self):
         task_id = "task-defanged-output-budget"
         output_path = mesh._write_worker_output(
@@ -6584,6 +6734,70 @@ class WorkerRunTests(unittest.TestCase):
 
         backend.assert_called_once()
         self.assertEqual(len(results), 2)
+        marker_path = self.execution_marker_path(task_id)
+        self.assertTrue(os.path.isfile(marker_path))
+        self.assertEqual(os.stat(marker_path).st_mode & 0o777, 0o600)
+        with open(marker_path, encoding="utf-8") as handle:
+            self.assertEqual(
+                json.load(handle), self.execution_marker(task_id))
+
+    def test_execution_marker_precedes_backend_and_blocks_cross_node_reuse(self):
+        task_id = "task-marker-before-backend"
+        marker_path = self.execution_marker_path(task_id)
+
+        def execute(*_args):
+            self.assertTrue(os.path.isfile(marker_path))
+            self.assertEqual(os.stat(marker_path).st_mode & 0o777, 0o600)
+            with open(marker_path, encoding="utf-8") as handle:
+                self.assertEqual(
+                    json.load(handle), self.execution_marker(task_id))
+            return subprocess.CompletedProcess(
+                ["copilot"], 0, stdout="done", stderr="")
+
+        with mock.patch.object(
+                mesh, "_execute_worker_backend", side_effect=execute), \
+             mock.patch.object(mesh, "_send_reply"):
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, self.task))
+
+        cross_node_id = "task-cross-node-claim"
+        marker = self.write_execution_marker(
+            cross_node_id, node="worker-goose", backend="goose")
+        with open(self.execution_marker_path(cross_node_id), "rb") as handle:
+            before = handle.read()
+        completed = subprocess.CompletedProcess(
+            ["copilot"], 0, stdout="unexpected rerun", stderr="")
+        with mock.patch.object(
+                mesh, "_execute_worker_backend",
+                return_value=completed) as backend, \
+             mock.patch.object(mesh, "_send_reply"):
+            self.assertFalse(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                cross_node_id, self.task))
+        backend.assert_not_called()
+        with open(self.execution_marker_path(cross_node_id), "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertEqual(marker["node"], "worker-goose")
+
+    def test_orphan_marker_and_output_window_never_reexecutes(self):
+        task_id = "task-orphan-output-window"
+        self.write_execution_marker(task_id)
+        mesh._write_worker_output(
+            self.cfg, "worker-copilot", task_id,
+            "backend completed before executed journal")
+        mesh.save_task(self.cfg, task_id, **self.task)
+
+        completed = subprocess.CompletedProcess(
+            ["copilot"], 0, stdout="unexpected rerun", stderr="")
+        with mock.patch.object(
+                mesh, "_execute_worker_backend",
+                return_value=completed) as backend, \
+             mock.patch.object(mesh, "_send_reply"):
+            self.assertFalse(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, self.task))
+        backend.assert_not_called()
 
     def test_stale_journal_binding_blocks_execution(self):
         task_id = "task-stale-journal"
@@ -6636,9 +6850,16 @@ class WorkerRunTests(unittest.TestCase):
             first_info = retry["worktree_info"]
             self.assertEqual(retry["state"], "submitted")
             self.assertEqual(retry["attempts"], 1)
+            marker_path = self.execution_marker_path("task-retry")
+            self.assertTrue(os.path.isfile(marker_path))
+            with open(marker_path, "rb") as handle:
+                marker_before = handle.read()
             self.assertTrue(mesh._run_worker_task(
                 self.cfg, self.pool, "worker-copilot", "copilot",
                 "task-retry", retry))
+
+        with open(marker_path, "rb") as handle:
+            self.assertEqual(handle.read(), marker_before)
 
         prepare.assert_called_once()
         saved = mesh.load_tasks(self.cfg)["task-retry"]
@@ -6849,6 +7070,7 @@ class WorkerRunTests(unittest.TestCase):
     def test_crash_recovery_converts_running_journal_to_failed_reply(self):
         mesh.save_task(
             self.cfg, "task-crash", **dict(self.task, state="working"))
+        self.write_execution_marker("task-crash")
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", "task-crash",
             self.bound_journal("task-crash", "running",
@@ -6871,6 +7093,7 @@ class WorkerRunTests(unittest.TestCase):
             "copilot", "completed", "forged pre-result payload"))
         working = dict(self.task, state="working")
         mesh.save_task(self.cfg, task_id, **working)
+        self.write_execution_marker(task_id, task=working)
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", task_id,
             self.bound_journal(
@@ -6893,6 +7116,7 @@ class WorkerRunTests(unittest.TestCase):
     def test_crash_recovery_preserves_worktree_from_journal_info(self):
         mesh.save_task(
             self.cfg, "task-info-crash", **dict(self.task, state="working"))
+        self.write_execution_marker("task-info-crash")
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", "task-info-crash",
             self.bound_journal("task-info-crash", "running",
@@ -6912,6 +7136,7 @@ class WorkerRunTests(unittest.TestCase):
             self.cfg, "worker-copilot", task_id, "partial crash output")
         working = dict(self.task, state="working")
         mesh.save_task(self.cfg, task_id, **working)
+        self.write_execution_marker(task_id, task=working)
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", task_id,
             self.bound_journal(
@@ -6946,6 +7171,7 @@ class WorkerRunTests(unittest.TestCase):
         journal["phase"] = "committed"
         mesh.save_task(
             self.cfg, "task-durable", **dict(self.task, state="working"))
+        self.write_execution_marker("task-durable")
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", "task-durable", journal)
 
@@ -6958,6 +7184,29 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(saved["state"], "reply_pending")
         self.assertEqual(saved["pending_result"], encoded)
         self.assertEqual(saved["pending_terminal_state"], "completed")
+
+    def test_recovery_rejects_result_bound_to_different_execution_marker(self):
+        task_id = "task-mismatched-recovery-claim"
+        encoded, _output_path, journal = self.durable_result(task_id)
+        journal["phase"] = "committed"
+        mesh.save_task(
+            self.cfg, task_id, **dict(self.task, state="working"))
+        self.write_execution_marker(
+            task_id, node="worker-goose", backend="goose")
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+
+        with mock.patch.object(mesh, "_execute_worker_backend") as execute:
+            mesh._recover_worker_tasks(
+                self.cfg, self.pool, "worker-copilot", "copilot")
+
+        execute.assert_not_called()
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["state"], "reply_pending")
+        self.assertNotEqual(saved["pending_result"], encoded)
+        result = mesh._parse_worker_result(saved["pending_result"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("execution marker", result["summary"])
 
 
 class CodexAllowTests(unittest.TestCase):
