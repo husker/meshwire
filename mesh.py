@@ -72,6 +72,7 @@ def activity_file(cfg, node):
 
 
 TASKS_NAME = ".meshwire.tasks.json"
+DELEGATE_TASKS_NAME = ".meshwire.delegate-tasks.{}.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
 STATUS_NAME = ".meshwire.status-{}.json"
@@ -151,6 +152,8 @@ WORKER_JOURNAL_MAX = 256 * 1024
 WORKER_CLAIM_MAX = 16 * 1024
 WORKER_VERIFY_MAX = 16
 WORKER_VERIFY_ITEM_MAX = 2048
+WORKER_DELEGATE_WAIT_MAX = 300
+WORKER_DELEGATE_LEDGER_MAX = 16 * 1024 * 1024
 WORKER_JOB_FIELDS = frozenset(
     {"repo", "base", "task", "verification", "kind", "class"})
 WORKER_RESULT_FIELDS = frozenset({
@@ -1378,6 +1381,142 @@ def load_tasks(cfg):
         return {}
 
 
+def delegate_tasks_file(cfg, local_node):
+    if not _valid_pool_node(local_node):
+        raise ValueError("delegate ledger identity is invalid")
+    token = hashlib.sha256(local_node.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(cfg["_dir"], DELEGATE_TASKS_NAME.format(token))
+
+
+def _delegate_tasks_lock_file(cfg, local_node):
+    path = os.path.abspath(delegate_tasks_file(cfg, local_node))
+    suffix = hashlib.sha256(path.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), TASKS_LOCK_PREFIX + suffix)
+
+
+def _validate_delegate_task_record(cfg, local_node, task_id, value):
+    allowed = {
+        "contextId", "state", "peer", "direction", "local_node", "text",
+        "worker_backend", "worker_job_digest", "updated", "result",
+    }
+    if (not _valid_task_id(task_id) or not isinstance(value, dict)
+            or not set(value).issubset(allowed)
+            or value.get("direction") != "outbound"
+            or value.get("local_node") != local_node
+            or not _valid_pool_node(value.get("peer"))
+            or value.get("peer") == local_node
+            or not _valid_task_id(value.get("contextId"))
+            or value.get("worker_backend") not in WORKER_BACKENDS
+            or not isinstance(value.get("text"), str)
+            or re.fullmatch(r"[0-9a-f]{64}",
+                            value.get("worker_job_digest", "")) is None
+            or not isinstance(value.get("updated"), int)
+            or isinstance(value.get("updated"), bool)
+            or not 0 <= value["updated"] <= MAX_RELAY_TIME
+            or value.get("state") not in TERMINAL_STATES | {"submitted"}
+            or _contains_config_secret(cfg, value)):
+        raise ValueError("delegate task record is invalid")
+    job = _parse_worker_job(value["text"])
+    encoded = _encode_worker_job(job)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    if digest != value["worker_job_digest"]:
+        raise ValueError("delegate task digest is invalid")
+    result_text = value.get("result")
+    if result_text is not None:
+        if result_text == "worker dispatch failed":
+            if value["state"] != "failed":
+                raise ValueError("delegate dispatch state is invalid")
+        else:
+            result = _parse_worker_result(result_text)
+            if (result["backend"] != value["worker_backend"]
+                    or _worker_terminal_for_outcome(result["outcome"])
+                    != value["state"]):
+                raise ValueError("delegate result binding is invalid")
+    return dict(value)
+
+
+def _load_delegate_tasks(cfg, local_node):
+    path = delegate_tasks_file(cfg, local_node)
+    try:
+        values = _load_json_regular(
+            path, require_private=True,
+            max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, TypeError, ValueError, RecursionError,
+            WorkerEvidenceUnsupported) as exc:
+        raise ValueError("delegate task ledger is invalid") from exc
+    if not isinstance(values, dict):
+        raise ValueError("delegate task ledger is invalid")
+    return {
+        task_id: _validate_delegate_task_record(
+            cfg, local_node, task_id, value)
+        for task_id, value in values.items()
+    }
+
+
+def _save_delegate_task(cfg, local_node, task_id, create_only=False,
+                        **fields):
+    lock = _acquire_path_lock(
+        _delegate_tasks_lock_file(cfg, local_node), reclaim_stale=False)
+    if lock is None:
+        raise TaskLedgerBusy(_delegate_tasks_lock_file(cfg, local_node))
+    try:
+        tasks = _load_delegate_tasks(cfg, local_node)
+        if create_only and task_id in tasks:
+            raise ValueError("worker task id collision")
+        current = tasks.get(task_id)
+        if current is None and not create_only:
+            raise ValueError("unknown delegate task")
+        value = {} if current is None else dict(current)
+        value.update(fields)
+        value["local_node"] = local_node
+        value["updated"] = int(time.time())
+        value = _validate_delegate_task_record(
+            cfg, local_node, task_id, value)
+        tasks[task_id] = value
+        if not os.path.exists(delegate_tasks_file(cfg, local_node)):
+            _ensure_gitignore(cfg["_dir"])
+        _write_json_secure(
+            delegate_tasks_file(cfg, local_node), tasks, indent=1)
+        return value
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def _record_delegate_result(cfg, local_node, task_id, context_id, state,
+                            peer, text):
+    """Correlate a result to a coordinator ledger, or return None."""
+    if not _valid_pool_node(local_node):
+        return None
+    try:
+        tasks = _load_delegate_tasks(cfg, local_node)
+    except ValueError:
+        return TASK_RECORD_COLLISION
+    current = tasks.get(task_id)
+    if current is None:
+        return None
+    if (current.get("peer") != peer
+            or current.get("contextId") != context_id
+            or current.get("state") in TERMINAL_STATES):
+        return TASK_RECORD_COLLISION
+    try:
+        result = _parse_worker_result(text)
+        if (result["backend"] != current.get("worker_backend")
+                or _worker_terminal_for_outcome(result["outcome"]) != state
+                or _contains_config_secret(cfg, result)):
+            return TASK_RECORD_COLLISION
+        _save_delegate_task(
+            cfg, local_node, task_id, state=state, result=text)
+    except (OSError, RuntimeError, TaskLedgerBusy, TypeError, UnicodeError,
+            ValueError):
+        return TASK_RECORD_COLLISION
+    return TASK_RECORD_ACCEPTED
+
+
 def save_task(cfg, task_id, **fields):
     """Locked, atomic read-modify-write of one task in the store.
 
@@ -1414,6 +1553,11 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
     """
     if kind not in {"request", "result"} or not _valid_task_id(task_id):
         return TASK_RECORD_COLLISION
+    if kind == "result":
+        delegate = _record_delegate_result(
+            cfg, local_node, task_id, context_id, state, peer, text)
+        if delegate is not None:
+            return delegate
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
         raise TaskLedgerBusy(_tasks_lock_file(cfg))
@@ -1960,6 +2104,81 @@ def _read_worker_health(cfg, node):
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
             WorkerEvidenceUnsupported):
         return {}
+
+
+def _delegate_pool_workers(cfg, pool, me=None):
+    """Return a strictly bound backend map for coordinator delegation."""
+    if not isinstance(cfg, dict) or not isinstance(pool, dict):
+        raise ValueError("worker pool context is invalid")
+    coordinator = pool.get("coordinator")
+    workers = pool.get("workers")
+    routing = pool.get("routing")
+    nodes = cfg.get("nodes")
+    if (not _valid_pool_node(coordinator)
+            or cfg.get("exec_allow") != [coordinator]
+            or not isinstance(nodes, list)
+            or any(not _valid_pool_node(node) for node in nodes)
+            or len(nodes) != len(set(nodes))
+            or coordinator not in nodes):
+        raise ValueError("worker pool coordinator trust is invalid")
+    if me is not None and me != coordinator:
+        raise ValueError("only the configured coordinator may delegate")
+    if (not isinstance(workers, dict) or not workers
+            or not set(workers).issubset(WORKER_BACKENDS)
+            or not isinstance(routing, list)
+            or len(routing) != len(workers)
+            or len(set(routing)) != len(routing)
+            or set(routing) != set(workers)
+            or any(not isinstance(item, str) for item in routing)):
+        raise ValueError("worker pool routing is invalid")
+    seen = set()
+    for backend, worker in workers.items():
+        node = worker.get("node") if isinstance(worker, dict) else None
+        if (not _valid_pool_node(node) or node == coordinator
+                or node == BROADCAST or node not in nodes or node in seen):
+            raise ValueError("worker pool identities are invalid")
+        seen.add(node)
+    return workers
+
+
+def _worker_candidates(cfg, pool, requested, job):
+    """Choose deterministic, currently eligible backends without discovery."""
+    if (not isinstance(requested, str)
+            or requested not in WORKER_BACKENDS | {"auto"}):
+        raise ValueError("worker backend is invalid")
+    job = _validate_worker_job(job)
+    workers = _delegate_pool_workers(cfg, pool)
+    if requested != "auto":
+        if requested not in workers:
+            raise ValueError("worker backend is not configured")
+        order = [requested]
+    elif job["class"] in {"security", "integration"}:
+        order = ["codex"] if "codex" in workers else []
+    else:
+        order = list(pool["routing"])
+
+    peers = load_peers(cfg)
+    if not isinstance(peers, dict):
+        peers = {}
+    now = int(time.time())
+    candidates = []
+    for backend in order:
+        node = workers[backend]["node"]
+        peer = peers.get(node)
+        if isinstance(peer, dict) and peer.get("status") == "blocked":
+            continue
+        health = _read_worker_health(cfg, node)
+        if health:
+            if health.get("backend") != backend:
+                continue
+            state = health.get("state")
+            if state in {"busy", "unavailable"}:
+                continue
+            if (state == "cooldown"
+                    and health.get("cooldown_until", now + 1) > now):
+                continue
+        candidates.append(backend)
+    return candidates
 
 
 def _worker_journal_file(cfg, node, task_id):
@@ -3519,6 +3738,7 @@ def _ensure_gitignore(dirpath):
     # keep secrets and per-machine files out of version control
     _gitignore_add(dirpath, [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
                              ".meshwire.replay-*", ".meshwire.status-*",
+                             ".meshwire.delegate-tasks.*.json",
                              TASKS_NAME, PEERS_NAME])
 
 
@@ -3957,6 +4177,124 @@ def _encode_worker_job(job):
 def _parse_worker_job(text):
     return _validate_worker_job(_decode_prefixed_json(
         text, WORKER_JOB_PREFIX, WORKER_JOB_MAX, "worker job"))
+
+
+def _build_delegate_job(pool, repo, base, task, kind, task_class,
+                        verification):
+    if (not isinstance(repo, str) or not repo.strip()
+            or len(repo) > WORKER_PATH_MAX
+            or _worker_metadata_has_controls(repo)):
+        raise ValueError("repository path is invalid")
+    ref = "HEAD" if base is None else base
+    if (not isinstance(ref, str) or not ref.strip()
+            or len(ref) > WORKER_PATH_MAX
+            or _worker_metadata_has_controls(ref)):
+        raise ValueError("base revision is invalid")
+    try:
+        canonical = _canonical_worker_repo(pool, repo)
+        resolved = _resolve_worker_base(canonical, ref)
+    except (OSError, TypeError, UnicodeError,
+            subprocess.CalledProcessError) as exc:
+        raise ValueError("repository or base revision is not trusted") from exc
+    try:
+        return _validate_worker_job({
+            "repo": canonical,
+            "base": resolved,
+            "task": task,
+            "verification": verification,
+            "kind": kind,
+            "class": task_class,
+        })
+    except (TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError("worker job is invalid") from exc
+
+
+def _validate_delegate_request(backend, repo, base, task, kind, task_class,
+                               verification):
+    """Validate caller-controlled fields before config, Git, or transport."""
+    if (not isinstance(backend, str)
+            or backend not in WORKER_BACKENDS | {"auto"}):
+        raise ValueError("worker backend is invalid")
+    if (not isinstance(repo, str) or not os.path.isabs(repo)
+            or not repo.strip() or len(repo) > WORKER_PATH_MAX
+            or _worker_metadata_has_controls(repo)):
+        raise ValueError("repository path is invalid")
+    if (base is not None
+            and (not isinstance(base, str) or not base.strip()
+                 or len(base) > WORKER_PATH_MAX
+                 or _worker_metadata_has_controls(base))):
+        raise ValueError("base revision is invalid")
+    try:
+        task_size = len(task.encode("utf-8"))
+    except (AttributeError, UnicodeError):
+        raise ValueError("worker task is invalid") from None
+    sanitized_task = _sanitize_worker_human_text(task)
+    if (not sanitized_task.strip() or task_size > WORKER_TASK_MAX
+            or len(sanitized_task.encode("utf-8")) > WORKER_TASK_MAX):
+        raise ValueError("worker task is invalid")
+    if (not isinstance(verification, list)
+            or len(verification) > WORKER_VERIFY_MAX):
+        raise ValueError("worker verification is invalid")
+    try:
+        invalid_verification = any(
+            not isinstance(item, str)
+            or not _sanitize_worker_human_text(item).strip()
+            or len(item.encode("utf-8")) > WORKER_VERIFY_ITEM_MAX
+            or len(_sanitize_worker_human_text(item).encode("utf-8"))
+            > WORKER_VERIFY_ITEM_MAX
+            for item in verification)
+    except UnicodeError:
+        invalid_verification = True
+    if invalid_verification:
+        raise ValueError("worker verification is invalid")
+    if (not isinstance(kind, str)
+            or kind not in {"implementation", "analysis"}):
+        raise ValueError("worker kind is invalid")
+    if (not isinstance(task_class, str)
+            or task_class not in {"normal", "security", "integration"}):
+        raise ValueError("worker class is invalid")
+
+
+def _save_new_outbound_task(cfg, task_id, **fields):
+    """Create one outbound task without overwriting another recipient."""
+    if not _valid_task_id(task_id):
+        raise ValueError("worker task id is invalid")
+    fields = dict(fields)
+    local_node = fields.pop("local_node", None)
+    return _save_delegate_task(
+        cfg, local_node, task_id, create_only=True, **fields)
+
+
+def _dispatch_worker_job(cfg, pool, me, backend, job):
+    if (not isinstance(backend, str) or backend not in WORKER_BACKENDS):
+        raise ValueError("worker backend is invalid")
+    workers = _delegate_pool_workers(cfg, pool, me=me)
+    if backend not in workers:
+        raise ValueError("worker backend is not configured")
+    node = workers[backend]["node"]
+    text = _encode_worker_job(job)
+    envelope = make_send_envelope(me, node, text)
+    task_id = envelope["params"]["message"]["taskId"]
+    context_id = envelope["params"]["message"]["contextId"]
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    _save_new_outbound_task(
+        cfg, task_id, contextId=context_id, state="submitted",
+        peer=node, direction="outbound", local_node=me, text=text,
+        worker_backend=backend, worker_job_digest=digest)
+    try:
+        send_raw(
+            cfg, me, node, json.dumps(envelope),
+            title=f"{cfg['mesh']}: worker {me} -> {node}")
+    except (OSError, UnicodeError, ValueError,
+            urllib.error.URLError, socket.timeout) as exc:
+        try:
+            _save_delegate_task(
+                cfg, me, task_id, state="failed",
+                result="worker dispatch failed")
+        except (OSError, RuntimeError, TaskLedgerBusy, ValueError):
+            pass
+        raise ValueError("worker dispatch failed") from exc
+    return task_id, node
 
 
 def _validate_worker_result(result):
@@ -4584,6 +4922,36 @@ class MeshMCPServer:
              "inputSchema": {"type": "object", "properties": {
                  "to": {"type": "string"}, "text": {"type": "string"}},
                  "required": ["to", "text"]}},
+            {"name": "mesh_delegate",
+             "description": "Route an isolated Git task to the configured "
+                            "worker pool without waiting for completion.",
+             "inputSchema": {
+                 "type": "object",
+                 "additionalProperties": False,
+                 "properties": {
+                     "backend": {
+                         "type": "string",
+                         "enum": ["auto", "codex", "copilot", "goose"],
+                     },
+                     "repo": {"type": "string"},
+                     "base": {"type": "string"},
+                     "text": {"type": "string"},
+                     "kind": {
+                         "type": "string",
+                         "enum": ["implementation", "analysis"],
+                     },
+                     "class": {
+                         "type": "string",
+                         "enum": ["normal", "security", "integration"],
+                     },
+                     "verification": {
+                         "type": "array",
+                         "items": {"type": "string"},
+                         "maxItems": WORKER_VERIFY_MAX,
+                     },
+                 },
+                 "required": ["repo", "text"],
+             }},
             {"name": "mesh_list_agents",
              "description": "List the nodes known in this mesh, with last-seen "
                             "times.",
@@ -4602,6 +4970,8 @@ class MeshMCPServer:
                 text = self._tool_send(args)
             elif name == "mesh_ask":
                 text = self._tool_ask(args)
+            elif name == "mesh_delegate":
+                text = self._tool_delegate(args)
             elif name == "mesh_list_agents":
                 text = self._tool_list_agents()
             else:
@@ -4671,6 +5041,50 @@ class MeshMCPServer:
                   peer=to, direction="outbound", text=text)
         return (f"asked {to}: task {task_id}. The answer returns later as a "
                 f"pending delivery — poll mesh_pending.")
+
+    def _tool_delegate(self, args):
+        allowed = {
+            "backend", "repo", "base", "text", "kind", "class",
+            "verification",
+        }
+        if not isinstance(args, dict) or set(args) - allowed:
+            raise ValueError("mesh_delegate arguments are invalid")
+        if set(args) & {"repo", "text"} != {"repo", "text"}:
+            raise ValueError("mesh_delegate requires repo and text")
+        backend = args.get("backend", "auto")
+        repo = args.get("repo")
+        base = args.get("base")
+        text = args.get("text")
+        kind = args.get("kind", "implementation")
+        task_class = args.get("class", "normal")
+        verification = args.get("verification", [])
+        try:
+            _validate_delegate_request(
+                backend, repo, base, text, kind, task_class, verification)
+        except (TypeError, UnicodeError, ValueError):
+            raise ValueError("mesh_delegate arguments are invalid")
+
+        pool = load_pool_config(self.cfg)
+        _delegate_pool_workers(self.cfg, pool, me=self.me)
+        job = _build_delegate_job(
+            pool, repo, base, text, kind, task_class, verification)
+        candidates = _worker_candidates(
+            self.cfg, pool, backend, job)
+        if not candidates:
+            raise ValueError("no worker backend is currently available")
+        selected = candidates[0]
+        try:
+            task_id, node = _dispatch_worker_job(
+                self.cfg, pool, self.me, selected, job)
+        except (OSError, RuntimeError, TaskLedgerBusy, UnicodeError,
+                ValueError) as exc:
+            raise ValueError("worker dispatch failed") from exc
+        return json.dumps({
+            "backend": selected,
+            "node": node,
+            "task_id": task_id,
+            "state": "submitted",
+        })
 
     def _tool_list_agents(self):
         peers = load_peers(self.cfg)
@@ -6003,6 +6417,64 @@ def _await_result(cfg, me, task_id, timeout, first=None,
     return None
 
 
+def _await_worker_result(cfg, me, task_id, node, backend, timeout,
+                         first=None, since=None):
+    """Await one authenticated, exactly bound, framed worker result."""
+    if (not isinstance(timeout, int) or isinstance(timeout, bool)
+            or not 0 < timeout <= WORKER_DELEGATE_WAIT_MAX):
+        raise ValueError("worker wait is invalid")
+    expected = _load_delegate_tasks(cfg, me).get(task_id)
+    if (not isinstance(expected, dict)
+            or expected.get("direction") != "outbound"
+            or expected.get("local_node") != me
+            or expected.get("peer") != node
+            or expected.get("worker_backend") != backend
+            or not _valid_task_id(expected.get("contextId"))):
+        raise ValueError("worker task binding is invalid")
+    context_id = expected["contextId"]
+    if expected.get("state") in TERMINAL_STATES:
+        try:
+            stored = _parse_worker_result(expected.get("result", ""))
+            if (stored["backend"] == backend
+                    and _worker_terminal_for_outcome(stored["outcome"])
+                    == expected["state"]
+                    and not _contains_config_secret(cfg, stored)):
+                return stored
+        except (TypeError, UnicodeError, ValueError):
+            pass
+        raise ValueError("stored worker result is invalid")
+    deadline = time.time() + timeout
+    stream_since = since if since is not None else str(
+        max(0, int(expected.get("updated", time.time())) - 1))
+    for ev in _stream_events(
+            cfg, topic(cfg, me), stream_since, deadline, first=first):
+        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
+        if not trusted or ctl or frm != node or recipient != me:
+            continue
+        env = _parse_envelope(body)
+        details = _envelope_details(env) if env else None
+        if details is None:
+            continue
+        kind, tid, ctx, state, envelope_from, envelope_to, text = details
+        if (kind != "result" or tid != task_id or ctx != context_id
+                or envelope_from != node or envelope_to != me
+                or state not in TERMINAL_STATES):
+            continue
+        try:
+            result = _parse_worker_result(text)
+            if (result["backend"] != backend
+                    or _worker_terminal_for_outcome(result["outcome"])
+                    != state
+                    or _contains_config_secret(cfg, result)):
+                continue
+        except (TypeError, UnicodeError, ValueError):
+            continue
+        _save_delegate_task(cfg, me, task_id, state=state, result=text)
+        note_peer(cfg, node, "message")
+        return result
+    return None
+
+
 def _recipe_targets(cfg, me):
     """Rank other roster nodes by reported availability, then recency.
 
@@ -6172,6 +6644,107 @@ def cmd_run(args):
     if errors or any(result["state"] != "completed"
                      for result in results.values()):
         raise SystemExit(1)
+
+
+def _delegate_wait(value):
+    if (not isinstance(value, int) or isinstance(value, bool)
+            or not 0 <= value <= WORKER_DELEGATE_WAIT_MAX):
+        raise ValueError(
+            f"--wait must be between 0 and {WORKER_DELEGATE_WAIT_MAX}")
+    return value
+
+
+def cmd_delegate(args):
+    try:
+        backend = args.backend
+        if (not isinstance(backend, str)
+                or backend not in WORKER_BACKENDS | {"auto"}):
+            raise ValueError("worker backend is invalid")
+        wait = _delegate_wait(args.wait)
+        task_parts = args.task
+        if (not isinstance(task_parts, list) or not task_parts
+                or any(not isinstance(part, str) for part in task_parts)):
+            raise ValueError("worker task is invalid")
+        task = " ".join(task_parts).strip()
+        if args.as_node is not None and not _valid_pool_node(args.as_node):
+            raise ValueError("coordinator identity is invalid")
+        _validate_delegate_request(
+            backend, args.repo, args.base, task, args.kind,
+            args.task_class, args.verify)
+    except (AttributeError, TypeError, UnicodeError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    cfg = load_config()
+    try:
+        pool = load_pool_config(cfg)
+        me = my_node(cfg, args.as_node)
+        _delegate_pool_workers(cfg, pool, me=me)
+        job = _build_delegate_job(
+            pool, args.repo, args.base, task, args.kind,
+            args.task_class, args.verify)
+        candidates = _worker_candidates(cfg, pool, backend, job)
+    except (AttributeError, OSError, TypeError, UnicodeError,
+            ValueError) as exc:
+        sys.exit(f"error: {exc}")
+    if not candidates:
+        sys.exit("error: no worker backend is currently available")
+
+    deadline = time.monotonic() + wait if wait else None
+    since = str(max(0, int(time.time()) - 5))
+    for index, selected in enumerate(candidates):
+        remaining = 0
+        first = None
+        if deadline is not None:
+            remaining = max(
+                0, min(WORKER_DELEGATE_WAIT_MAX,
+                       int(deadline - time.monotonic() + 0.999)))
+            if remaining <= 0:
+                raise SystemExit(124)
+            try:
+                first = _stream_open(
+                    cfg, topic(cfg, me), since, min(remaining, 300))
+            except (OSError, urllib.error.URLError, socket.timeout):
+                pass
+        try:
+            task_id, node = _dispatch_worker_job(
+                cfg, pool, me, selected, job)
+        except (OSError, RuntimeError, TaskLedgerBusy, UnicodeError,
+                ValueError):
+            close = getattr(first, "close", None)
+            if close:
+                close()
+            sys.exit("error: worker dispatch failed")
+        print(f"delegated to {selected} ({node}): task {task_id}")
+        if deadline is None:
+            return
+        try:
+            result = _await_worker_result(
+                cfg, me, task_id, node, selected, remaining,
+                first=first, since=since)
+        except (OSError, RuntimeError, TaskLedgerBusy, UnicodeError,
+                ValueError):
+            sys.exit("error: worker result was rejected")
+        if result is None:
+            raise SystemExit(124)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        outcome = result["outcome"]
+        if outcome == "quota":
+            _write_worker_health(
+                cfg, node, "cooldown", backend=selected,
+                task_id=task_id, error="quota",
+                cooldown_until=int(time.time()) + 3600)
+        elif outcome == "unavailable":
+            _write_worker_health(
+                cfg, node, "unavailable", backend=selected,
+                task_id=task_id, error="backend unavailable",
+                cooldown_until=0)
+        if (backend == "auto" and outcome in {"quota", "unavailable"}
+                and index + 1 < len(candidates)):
+            continue
+        if outcome in {"completed", "no_change"}:
+            return
+        raise SystemExit(1)
+    raise SystemExit(1)
 
 
 def cmd_ask(args):
@@ -7301,6 +7874,24 @@ def main():
                    help="block up to SECS for the reply (0 = fire and forget)")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_ask)
+
+    p = sub.add_parser(
+        "delegate", help="route an isolated repository task to a worker")
+    p.add_argument(
+        "backend", choices=["auto", "codex", "copilot", "goose"])
+    p.add_argument("task", nargs="+")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--base", default=None)
+    p.add_argument(
+        "--kind", choices=["implementation", "analysis"],
+        default="implementation")
+    p.add_argument(
+        "--class", dest="task_class",
+        choices=["normal", "security", "integration"], default="normal")
+    p.add_argument("--verify", action="append", default=[])
+    p.add_argument("--wait", type=int, default=0, metavar="SECS")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_delegate)
 
     p = sub.add_parser("reply", help="answer a received A2A task")
     p.add_argument("task_id")

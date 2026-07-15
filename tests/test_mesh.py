@@ -3164,6 +3164,7 @@ class RecipeTests(MembershipCmdTests):
         self.assertEqual(mesh._recipe_targets(cfg, "alpha"),
                          ["beta", "gamma"])
 
+
     def test_collector_correlates_out_of_order_results_by_task_and_peer(self):
         cfg = self._setup_recipe_mesh()
         pending = {"task-beta": "beta", "task-gamma": "gamma"}
@@ -3191,6 +3192,383 @@ class RecipeTests(MembershipCmdTests):
         self.assertEqual(results["beta"]["result"], "beta answer")
         self.assertEqual(results["gamma"]["result"], "gamma answer")
         self.assertNotIn("spoof", json.dumps(results))
+
+
+class WorkerRoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+        self.cfg["nodes"] = [
+            "coordinator", "worker-goose", "worker-copilot", "worker-codex",
+        ]
+        self.cfg["exec_allow"] = ["coordinator"]
+        self.pool = {
+            "coordinator": "coordinator",
+            "routing": ["goose", "copilot", "codex"],
+            "workers": {
+                name: {"node": f"worker-{name}"}
+                for name in ("goose", "copilot", "codex")
+            },
+        }
+
+    def job(self, task_class="normal", kind="implementation"):
+        return {
+            "repo": "/tmp/repo", "base": "a" * 40,
+            "task": "add a regression test", "verification": [],
+            "class": task_class, "kind": kind,
+        }
+
+    def test_security_and_integration_auto_route_only_to_codex(self):
+        for task_class in ("security", "integration"):
+            with self.subTest(task_class=task_class):
+                self.assertEqual(mesh._worker_candidates(
+                    self.cfg, self.pool, "auto", self.job(task_class)),
+                    ["codex"])
+
+    def test_normal_auto_skips_blocked_and_cooldown_workers(self):
+        mesh._write_json_secure(mesh.peers_file(self.cfg), {
+            "worker-goose": {
+                "status": "blocked", "seen": int(mesh.time.time()),
+            },
+        })
+        mesh._write_worker_health(
+            self.cfg, "worker-copilot", "cooldown", backend="copilot",
+            cooldown_until=int(mesh.time.time()) + 100)
+        self.assertEqual(mesh._worker_candidates(
+            self.cfg, self.pool, "auto", self.job()), ["codex"])
+
+    def test_explicit_backend_overrides_security_class(self):
+        self.assertEqual(mesh._worker_candidates(
+            self.cfg, self.pool, "goose", self.job("security")), ["goose"])
+
+    def test_invalid_backend_is_rejected_before_health_is_consulted(self):
+        with mock.patch.object(mesh, "_read_worker_health") as health:
+            with self.assertRaisesRegex(ValueError, "backend"):
+                mesh._worker_candidates(
+                    self.cfg, self.pool, "claude", self.job())
+        health.assert_not_called()
+
+    def test_unknown_or_reserved_worker_identity_is_rejected(self):
+        for node in ("all", "coordinator", "not-in-current-roster"):
+            pool = dict(self.pool)
+            pool["workers"] = dict(self.pool["workers"])
+            pool["workers"]["goose"] = {"node": node}
+            with self.subTest(node=node), self.assertRaises(ValueError):
+                mesh._worker_candidates(
+                    self.cfg, pool, "auto", self.job())
+
+    def test_delegate_cli_parser_and_wait_boundary(self):
+        called = []
+        with mock.patch.object(mesh, "cmd_delegate", called.append,
+                               create=True), \
+             mock.patch.object(sys, "argv", [
+                 "mesh", "delegate", "auto", "add", "a", "test",
+                 "--repo", "/tmp/repo", "--class", "normal",
+                 "--kind", "implementation", "--wait", "30"]):
+            mesh.main()
+        self.assertEqual(called[0].backend, "auto")
+        self.assertEqual(called[0].task, ["add", "a", "test"])
+        self.assertEqual(called[0].wait, 30)
+
+
+class WorkerDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+        self.cfg["nodes"] = [
+            "coordinator", "worker-goose", "worker-copilot", "worker-codex",
+        ]
+        self.cfg["exec_allow"] = ["coordinator"]
+        self.pool = {
+            "coordinator": "coordinator",
+            "routing": ["goose", "copilot", "codex"],
+            "workers": {
+                name: {"node": f"worker-{name}"}
+                for name in ("goose", "copilot", "codex")
+            },
+        }
+        self.job = {
+            "repo": "/tmp/repo", "base": "a" * 40,
+            "task": "add a regression test", "verification": [],
+            "class": "normal", "kind": "implementation",
+        }
+
+    @staticmethod
+    def result(backend="copilot", outcome="completed", summary="done"):
+        return {
+            "backend": backend, "outcome": outcome,
+            "branch": "codex/worker", "commit": "b" * 40,
+            "changed_files": ["src/a.py"], "summary": summary,
+            "verification": "tests passed", "runtime_seconds": 1,
+            "worktree": "/tmp/worker",
+        }
+
+    def event(self, sender, task_id, context_id, text, event_id,
+              state="completed"):
+        env = mesh.make_result_envelope(
+            sender, "coordinator", task_id, context_id, state, text)
+        wrapper = {"f": sender, "t": "coordinator", "b": json.dumps(env)}
+        return {
+            "event": "message", "id": event_id,
+            "time": int(mesh.time.time()),
+            "message": mesh.encrypt(self.cfg, json.dumps(wrapper)),
+        }
+
+    def test_dispatch_persists_recipient_binding_before_send(self):
+        observed = {}
+
+        def send(_cfg, sender, to, body, **_kwargs):
+            details = mesh._envelope_details(json.loads(body))
+            task = mesh._load_delegate_tasks(
+                self.cfg, "coordinator")[details[1]]
+            observed.update(sender=sender, to=to, details=details, task=task)
+            return {"id": "relay-1"}
+
+        with mock.patch.object(mesh, "send_raw", side_effect=send):
+            task_id, node = mesh._dispatch_worker_job(
+                self.cfg, self.pool, "coordinator", "copilot", self.job)
+
+        self.assertEqual(node, "worker-copilot")
+        self.assertEqual(observed["to"], node)
+        task = observed["task"]
+        self.assertEqual(task["local_node"], "coordinator")
+        self.assertEqual(task["peer"], node)
+        self.assertEqual(task["worker_backend"], "copilot")
+        self.assertEqual(task["contextId"], observed["details"][2])
+        self.assertEqual(
+            mesh._parse_worker_job(task["text"]), self.job)
+        self.assertEqual(mesh._load_delegate_tasks(
+            self.cfg, "coordinator")[task_id]["state"], "submitted")
+        self.assertEqual(mesh.load_tasks(self.cfg), {})
+        with open(os.path.join(self.cfg["_dir"], ".gitignore")) as handle:
+            self.assertIn(".meshwire.delegate-tasks.*.json", handle.read())
+
+    def test_coordinator_ledger_does_not_collide_with_worker_inbox(self):
+        captured = {}
+
+        def send(_cfg, _sender, _to, body, **_kwargs):
+            captured["details"] = mesh._envelope_details(json.loads(body))
+            return {"id": "relay-1"}
+
+        with mock.patch.object(mesh, "send_raw", side_effect=send):
+            task_id, _node = mesh._dispatch_worker_job(
+                self.cfg, self.pool, "coordinator", "copilot", self.job)
+        details = captured["details"]
+
+        disposition = mesh._record_received_task(
+            self.cfg, "request", task_id, details[2], "submitted",
+            "coordinator", details[-1], local_node="worker-copilot")
+
+        self.assertEqual(disposition, mesh.TASK_RECORD_ACCEPTED)
+        worker_task = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(worker_task["direction"], "inbound")
+        self.assertEqual(worker_task["local_node"], "worker-copilot")
+
+    def test_worker_result_updates_exact_coordinator_scoped_record(self):
+        captured = {}
+
+        def send(_cfg, _sender, _to, body, **_kwargs):
+            captured["details"] = mesh._envelope_details(json.loads(body))
+            return {"id": "relay-1"}
+
+        with mock.patch.object(mesh, "send_raw", side_effect=send):
+            task_id, _node = mesh._dispatch_worker_job(
+                self.cfg, self.pool, "coordinator", "copilot", self.job)
+        details = captured["details"]
+        self.assertEqual(mesh._record_received_task(
+            self.cfg, "request", task_id, details[2], "submitted",
+            "coordinator", details[-1], local_node="worker-copilot"),
+            mesh.TASK_RECORD_ACCEPTED)
+        encoded = mesh._encode_worker_result(self.result())
+
+        disposition = mesh._record_received_task(
+            self.cfg, "result", task_id, details[2], "completed",
+            "worker-copilot", encoded, local_node="coordinator")
+
+        self.assertEqual(disposition, mesh.TASK_RECORD_ACCEPTED)
+        coordinator_task = mesh._load_delegate_tasks(
+            self.cfg, "coordinator")[task_id]
+        self.assertEqual(coordinator_task["result"], encoded)
+        self.assertEqual(coordinator_task["state"], "completed")
+        self.assertEqual(
+            mesh.load_tasks(self.cfg)[task_id]["direction"], "inbound")
+
+    def test_build_job_pins_canonical_repo_and_exact_commit(self):
+        workspace = os.path.join(self.tmp.name, "projects")
+        repo = os.path.join(workspace, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(
+            ["git", "-C", repo, "config", "user.email", "test@example.com"],
+            check=True)
+        subprocess.run(
+            ["git", "-C", repo, "config", "user.name", "Test"], check=True)
+        with open(os.path.join(repo, "tracked.txt"), "w") as handle:
+            handle.write("base\n")
+        subprocess.run(["git", "-C", repo, "add", "tracked.txt"],
+                       check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qm", "base"],
+                       check=True)
+        pool = dict(self.pool, workspace_roots=[os.path.realpath(workspace)])
+
+        job = mesh._build_delegate_job(
+            pool, repo, None, "review it", "analysis", "security",
+            ["run tests"])
+
+        expected = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True).stdout.strip()
+        self.assertEqual(job["repo"], os.path.realpath(repo))
+        self.assertEqual(job["base"], expected)
+        self.assertRegex(job["base"], r"^[0-9a-f]{40}$")
+
+    def test_ledger_failure_prevents_send(self):
+        with mock.patch.object(
+                mesh, "_save_new_outbound_task",
+                side_effect=mesh.TaskLedgerBusy("busy")), \
+             mock.patch.object(mesh, "send_raw") as send:
+            with self.assertRaises(mesh.TaskLedgerBusy):
+                mesh._dispatch_worker_job(
+                    self.cfg, self.pool, "coordinator", "copilot", self.job)
+        send.assert_not_called()
+
+    def test_send_failure_leaves_recoverable_secret_free_record(self):
+        error = urllib.error.URLError("failed " + self.cfg["key"])
+        with mock.patch.object(mesh, "send_raw", side_effect=error):
+            with self.assertRaisesRegex(ValueError, "worker dispatch failed"):
+                mesh._dispatch_worker_job(
+                    self.cfg, self.pool, "coordinator", "copilot", self.job)
+        tasks = mesh._load_delegate_tasks(self.cfg, "coordinator")
+        self.assertEqual(len(tasks), 1)
+        task = next(iter(tasks.values()))
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["result"], "worker dispatch failed")
+        self.assertNotIn(self.cfg["key"], json.dumps(tasks))
+
+    def test_worker_wait_accepts_only_exact_bound_framed_result(self):
+        task_id = "task-bound"
+        context_id = "ctx-bound"
+        encoded_job = mesh._encode_worker_job(self.job)
+        mesh._save_delegate_task(
+            self.cfg, "coordinator", task_id, create_only=True,
+            direction="outbound", state="submitted",
+            peer="worker-copilot",
+            worker_backend="copilot", contextId=context_id,
+            text=encoded_job,
+            worker_job_digest=hashlib.sha256(
+                encoded_job.encode("utf-8")).hexdigest())
+        unframed = "completed without worker framing"
+        wrong_backend = mesh._encode_worker_result(self.result("goose"))
+        secret = mesh._encode_worker_result(
+            self.result(summary=self.cfg["key"]))
+        valid = mesh._encode_worker_result(self.result())
+        events = [
+            self.event("worker-copilot", task_id, "wrong-context",
+                       valid, "e1"),
+            self.event("worker-goose", task_id, context_id, valid, "e2"),
+            self.event("worker-copilot", task_id, context_id,
+                       unframed, "e3"),
+            self.event("worker-copilot", task_id, context_id,
+                       wrong_backend, "e4"),
+            self.event("worker-copilot", task_id, context_id, secret, "e5"),
+            self.event("worker-copilot", task_id, context_id, valid, "e6"),
+        ]
+        with mock.patch.object(
+                mesh, "_stream_events", return_value=iter(events)):
+            result = mesh._await_worker_result(
+                self.cfg, "coordinator", task_id, "worker-copilot",
+                "copilot", 30, since="0")
+        self.assertEqual(result, self.result())
+        stored = mesh._load_delegate_tasks(self.cfg, "coordinator")[task_id]
+        self.assertEqual(stored["contextId"], context_id)
+        self.assertEqual(stored["peer"], "worker-copilot")
+        self.assertEqual(stored["result"], valid)
+        self.assertNotIn(self.cfg["key"], json.dumps(stored))
+
+    def test_worker_wait_rejects_bad_binding_without_streaming(self):
+        encoded_job = mesh._encode_worker_job(self.job)
+        mesh._save_delegate_task(
+            self.cfg, "coordinator", "task-bad-binding", create_only=True,
+            direction="outbound",
+            state="submitted", peer="worker-goose",
+            worker_backend="copilot", contextId="ctx", text=encoded_job,
+            worker_job_digest=hashlib.sha256(
+                encoded_job.encode("utf-8")).hexdigest())
+        with mock.patch.object(mesh, "_stream_events") as stream:
+            with self.assertRaisesRegex(ValueError, "binding"):
+                mesh._await_worker_result(
+                    self.cfg, "coordinator", "task-bad-binding",
+                    "worker-copilot", "copilot", 30)
+        stream.assert_not_called()
+
+    def test_wait_bounds_reject_bool_negative_and_oversized(self):
+        for value in (True, -1, mesh.WORKER_DELEGATE_WAIT_MAX + 1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mesh._delegate_wait(value)
+
+    def args(self, **overrides):
+        values = {
+            "backend": "auto", "task": ["do", "it"],
+            "repo": "/tmp/repo", "base": None,
+            "kind": "implementation", "task_class": "normal",
+            "verify": [], "wait": 0, "as_node": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_invalid_wait_precedes_config_load(self):
+        with mock.patch.object(mesh, "load_config") as load:
+            with self.assertRaisesRegex(SystemExit, "--wait"):
+                mesh.cmd_delegate(self.args(wait=-1))
+        load.assert_not_called()
+
+    def test_no_candidate_opens_no_stream_and_persists_no_task(self):
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "my_node", return_value="coordinator"), \
+             mock.patch.object(mesh, "_build_delegate_job",
+                               return_value=self.job), \
+             mock.patch.object(mesh, "_worker_candidates", return_value=[]), \
+             mock.patch.object(mesh, "_stream_open") as stream, \
+             mock.patch.object(mesh, "_dispatch_worker_job") as dispatch:
+            with self.assertRaisesRegex(SystemExit, "no worker backend"):
+                mesh.cmd_delegate(self.args(wait=30))
+        stream.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(mesh.load_tasks(self.cfg), {})
+        self.assertEqual(
+            mesh._load_delegate_tasks(self.cfg, "coordinator"), {})
+
+    def test_auto_falls_back_only_after_authenticated_quota(self):
+        quota = self.result("goose", outcome="quota", summary="quota")
+        quota["commit"] = ""
+        quota["changed_files"] = []
+        completed = self.result("copilot")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "my_node", return_value="coordinator"), \
+             mock.patch.object(mesh, "_build_delegate_job",
+                               return_value=self.job), \
+             mock.patch.object(mesh, "_worker_candidates",
+                               return_value=["goose", "copilot"]), \
+             mock.patch.object(mesh, "_stream_open", return_value=None), \
+             mock.patch.object(
+                 mesh, "_dispatch_worker_job",
+                 side_effect=[("task-1", "worker-goose"),
+                              ("task-2", "worker-copilot")]) as dispatch, \
+             mock.patch.object(
+                 mesh, "_await_worker_result",
+                 side_effect=[quota, completed]) as wait, \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_delegate(self.args(wait=30))
+        self.assertEqual(
+            [call.args[3] for call in dispatch.call_args_list],
+            ["goose", "copilot"])
+        self.assertEqual(wait.call_count, 2)
 
 
 class _FakeConn:
@@ -3959,7 +4337,10 @@ class MCPServeTests(unittest.TestCase):
         self._initialize(srv, out)
         srv.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
         names = {t["name"] for t in self._sent(out)[0]["result"]["tools"]}
-        self.assertEqual(names, {"mesh_pending", "mesh_reply", "mesh_send", "mesh_ask", "mesh_list_agents"})
+        self.assertEqual(names, {
+            "mesh_pending", "mesh_reply", "mesh_send", "mesh_ask",
+            "mesh_list_agents", "mesh_delegate",
+        })
 
     def test_mesh_pending_drains_buffer(self):
         srv, out = self._server()
@@ -4300,6 +4681,95 @@ class MCPServeTests(unittest.TestCase):
         self.assertTrue(os.path.exists(activity))
         with open(activity) as f:
             self.assertIn("presence server exited", f.read())
+
+
+class WorkerDelegateMCPTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.server = mesh.MeshMCPServer.__new__(mesh.MeshMCPServer)
+        self.server.cfg = make_cfg(self.tmp.name)
+        self.server.cfg["nodes"] = ["coordinator", "worker-goose"]
+        self.server.cfg["exec_allow"] = ["coordinator"]
+        self.server.me = "coordinator"
+        self.pool = {
+            "coordinator": "coordinator", "routing": ["goose"],
+            "workers": {"goose": {"node": "worker-goose"}},
+        }
+
+    def test_mesh_delegate_is_closed_and_dispatches_nonblocking(self):
+        spec = next(item for item in self.server._tool_specs()
+                    if item["name"] == "mesh_delegate")
+        self.assertFalse(spec["inputSchema"]["additionalProperties"])
+        with mock.patch.object(
+                mesh, "load_pool_config", return_value=self.pool), \
+             mock.patch.object(
+                 mesh, "_build_delegate_job",
+                 return_value={
+                     "repo": "/tmp/repo", "base": "a" * 40,
+                     "task": "review it", "verification": [],
+                     "kind": "analysis", "class": "normal",
+                 }), \
+             mock.patch.object(
+                 mesh, "_dispatch_worker_job",
+                 return_value=("task-1", "worker-goose")) as dispatch, \
+             mock.patch.object(mesh, "_await_result") as wait:
+            result = self.server._tool_delegate({
+                "repo": "/tmp/repo", "text": "review it",
+                "kind": "analysis",
+            })
+        value = json.loads(result)
+        self.assertEqual(value["backend"], "goose")
+        self.assertEqual(value["task_id"], "task-1")
+        dispatch.assert_called_once()
+        wait.assert_not_called()
+
+    def test_mesh_delegate_rejects_unknown_input_before_loading_pool(self):
+        with mock.patch.object(mesh, "load_pool_config") as load:
+            with self.assertRaisesRegex(ValueError, "arguments"):
+                self.server._tool_delegate({
+                    "repo": "/tmp/repo", "text": "review it",
+                    "wait": 30,
+                })
+        load.assert_not_called()
+
+    def test_mesh_delegate_rejects_invalid_fields_before_loading_pool(self):
+        cases = [
+            {"repo": "relative", "text": "review it"},
+            {"repo": "/tmp/repo", "text": ""},
+            {"repo": "/tmp/repo", "text": "review it", "backend": True},
+            {"repo": "/tmp/repo", "text": "review it", "kind": []},
+            {"repo": "/tmp/repo", "text": "review it", "class": "urgent"},
+            {"repo": "/tmp/repo", "text": "review it",
+             "verification": ("tests",)},
+        ]
+        for args in cases:
+            with self.subTest(args=args), \
+                 mock.patch.object(mesh, "load_pool_config") as load:
+                with self.assertRaisesRegex(ValueError, "arguments"):
+                    self.server._tool_delegate(args)
+                load.assert_not_called()
+
+    def test_mesh_delegate_no_candidate_has_no_dispatch_or_task(self):
+        with mock.patch.object(
+                mesh, "load_pool_config", return_value=self.pool), \
+             mock.patch.object(
+                 mesh, "_build_delegate_job",
+                 return_value={
+                     "repo": "/tmp/repo", "base": "a" * 40,
+                     "task": "review it", "verification": [],
+                     "kind": "analysis", "class": "normal",
+                 }), \
+             mock.patch.object(mesh, "_worker_candidates",
+                               return_value=[]), \
+             mock.patch.object(mesh, "_dispatch_worker_job") as dispatch:
+            with self.assertRaisesRegex(ValueError, "no worker backend"):
+                self.server._tool_delegate({
+                    "repo": "/tmp/repo", "text": "review it",
+                    "kind": "analysis",
+                })
+        dispatch.assert_not_called()
+        self.assertEqual(mesh.load_tasks(self.server.cfg), {})
 
 
 class HarnessSpecTests(unittest.TestCase):
