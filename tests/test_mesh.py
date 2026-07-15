@@ -4630,6 +4630,46 @@ class SupervisePendingTests(unittest.TestCase):
             ["t1"])
 
 
+class RecipientScopedTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+
+    def test_received_request_records_local_node(self):
+        mesh._record_received_task(
+            self.cfg, "request", "t1", "c1", "submitted", "coordinator",
+            "change one file", local_node="worker-copilot")
+        task = mesh.load_tasks(self.cfg)["t1"]
+        self.assertEqual(task["local_node"], "worker-copilot")
+
+    def test_strict_worker_selection_does_not_race_other_recipient(self):
+        self.cfg["exec_allow"] = ["coordinator"]
+        mesh.save_task(
+            self.cfg, "for-copilot", direction="inbound", state="submitted",
+            peer="coordinator", local_node="worker-copilot")
+        mesh.save_task(
+            self.cfg, "for-goose", direction="inbound", state="submitted",
+            peer="coordinator", local_node="worker-goose")
+        got = mesh._supervise_pending(
+            self.cfg, "worker-copilot", allow_legacy=False)
+        self.assertEqual([task_id for task_id, _ in got], ["for-copilot"])
+
+    def test_legacy_codex_path_accepts_old_record_but_pool_does_not(self):
+        self.cfg["exec_allow"] = ["coordinator"]
+        mesh.save_task(
+            self.cfg, "old", direction="inbound", state="submitted",
+            peer="coordinator")
+        self.assertEqual(
+            [task_id for task_id, _ in
+             mesh._supervise_pending(self.cfg, "codex", allow_legacy=True)],
+            ["old"])
+        self.assertEqual(
+            mesh._supervise_pending(
+                self.cfg, "worker-codex", allow_legacy=False),
+            [])
+
+
 class CodexAllowTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -977,7 +977,7 @@ def save_task(cfg, task_id, **fields):
 
 
 def _record_received_task(cfg, kind, task_id, context_id, state, peer,
-                          text, rpc_id=None):
+                          text, rpc_id=None, local_node=None):
     """Record an inbound task request or result and return whether a result
     was unsolicited.
 
@@ -987,9 +987,17 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
     explicitly tagged for verification.
     """
     if kind == "request":
-        save_task(cfg, task_id, contextId=context_id, state=state,
-                  peer=peer, direction="inbound", text=text,
-                  rpcId=rpc_id)
+        fields = {
+            "contextId": context_id,
+            "state": state,
+            "peer": peer,
+            "direction": "inbound",
+            "text": text,
+            "rpcId": rpc_id,
+        }
+        if local_node is not None:
+            fields["local_node"] = local_node
+        save_task(cfg, task_id, **fields)
         return False
 
     existing = load_tasks(cfg).get(task_id) or {}
@@ -1011,9 +1019,18 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
                   unsolicited_updates=updates)
         return True
 
-    save_task(cfg, task_id, contextId=context_id, state=state,
-              peer=peer, direction="inbound", text=text, rpcId=rpc_id,
-              unsolicited=True)
+    fields = {
+        "contextId": context_id,
+        "state": state,
+        "peer": peer,
+        "direction": "inbound",
+        "text": text,
+        "rpcId": rpc_id,
+        "unsolicited": True,
+    }
+    if local_node is not None:
+        fields["local_node"] = local_node
+    save_task(cfg, task_id, **fields)
     return True
 
 
@@ -1041,7 +1058,7 @@ def _mark_handled(cfg, node, task_id):
         pass
 
 
-def _supervise_pending(cfg, node):
+def _supervise_pending(cfg, node, allow_legacy=True):
     """Inbound tasks from an exec-allowlisted peer awaiting `mesh
     codex-supervise` action, oldest first, skipping ones already marked
     handled.
@@ -1060,6 +1077,10 @@ def _supervise_pending(cfg, node):
         and t.get("state") == "submitted"
         and t.get("peer") in cfg.get("exec_allow", [])
         and task_id not in handled
+        and (
+            t.get("local_node") == node
+            or (allow_legacy and t.get("local_node") is None)
+        )
     ]
     pending.sort(key=lambda item: item[1].get("updated", 0))
     return pending
@@ -1722,7 +1743,8 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None):
             print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             return False
         unsolicited = _record_received_task(
-            cfg, kind, task_id, ctx, state, frm, text, env.get("id"))
+            cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
+            local_node=authority_to)
         if kind == "request":
             print(f"MESH_TASK from={_single_line(frm)} task={task_id} "
                   f"state=submitted: {_single_line(text)}")
@@ -2360,7 +2382,8 @@ class MeshMCPServer:
                     eto != authority_to):
                 return None
             unsolicited = _record_received_task(
-                self.cfg, kind, task_id, ctx, state, frm, text, env.get("id"))
+                self.cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
+                local_node=authority_to)
             delivery = {
                 "kind": "task" if kind == "request" else "task_update",
                 "from": frm,
