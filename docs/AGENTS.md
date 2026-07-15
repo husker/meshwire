@@ -74,9 +74,36 @@ to `mesh reply`.
 A node doesn't have to be an agent. A build server can `mesh send all "nightly
 green"` and a monitoring script can `mesh watch --timeout 60` in a loop.
 
+## Optional machine-wide worker pool
+
+The pool is off until an operator runs both `mesh pool-setup` and
+`mesh pool-start`. Setup replaces `exec_allow` with the single named
+coordinator; because mesh members share one key and can assert each other's
+names, that allowlist is a trust policy, not cryptographic node identity.
+
+Before starting, install all three configured CLIs, authenticate Codex and
+Copilot for the current user, and ensure local Ollama has the configured Goose
+model. macOS uses current-user LaunchAgents. On other operating systems,
+`pool-start`/`pool-stop` only print foreground commands for an operator or
+service manager; they do not install services.
+
+`mesh delegate auto` routes normal jobs through Goose/Ollama, Copilot, then
+Codex; security and integration jobs use Codex unless a backend is explicitly
+selected. Every job gets a separate Git worktree, but a worktree is collision
+isolation, not an OS security sandbox. Treat task text as untrusted. A returned
+branch/commit is proposed production, not integration: workers do not
+automatically merge, push, open PRs, deploy, publish, or remove worktrees.
+Use `mesh pool-clean` only after review and integration; default cleanup
+preserves dirty, unintegrated, or uncertain worktrees. The explicit
+`mesh pool-clean --task <id> --force` escape hatch may discard one terminal
+task's worktree.
+
 ## Answering tasks: who does the thinking?
 
-`mesh` moves messages; it never calls a model itself. The receiving node's
-harness (Claude Code session, Codex loop, your framework) is what reads the
-task and produces the reply. That's deliberate: each node answers with
-whatever brain, tools, and permissions it already has.
+By default, mesh only transports tasks and an interactive harness does the
+thinking. The optional worker pool is the exception: an explicitly started,
+exec-allowlisted `worker-supervise` process invokes its configured local CLI in
+an isolated Git worktree and replies with a branch/commit result. Outside that
+opt-in path, the receiving node's harness (Claude Code session, Codex loop, or
+your framework) reads the task and produces the reply with its existing brain,
+tools, and permissions.

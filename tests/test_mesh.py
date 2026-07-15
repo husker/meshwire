@@ -3798,7 +3798,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.14.1")
+        self.assertEqual(release, "0.15.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
@@ -4929,6 +4929,18 @@ class IntegrateTests(unittest.TestCase):
 
 
 class OnboardingTextTests(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_readme_lists_worker_pool_commands(self):
+        with open(os.path.join(self.ROOT, "README.md"),
+                  encoding="utf-8") as f:
+            readme = f.read()
+        for command in (
+                "mesh pool-setup", "mesh pool-start", "mesh pool-status",
+                "mesh pool-stop", "mesh pool-clean", "mesh delegate"):
+            self.assertIn(command, readme)
+        self.assertIn("worktree is not a security sandbox", readme.lower())
+
     def test_integrate_codex_mentions_codex_setup(self):
         self.assertIn("mesh codex-setup", mesh._integrate_harness("codex"))
 

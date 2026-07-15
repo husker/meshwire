@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "a2acast plugins for cross-machine agent messaging",
-    "version": "0.14.1"
+    "version": "0.15.0"
   },
   "plugins": [
     {
       "name": "a2acast",
       "description": "Encrypted messaging and A2A tasks between agent sessions on different machines.",
-      "version": "0.14.1",
+      "version": "0.15.0",
       "source": "./plugins/copilot-a2acast",
       "author": {
         "name": "James Gagan"
