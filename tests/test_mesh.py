@@ -8450,6 +8450,42 @@ class WorkerSuperviseTests(unittest.TestCase):
         self.addCleanup(mesh._release_supervise_lock, lock)
         self.assertIsNotNone(lock)
 
+    def test_headless_worker_receiver_subscribes_without_mcp_notification(self):
+        class StopLoop(Exception):
+            pass
+
+        subscribed = threading.Event()
+        receiver = mesh.MeshMCPServer(
+            self.cfg, "worker-copilot", out=lambda _line: None)
+
+        def watch_once(_cfg, _node, _topic):
+            subscribed.set()
+            receiver._stop.wait()
+
+        receiver._watch_once = watch_once
+
+        def stop_main_loop(_seconds):
+            subscribed.wait(timeout=0.25)
+            raise StopLoop
+
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(
+                 mesh, "MeshMCPServer", return_value=receiver), \
+             mock.patch.object(mesh.time, "sleep",
+                               side_effect=stop_main_loop), \
+             mock.patch.object(mesh.signal, "signal"):
+            with self.assertRaises(StopLoop):
+                mesh.cmd_worker_supervise(
+                    self._args(once=False, interval=1))
+
+        self.assertTrue(subscribed.is_set())
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "worker-copilot")))
+
     def test_configured_worker_node_is_authoritative(self):
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
              mock.patch.object(
@@ -8880,6 +8916,8 @@ class SuperviseReceiverTests(unittest.TestCase):
     def test_initialization_wait_stops_without_waiting_thirty_seconds(self):
         server = mesh.MeshMCPServer(
             self.cfg, "mynode", out=lambda _line: None)
+        subscribed = threading.Event()
+        server._watch_once = lambda *_args: subscribed.set()
         watch_thread = threading.Thread(
             target=server.watch_loop, daemon=True)
         self.addCleanup(server._initialized.set)
@@ -8891,6 +8929,92 @@ class SuperviseReceiverTests(unittest.TestCase):
         watch_thread.join(timeout=0.5)
 
         self.assertFalse(watch_thread.is_alive())
+        self.assertFalse(subscribed.is_set())
+
+    def test_initialization_without_notification_falls_back_after_thirty_seconds(self):
+        server = mesh.MeshMCPServer(
+            self.cfg, "mynode", out=lambda _line: None)
+        elapsed = [0.0]
+        subscribed_at = []
+
+        def simulated_wait(timeout):
+            elapsed[0] += timeout
+            if elapsed[0] > 31:
+                server._stop.set()
+                return True
+            return False
+
+        def watch_once(_cfg, _node, _topic):
+            subscribed_at.append(elapsed[0])
+            server._stop.set()
+
+        server._watch_once = watch_once
+        with mock.patch.object(
+                server._stop, "wait", side_effect=simulated_wait), \
+             mock.patch.object(
+                 mesh.time, "monotonic", side_effect=lambda: elapsed[0]):
+            server.watch_loop()
+
+        self.assertEqual(len(subscribed_at), 1)
+        self.assertAlmostEqual(subscribed_at[0], 30.0, delta=0.11)
+
+    def test_initialization_notification_subscribes_immediately(self):
+        server = mesh.MeshMCPServer(
+            self.cfg, "mynode", out=lambda _line: None)
+        subscribed = threading.Event()
+
+        def watch_once(_cfg, _node, _topic):
+            subscribed.set()
+            server._stop.wait()
+
+        server._watch_once = watch_once
+        watch_thread = threading.Thread(
+            target=server.watch_loop, daemon=True)
+        self.addCleanup(server.stop)
+        self.addCleanup(watch_thread.join, 1)
+
+        watch_thread.start()
+        server.handle({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        self.assertTrue(subscribed.wait(timeout=0.5))
+        server.stop()
+        watch_thread.join(timeout=0.5)
+        self.assertFalse(watch_thread.is_alive())
+
+    def test_headless_codex_receiver_subscribes_without_mcp_notification(self):
+        class StopLoop(Exception):
+            pass
+
+        subscribed = threading.Event()
+        receiver = mesh.MeshMCPServer(
+            self.cfg, "mynode", out=lambda _line: None)
+
+        def watch_once(_cfg, _node, _topic):
+            subscribed.set()
+            receiver._stop.wait()
+
+        receiver._watch_once = watch_once
+
+        def stop_main_loop(_seconds):
+            subscribed.wait(timeout=0.25)
+            raise StopLoop
+
+        ns = argparse.Namespace(
+            sandbox="read-only", interval=1, once=False,
+            stop=False, as_node="mynode")
+        with mock.patch.object(mesh, "_run_task_with_codex"), \
+             mock.patch.object(
+                 mesh, "MeshMCPServer", return_value=receiver), \
+             mock.patch.object(mesh.time, "sleep",
+                               side_effect=stop_main_loop):
+            with self.assertRaises(StopLoop):
+                mesh.cmd_codex_supervise(ns)
+
+        self.assertTrue(subscribed.is_set())
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "mynode")))
 
     def test_active_stream_read_is_closed_by_stop_without_shorter_timeout(self):
         entered = threading.Event()

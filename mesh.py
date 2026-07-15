@@ -4040,6 +4040,7 @@ MESH_MCP_VERSION = VERSION
 # consumed by reasoning before any answer, yielding an empty/incomplete stream.
 MESH_MCP_SAMPLING_MAX_TOKENS = 8192
 MESH_MCP_SAMPLING_TIMEOUT = 300
+MESH_MCP_INITIALIZE_TIMEOUT = 30
 MESH_MCP_STOP_POLL_INTERVAL = 0.1
 
 _MCP_HANDLE_SYSTEM = (
@@ -4112,6 +4113,10 @@ class MeshMCPServer:
         if response is not None:
             self._interrupt_response(response)
 
+    def mark_initialized(self):
+        """Allow the receive loop to subscribe without an MCP handshake."""
+        self._initialized.set()
+
     # -- JSON-RPC I/O --------------------------------------------------------
 
     def _write(self, obj):
@@ -4147,7 +4152,7 @@ class MeshMCPServer:
                                "version": MESH_MCP_VERSION},
             })
         elif method == "notifications/initialized":
-            self._initialized.set()
+            self.mark_initialized()
         elif method == "tools/list":
             self._respond(mid, {"tools": self._tool_specs()})
         elif method == "tools/call":
@@ -4457,8 +4462,13 @@ class MeshMCPServer:
     def watch_loop(self):
         cfg, me = self.cfg, self.me
         tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
+        initialize_deadline = (
+            time.monotonic() + MESH_MCP_INITIALIZE_TIMEOUT)
         while not self._initialized.is_set():
-            if self._stop.wait(MESH_MCP_STOP_POLL_INTERVAL):
+            remaining = initialize_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._stop.wait(min(MESH_MCP_STOP_POLL_INTERVAL, remaining)):
                 return
         backoff = 1
         while not self._stop.is_set():
@@ -6256,6 +6266,7 @@ def cmd_codex_supervise(args):
         # outlive its lock through a background receiver thread.
         if not args.once:
             receiver = MeshMCPServer(cfg, me)
+            receiver.mark_initialized()
             receiver_thread = threading.Thread(
                 target=receiver.watch_loop, daemon=True)
             receiver_thread.start()
@@ -6416,6 +6427,7 @@ def _run_worker_supervisor(args):
         _recover_worker_tasks(cfg, pool, me, backend)
         if not getattr(args, "once", False):
             receiver = MeshMCPServer(cfg, me)
+            receiver.mark_initialized()
             receiver_thread = threading.Thread(
                 target=receiver.watch_loop, daemon=True)
             receiver_thread.start()
