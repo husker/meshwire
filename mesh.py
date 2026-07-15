@@ -6422,7 +6422,8 @@ def _await_result(cfg, me, task_id, timeout, first=None,
 def _await_worker_result(cfg, me, task_id, node, backend, timeout,
                          first=None, since=None):
     """Await one authenticated, exactly bound, framed worker result."""
-    if (not isinstance(timeout, int) or isinstance(timeout, bool)
+    if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
             or not 0 < timeout <= WORKER_DELEGATE_WAIT_MAX):
         raise ValueError("worker wait is invalid")
     expected = _load_delegate_tasks(cfg, me).get(task_id)
@@ -6697,14 +6698,14 @@ def cmd_delegate(args):
         remaining = 0
         first = None
         if deadline is not None:
-            remaining = max(
-                0, min(WORKER_DELEGATE_WAIT_MAX,
-                       int(deadline - time.monotonic() + 0.999)))
+            remaining = max(0.0, min(
+                float(WORKER_DELEGATE_WAIT_MAX),
+                deadline - time.monotonic()))
             if remaining <= 0:
                 raise SystemExit(124)
             try:
                 first = _stream_open(
-                    cfg, topic(cfg, me), since, min(remaining, 300))
+                    cfg, topic(cfg, me), since, min(remaining, 5.0))
             except (OSError, urllib.error.URLError, socket.timeout):
                 pass
         try:
@@ -6719,6 +6720,18 @@ def cmd_delegate(args):
         print(f"delegated to {selected} ({node}): task {task_id}")
         if deadline is None:
             return
+        close = getattr(first, "close", None)
+        if close:
+            try:
+                close()
+            except OSError:
+                pass
+        first = None
+        remaining = max(0.0, min(
+            float(WORKER_DELEGATE_WAIT_MAX),
+            deadline - time.monotonic()))
+        if remaining <= 0:
+            raise SystemExit(124)
         try:
             result = _await_worker_result(
                 cfg, me, task_id, node, selected, remaining,

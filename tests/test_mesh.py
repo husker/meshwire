@@ -3585,6 +3585,40 @@ class WorkerDispatchTests(unittest.TestCase):
             ["goose", "copilot"])
         self.assertEqual(wait.call_count, 2)
 
+    def test_wait_budget_is_recomputed_after_stream_setup_and_dispatch(self):
+        class First:
+            closed = False
+
+            def close(inner_self):
+                inner_self.closed = True
+
+        first = First()
+        completed = self.result("copilot")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "my_node", return_value="coordinator"), \
+             mock.patch.object(mesh, "_build_delegate_job",
+                               return_value=self.job), \
+             mock.patch.object(mesh, "_worker_candidates",
+                               return_value=["copilot"]), \
+             mock.patch.object(mesh, "_stream_open", return_value=first), \
+             mock.patch.object(
+                 mesh, "_dispatch_worker_job",
+                 return_value=("task-1", "worker-copilot")), \
+             mock.patch.object(
+                 mesh, "_await_worker_result",
+                 return_value=completed) as wait_result, \
+             mock.patch.object(
+                 mesh.time, "monotonic",
+                 side_effect=[100.0, 100.0, 108.25]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_delegate(self.args(wait=10))
+
+        self.assertTrue(first.closed)
+        self.assertIsNone(wait_result.call_args.kwargs["first"])
+        self.assertAlmostEqual(wait_result.call_args.args[5], 1.75)
+
 
 class _FakeConn:
     instances = []
