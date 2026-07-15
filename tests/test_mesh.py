@@ -1448,6 +1448,68 @@ class WatchTests(MembershipCmdTests):
         with open(".meshwire.cursor-alpha") as f:
             self.assertEqual(json.load(f)["since"], 200)
 
+    def _assert_task_lock_busy_retries_before_checkpoint(self, kind):
+        cfg = self._setup_mesh()
+        task_id = "busy-%s" % kind
+        context_id = "ctx-%s" % kind
+        if kind == "request":
+            env = mesh.make_send_envelope(
+                "beta", "alpha", "do it", task_id=task_id,
+                context_id=context_id)
+        else:
+            mesh.save_task(
+                mesh.load_config(), task_id, direction="outbound",
+                state="submitted", peer="beta", text="request",
+                contextId=context_id)
+            env = mesh.make_result_envelope(
+                "beta", "alpha", task_id, context_id, "completed", "done")
+        ev = self._msg_event(cfg, "beta", json.dumps(env), "busy-event", 200)
+        real_acquire = mesh._acquire_tasks_lock
+        acks = []
+        attempts = []
+
+        def acquire(cfg_):
+            attempts.append(1)
+            if len(attempts) == 1:
+                with open(".meshwire.cursor-alpha") as f:
+                    self.assertEqual(json.load(f), {"since": 0, "seen": []})
+                self.assertFalse(os.path.exists(mesh.replay_file(cfg_, "alpha")))
+                self.assertEqual(acks, [])
+                return None
+            return real_acquire(cfg_)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", return_value=iter([ev])), \
+             mock.patch.object(mesh, "_acquire_tasks_lock", side_effect=acquire), \
+             mock.patch.object(mesh, "_send_ack",
+                               side_effect=lambda *a: acks.append(a[3]["id"])), \
+             mock.patch.object(mesh.time, "sleep", return_value=None), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(acks, ["busy-event"])
+        self.assertIn(mesh._tasks_lock_file(mesh.load_config()), err.getvalue())
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f),
+                             {"since": 200, "seen": ["busy-event"]})
+        self.assertEqual(len(mesh.load_replays(mesh.load_config(), "alpha")), 1)
+        task = mesh.load_tasks(mesh.load_config())[task_id]
+        if kind == "request":
+            self.assertEqual(task["direction"], "inbound")
+            self.assertEqual(out.getvalue().count("MESH_TASK from="), 1)
+        else:
+            self.assertEqual(task["direction"], "outbound")
+            self.assertEqual(task["result"], "done")
+            self.assertEqual(out.getvalue().count("MESH_TASK_UPDATE"), 1)
+
+    def test_direct_watch_retries_busy_task_request_before_checkpoint(self):
+        self._assert_task_lock_busy_retries_before_checkpoint("request")
+
+    def test_direct_watch_retries_busy_task_result_before_checkpoint(self):
+        self._assert_task_lock_busy_retries_before_checkpoint("result")
+
     def test_malformed_utf8_stream_precedes_valid_delivery_and_sentinel(self):
         cfg = self._setup_mesh()
         valid = self._msg_event(cfg, "beta", "real message", "valid", 201)
@@ -3729,6 +3791,80 @@ class MCPServeTests(unittest.TestCase):
         out.clear()
         return resp
 
+    def _assert_task_lock_busy_precedes_mcp_checkpoint(self, kind):
+        srv, _ = self._server()
+        task_id = "mcp-busy-%s" % kind
+        context_id = "mcp-ctx-%s" % kind
+        if kind == "request":
+            env = mesh.make_send_envelope(
+                "beta", "alpha", "do it", task_id=task_id,
+                context_id=context_id)
+        else:
+            mesh.save_task(
+                srv.cfg, task_id, direction="outbound", state="submitted",
+                peer="beta", text="request", contextId=context_id)
+            env = mesh.make_result_envelope(
+                "beta", "alpha", task_id, context_id, "completed", "done")
+        body = json.dumps(env)
+        ev = {
+            "event": "message", "id": "mcp-busy-event", "time": 200,
+            "message": mesh.encrypt(srv.cfg, json.dumps(
+                {"f": "beta", "t": "alpha", "b": body})),
+        }
+        cf = mesh.cursor_file(srv.cfg, "alpha")
+        mesh._write_json_secure(cf, {"since": 0, "seen": []})
+        acks = []
+        stream = lambda *a, **k: iter([ev])
+
+        caught = None
+        with mock.patch.object(mesh, "_stream_events", side_effect=stream), \
+             mock.patch.object(mesh, "_acquire_tasks_lock", return_value=None), \
+             mock.patch.object(mesh, "_send_ack",
+                               side_effect=lambda *a: acks.append(a[3]["id"])):
+            try:
+                srv._watch_once(srv.cfg, "alpha", "topic")
+            except Exception as exc:
+                caught = exc
+
+        self.assertIsNotNone(caught)
+        self.assertEqual(type(caught).__name__, "TaskLedgerBusy")
+        self.assertIn(mesh._tasks_lock_file(srv.cfg), str(caught))
+        self.assertEqual(acks, [])
+        with open(cf) as f:
+            self.assertEqual(json.load(f), {"since": 0, "seen": []})
+        self.assertFalse(os.path.exists(mesh.replay_file(srv.cfg, "alpha")))
+        self.assertEqual(srv._buf, [])
+        task = mesh.load_tasks(srv.cfg).get(task_id)
+        if kind == "request":
+            self.assertIsNone(task)
+        else:
+            self.assertEqual(task["state"], "submitted")
+            self.assertNotIn("result", task)
+
+        with mock.patch.object(mesh, "_stream_events", side_effect=stream), \
+             mock.patch.object(mesh, "_send_ack",
+                               side_effect=lambda *a: acks.append(a[3]["id"])):
+            srv._watch_once(srv.cfg, "alpha", "topic")
+
+        self.assertEqual(acks, ["mcp-busy-event"])
+        with open(cf) as f:
+            self.assertEqual(json.load(f),
+                             {"since": 200, "seen": ["mcp-busy-event"]})
+        self.assertEqual(len(mesh.load_replays(srv.cfg, "alpha")), 1)
+        self.assertEqual(len(srv._buf), 1)
+        task = mesh.load_tasks(srv.cfg)[task_id]
+        if kind == "request":
+            self.assertEqual(task["direction"], "inbound")
+        else:
+            self.assertEqual(task["direction"], "outbound")
+            self.assertEqual(task["result"], "done")
+
+    def test_mcp_watch_retries_busy_task_request_before_checkpoint(self):
+        self._assert_task_lock_busy_precedes_mcp_checkpoint("request")
+
+    def test_mcp_watch_retries_busy_task_result_before_checkpoint(self):
+        self._assert_task_lock_busy_precedes_mcp_checkpoint("result")
+
     def test_initialize_advertises_tools_and_detects_sampling(self):
         srv, out = self._server()
         resp = self._initialize(srv, out, sampling=True)
@@ -4270,6 +4406,33 @@ class TasksDurabilityTests(unittest.TestCase):
                 mesh.save_task(self.cfg, "blocked", state="working")
         write.assert_not_called()
         self.assertNotIn("blocked", mesh.load_tasks(self.cfg))
+
+    def test_task_lock_busy_is_a_distinct_retryable_error(self):
+        lock_path = mesh._tasks_lock_file(self.cfg)
+        lock = mesh._acquire_tasks_lock(self.cfg)
+        self.assertIsNotNone(lock)
+        self.addCleanup(lambda: os.path.exists(lock) and os.unlink(lock))
+
+        caught = None
+        try:
+            mesh.save_task(self.cfg, "blocked", state="working")
+        except Exception as exc:
+            caught = exc
+        self.assertIsNotNone(caught)
+        self.assertEqual(type(caught).__name__, "TaskLedgerBusy")
+        self.assertIn(lock_path, str(caught))
+
+        with mock.patch.object(mesh, "_acquire_tasks_lock", return_value=None):
+            caught = None
+            try:
+                mesh._record_received_task(
+                    self.cfg, "request", "blocked-request", "ctx",
+                    "submitted", "beta", "do it", local_node="alpha")
+            except Exception as exc:
+                caught = exc
+        self.assertIsNotNone(caught)
+        self.assertEqual(type(caught).__name__, "TaskLedgerBusy")
+        self.assertIn(lock_path, str(caught))
 
 
 class IdentityMigrationTests(unittest.TestCase):
@@ -6265,6 +6428,45 @@ class WorkerRunTests(unittest.TestCase):
                 self.cfg, "worker-copilot", task_id), {})
         opened.assert_not_called()
 
+    def test_unsupported_nofollow_rejects_without_marker_or_execution(self):
+        task_id = "task-unsupported-nofollow"
+        mesh.save_task(self.cfg, task_id, **self.task)
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+             mock.patch.object(mesh, "_execute_worker_backend") as backend:
+            self.assertFalse(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, mesh.load_tasks(self.cfg)[task_id]))
+
+        backend.assert_not_called()
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("no-follow", saved["worker_error"])
+        self.assertFalse(os.path.lexists(
+            self.execution_marker_path(task_id)))
+        self.assertFalse(os.path.lexists(mesh._worker_journal_file(
+            self.cfg, "worker-copilot", task_id)))
+
+    def test_unusable_stable_evidence_rejects_before_claim_write(self):
+        task_id = "task-no-stable-evidence"
+        mesh.save_task(self.cfg, task_id, **self.task)
+
+        with mock.patch.object(
+                mesh, "_open_regular_readonly",
+                side_effect=OSError("no stable file identity")), \
+             mock.patch.object(mesh, "_execute_worker_backend") as backend:
+            self.assertFalse(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, mesh.load_tasks(self.cfg)[task_id]))
+
+        backend.assert_not_called()
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("evidence", saved["worker_error"])
+        self.assertFalse(os.path.lexists(
+            self.execution_marker_path(task_id)))
+        self.assertFalse(os.path.lexists(mesh._worker_journal_file(
+            self.cfg, "worker-copilot", task_id)))
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_journal_reader_rejects_symlink(self):
         task_id = "task-journal-symlink"
@@ -6780,6 +6982,145 @@ class WorkerRunTests(unittest.TestCase):
             self.assertEqual(handle.read(), before)
         self.assertEqual(marker["node"], "worker-goose")
 
+    def test_interrupted_claim_boundaries_recover_and_execute_once(self):
+        boundaries = ("marker_write", "marker_readback", "journal", "ledger")
+        for boundary in boundaries:
+            task_id = f"task-claim-fault-{boundary}"
+            mesh.save_task(self.cfg, task_id, **self.task)
+            completed = subprocess.CompletedProcess(
+                ["copilot"], 0, stdout="completed once", stderr="")
+            with contextlib.ExitStack() as stack:
+                backend = stack.enter_context(mock.patch.object(
+                    mesh, "_execute_worker_backend",
+                    return_value=completed))
+                stack.enter_context(mock.patch.object(mesh, "_send_reply"))
+                failed = {"done": False}
+
+                if boundary == "marker_write":
+                    original = mesh._write_worker_execution_marker
+
+                    def write_marker(*args, **kwargs):
+                        if args[1] == task_id and not failed["done"]:
+                            failed["done"] = True
+                            raise OSError("injected marker write failure")
+                        return original(*args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(
+                        mesh, "_write_worker_execution_marker",
+                        side_effect=write_marker))
+                elif boundary == "marker_readback":
+                    original = mesh._load_worker_execution_marker
+
+                    def read_marker(*args, **kwargs):
+                        if (args[1] == task_id
+                                and os.path.lexists(
+                                    self.execution_marker_path(task_id))
+                                and not failed["done"]):
+                            failed["done"] = True
+                            return {}
+                        return original(*args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(
+                        mesh, "_load_worker_execution_marker",
+                        side_effect=read_marker))
+                elif boundary == "journal":
+                    original = mesh._write_worker_phase
+
+                    def write_phase(*args, **kwargs):
+                        if (args[2] == task_id and args[4] == "validated"
+                                and not failed["done"]):
+                            failed["done"] = True
+                            raise OSError("injected journal failure")
+                        return original(*args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(
+                        mesh, "_write_worker_phase", side_effect=write_phase))
+                else:
+                    original = mesh._write_json_secure
+
+                    def write_json(path, *args, **kwargs):
+                        if (path == mesh.tasks_file(self.cfg)
+                                and os.path.lexists(
+                                    self.execution_marker_path(task_id))
+                                and os.path.lexists(mesh._worker_journal_file(
+                                    self.cfg, "worker-copilot", task_id))
+                                and not failed["done"]):
+                            failed["done"] = True
+                            raise OSError("injected ledger failure")
+                        return original(path, *args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(
+                        mesh, "_write_json_secure", side_effect=write_json))
+
+                first = mesh._run_worker_task(
+                    self.cfg, self.pool, "worker-copilot", "copilot",
+                    task_id, mesh.load_tasks(self.cfg)[task_id])
+                self.assertFalse(first)
+                backend.assert_not_called()
+                retry = mesh.load_tasks(self.cfg)[task_id]
+                self.assertEqual(retry["state"], "submitted")
+                self.assertTrue(mesh._run_worker_task(
+                    self.cfg, self.pool, "worker-copilot", "copilot",
+                    task_id, retry))
+
+            with self.subTest(boundary=boundary):
+                backend.assert_called_once()
+                self.assertIn(
+                    mesh.load_tasks(self.cfg)[task_id]["state"],
+                    {"completed", "failed"})
+
+    def test_rejections_create_global_tombstones_from_raw_payload(self):
+        cases = []
+        cases.append(("invalid-json", "not a worker job"))
+        cases.append(("surrogate", "invalid-\ud800-payload"))
+        cases.append(("repo", mesh._encode_worker_job(dict(
+            self.job, repo=os.path.join(self.tmp.name, "outside")))))
+        cases.append((
+            "base",
+            mesh.WORKER_JOB_PREFIX + json.dumps(
+                dict(self.job, base="not-a-commit"),
+                ensure_ascii=False, separators=(",", ":"))))
+
+        for label, payload in cases:
+            task_id = f"task-rejected-{label}"
+            task = dict(self.task, text=payload)
+            mesh.save_task(self.cfg, task_id, **task)
+            with mock.patch.object(mesh, "_execute_worker_backend") as backend, \
+                 mock.patch.object(mesh, "_send_reply"):
+                mesh._run_worker_task(
+                    self.cfg, self.pool, "worker-copilot", "copilot",
+                    task_id, mesh.load_tasks(self.cfg)[task_id])
+
+            with self.subTest(label=label):
+                backend.assert_not_called()
+                marker_path = self.execution_marker_path(task_id)
+                self.assertTrue(os.path.isfile(marker_path))
+                with open(marker_path, encoding="utf-8") as handle:
+                    marker = json.load(handle)
+                self.assertEqual(marker["task_id"], task_id)
+                self.assertEqual(marker["node"], "worker-copilot")
+                self.assertEqual(
+                    marker["job_digest"],
+                    hashlib.sha256(payload.encode(
+                        "utf-8", errors="surrogatepass")).hexdigest())
+                journal = mesh._load_worker_journal(
+                    self.cfg, "worker-copilot", task_id)
+                self.assertIn(journal.get("phase"), {
+                    "reply_pending", "replied"})
+                self.assertIsInstance(journal.get("result"), str)
+
+        lost_id = "task-rejected-invalid-json"
+        os.unlink(mesh.tasks_file(self.cfg))
+        journal_path = mesh._worker_journal_file(
+            self.cfg, "worker-copilot", lost_id)
+        if os.path.exists(journal_path):
+            os.unlink(journal_path)
+        self.assertEqual(mesh._record_received_task(
+            self.cfg, "request", lost_id, "replay-context", "submitted",
+            "attacker", "replacement", local_node="worker-goose"),
+            "collision")
+        self.assertNotIn(lost_id, mesh.load_tasks(self.cfg))
+
     def test_orphan_marker_and_output_window_never_reexecutes(self):
         task_id = "task-orphan-output-window"
         self.write_execution_marker(task_id)
@@ -7087,6 +7428,26 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(result["worktree"], "/tmp/preserved")
         self.assertIn("before recording a result", result["summary"])
 
+    def test_missing_claim_recovery_creates_tombstone_before_result(self):
+        task_id = "task-recovery-missing-claim"
+        working = dict(self.task, state="working")
+        mesh.save_task(self.cfg, task_id, **working)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id,
+            self.bound_journal(
+                task_id, "running", task=working,
+                worktree="/tmp/preserved"))
+
+        mesh._recover_worker_tasks(
+            self.cfg, self.pool, "worker-copilot", "copilot")
+
+        self.assertTrue(os.path.isfile(
+            self.execution_marker_path(task_id)))
+        journal = mesh._load_worker_journal(
+            self.cfg, "worker-copilot", task_id)
+        self.assertIn(journal.get("phase"), {"committed", "reply_pending"})
+        self.assertIsInstance(journal.get("result"), str)
+
     def test_crash_recovery_never_forwards_result_from_running_phase(self):
         task_id = "task-running-forged-result"
         forged = mesh._encode_worker_result(mesh._empty_worker_result(
@@ -7195,6 +7556,9 @@ class WorkerRunTests(unittest.TestCase):
             task_id, node="worker-goose", backend="goose")
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", task_id, journal)
+        with open(mesh._worker_journal_file(
+                self.cfg, "worker-copilot", task_id), "rb") as handle:
+            journal_before = handle.read()
 
         with mock.patch.object(mesh, "_execute_worker_backend") as execute:
             mesh._recover_worker_tasks(
@@ -7202,11 +7566,12 @@ class WorkerRunTests(unittest.TestCase):
 
         execute.assert_not_called()
         saved = mesh.load_tasks(self.cfg)[task_id]
-        self.assertEqual(saved["state"], "reply_pending")
-        self.assertNotEqual(saved["pending_result"], encoded)
-        result = mesh._parse_worker_result(saved["pending_result"])
-        self.assertEqual(result["outcome"], "failed")
-        self.assertIn("execution marker", result["summary"])
+        self.assertEqual(saved["state"], "failed")
+        self.assertNotIn("pending_result", saved)
+        self.assertIn("execution marker", saved["worker_error"])
+        with open(mesh._worker_journal_file(
+                self.cfg, "worker-copilot", task_id), "rb") as handle:
+            self.assertEqual(handle.read(), journal_before)
 
 
 class CodexAllowTests(unittest.TestCase):

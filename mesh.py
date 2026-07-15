@@ -93,6 +93,19 @@ TASK_RECORD_ACCEPTED = "accepted"
 TASK_RECORD_DUPLICATE = "duplicate"
 TASK_RECORD_COLLISION = "collision"
 TASK_RECORD_UNSOLICITED = "unsolicited"
+_TASK_RECORD_UNSET = object()
+
+
+class TaskLedgerBusy(TimeoutError):
+    """Retryable failure to acquire the task ledger's exact lock path."""
+
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+        super().__init__(
+            "task ledger lock is busy (possible stale lock at %s)" %
+            lock_path)
+
+
 CODEX_TASK_TURN_GUARD = (
     "An ack alone does not complete this task, and no new turn will be "
     "created after you go idle. Do the requested work and send the result "
@@ -1110,7 +1123,7 @@ def save_task(cfg, task_id, **fields):
     file (which `load_tasks` would silently read back as an empty store)."""
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
-        raise TimeoutError("task ledger lock acquisition timed out")
+        raise TaskLedgerBusy(_tasks_lock_file(cfg))
     try:
         tasks = load_tasks(cfg)
         t = tasks.setdefault(task_id, {})
@@ -1137,7 +1150,7 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
         return TASK_RECORD_COLLISION
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
-        return TASK_RECORD_COLLISION
+        raise TaskLedgerBusy(_tasks_lock_file(cfg))
     try:
         tasks = load_tasks(cfg)
         existing = tasks.get(task_id)
@@ -1663,6 +1676,32 @@ def _open_regular_readonly(path):
         raise
 
 
+def _worker_evidence_supported(cfg):
+    """Preflight no-follow and stable identity without writing a claim."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not isinstance(nofollow, int) or not nofollow:
+        return False
+    probe = os.path.join(
+        cfg["_dir"], ".meshwire.worker-evidence-probe.%s.%s" % (
+            os.getpid(), uuid.uuid4().hex))
+    fd = None
+    try:
+        _write_text_secure(probe, "meshwire-evidence-probe\n")
+        fd = _open_regular_readonly(probe)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            return handle.read() == "meshwire-evidence-probe\n"
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
 def _worker_regular_file(path):
     try:
         fd = _open_regular_readonly(path)
@@ -1694,10 +1733,8 @@ def _worker_binding(me, backend, task_id, task):
             or local_node != me
             or not isinstance(encoded_job, str)):
         raise ValueError("invalid worker task identity")
-    try:
-        digest = hashlib.sha256(encoded_job.encode("utf-8")).hexdigest()
-    except UnicodeError as exc:
-        raise ValueError("invalid worker job encoding") from exc
+    digest = hashlib.sha256(
+        encoded_job.encode("utf-8", errors="surrogatepass")).hexdigest()
     return {
         "version": WORKER_JOURNAL_VERSION,
         "node": me,
@@ -1756,6 +1793,36 @@ def _load_worker_execution_marker(cfg, task_id, expected=None):
             task_id, value, expected=expected)
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
         return {}
+
+
+def _ensure_worker_execution_marker(cfg, task_id, binding):
+    """Create or validate the immutable global claim before durable state."""
+    if not _worker_evidence_supported(cfg):
+        raise OSError("reliable no-follow worker evidence is unavailable")
+    expected = _worker_execution_marker(binding)
+    lock = _acquire_tasks_lock(cfg)
+    if lock is None:
+        raise TaskLedgerBusy(_tasks_lock_file(cfg))
+    try:
+        path = _worker_execution_marker_file(cfg, task_id)
+        if os.path.lexists(path):
+            marker = _load_worker_execution_marker(
+                cfg, task_id, expected=expected)
+            if marker != expected:
+                raise ValueError(
+                    "worker execution marker binding does not match")
+            return marker
+        _write_worker_execution_marker(cfg, task_id, binding)
+        marker = _load_worker_execution_marker(
+            cfg, task_id, expected=expected)
+        if marker != expected:
+            raise OSError("worker execution marker readback failed")
+        return marker
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def _validate_worker_journal(cfg, node, task_id, value, expected=None):
@@ -2096,6 +2163,7 @@ def _queue_worker_result(cfg, me, task_id, binding, result,
     """Persist an encoded result before making it eligible for delivery."""
     if terminal_state not in {"completed", "failed"}:
         raise ValueError("invalid worker terminal state")
+    _ensure_worker_execution_marker(cfg, task_id, binding)
     _validate_worker_journal(
         cfg, me, task_id, dict(binding, phase="validated"))
     trusted_output = _worker_output_file(cfg, me, task_id)
@@ -2174,16 +2242,29 @@ def _queue_worker_result(cfg, me, task_id, binding, result,
 
 
 def _retry_worker_reply(cfg, me, task_id, task):
-    del task  # Delivery authority comes only from the immutable journal.
     if not _valid_task_id(task_id):
         return False
     journal = _load_worker_journal(cfg, me, task_id)
     if not journal or not isinstance(journal.get("result"), str):
-        save_task(
-            cfg, task_id, state="failed",
-            worker_error="worker reply journal is missing or invalid")
-        return False
+        try:
+            backend = task.get("worker_backend")
+            if backend not in {"codex", "copilot", "goose"}:
+                pending = _parse_worker_result(task.get("pending_result", ""))
+                backend = pending["backend"]
+            binding = _worker_binding(me, backend, task_id, task)
+            _ensure_worker_execution_marker(cfg, task_id, binding)
+        except (AttributeError, OSError, TypeError, ValueError, UnicodeError,
+                TaskLedgerBusy):
+            pass
+        return _fail_worker_locally(
+            cfg, task_id, "worker reply journal is missing or invalid")
     binding = _worker_journal_binding(journal)
+    try:
+        _ensure_worker_execution_marker(cfg, task_id, binding)
+    except (OSError, TypeError, ValueError, UnicodeError, TaskLedgerBusy) as exc:
+        return _fail_worker_locally(
+            cfg, task_id,
+            "worker execution marker is missing or invalid: %s" % exc)
     encoded = journal["result"]
     terminal_state = journal.get("terminal_state")
     try:
@@ -2233,9 +2314,12 @@ def _retry_worker_reply(cfg, me, task_id, task):
 
 def _reply_worker_result(cfg, me, task_id, binding, result, terminal_state,
                          output_path=None):
-    encoded, terminal_state = _queue_worker_result(
-        cfg, me, task_id, binding, result, terminal_state,
-        output_path=output_path)
+    try:
+        encoded, terminal_state = _queue_worker_result(
+            cfg, me, task_id, binding, result, terminal_state,
+            output_path=output_path)
+    except (OSError, TypeError, ValueError, UnicodeError, TaskLedgerBusy):
+        return False
     pending = load_tasks(cfg).get(task_id) or {}
     pending["pending_result"] = encoded
     pending["pending_terminal_state"] = terminal_state
@@ -2261,8 +2345,30 @@ def _same_worker_binding(left, right, include_attempt=True):
     return all(left.get(field) == right.get(field) for field in fields)
 
 
+def _pristine_submitted_worker_task(current, original):
+    allowed = {
+        "peer", "text", "state", "direction", "local_node",
+        "contextId", "rpcId", "updated",
+    }
+    return (
+        isinstance(current, dict)
+        and current.get("state") == "submitted"
+        and set(current).issubset(allowed)
+        and all(current.get(field) == original.get(field) for field in (
+            "peer", "text", "direction", "local_node"))
+    )
+
+
+def _fail_worker_locally(cfg, task_id, reason):
+    save_task(
+        cfg, task_id, state="failed",
+        worker_error=_bounded_worker_text(
+            reason, fallback="worker task rejected"))
+    return False
+
+
 def _claim_worker_execution(cfg, me, task_id, task, binding, job,
-                            prior_journal=None):
+                            prior_journal=None, recover_interrupted=False):
     """Claim the ledger and write global evidence before execution."""
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
@@ -2283,7 +2389,17 @@ def _claim_worker_execution(cfg, me, task_id, task, binding, job,
             cfg, task_id, expected=expected_marker)
         present = os.path.lexists(_worker_journal_file(cfg, me, task_id))
         latest = _load_worker_journal(cfg, me, task_id)
-        if prior_journal is None:
+        if recover_interrupted:
+            if (not _pristine_submitted_worker_task(current, task)
+                    or marker != expected_marker
+                    or os.path.lexists(
+                        _worker_output_file(cfg, me, task_id))
+                    or (present and (
+                        not latest
+                        or not _same_worker_binding(latest, binding)
+                        or latest.get("phase") != "validated"))):
+                return False
+        elif prior_journal is None:
             if marker_present or present:
                 return False
             _write_worker_execution_marker(cfg, task_id, binding)
@@ -2347,12 +2463,6 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
     # Once a result exists, this task is reply-only. Mutable ledger state can
     # never make the backend run again or choose a different recipient.
     if journal and isinstance(journal.get("result"), str):
-        save_task(
-            cfg, task_id, state="reply_pending",
-            peer=journal["origin_peer"], local_node=journal["local_node"],
-            direction="inbound", pending_result=journal["result"],
-            pending_terminal_state=journal["terminal_state"],
-            reply_error=None)
         return _retry_worker_reply(cfg, me, task_id, task)
     if not isinstance(task, dict):
         return False
@@ -2367,8 +2477,34 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
             cfg, task_id, state="failed",
             worker_error="invalid worker task identity")
         return False
+    if not _worker_evidence_supported(cfg):
+        return _fail_worker_locally(
+            cfg, task_id,
+            "reliable no-follow worker evidence is unavailable")
 
     prior_journal = None
+    recover_interrupted = False
+    expected_marker = _worker_execution_marker(binding)
+    marker_path = _worker_execution_marker_file(cfg, task_id)
+    marker_present = os.path.lexists(marker_path)
+    marker = _load_worker_execution_marker(
+        cfg, task_id, expected=expected_marker)
+    output_present = os.path.lexists(
+        _worker_output_file(cfg, me, task_id))
+    pristine = _pristine_submitted_worker_task(task, task)
+    interrupted = (
+        pristine
+        and marker == expected_marker
+        and not output_present
+        and (
+            not journal_present
+            or (
+                bool(journal)
+                and _same_worker_binding(journal, binding)
+                and journal.get("phase") == "validated"
+            )
+        )
+    )
     if journal_present:
         controlled_retry = (
             bool(journal)
@@ -2380,6 +2516,12 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
         )
         if controlled_retry:
             prior_journal = journal
+        elif interrupted:
+            recover_interrupted = True
+        elif marker_present:
+            return _fail_worker_locally(
+                cfg, task_id,
+                "ambiguous worker journal or execution marker evidence")
         else:
             reason = (
                 "worker journal binding does not match submitted task"
@@ -2389,6 +2531,21 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
             return _reply_worker_result(
                 cfg, me, task_id, binding, result, "failed",
                 output_path=output_path)
+    elif marker_present:
+        if interrupted:
+            recover_interrupted = True
+        else:
+            return _fail_worker_locally(
+                cfg, task_id,
+                "ambiguous worker execution marker evidence")
+    elif output_present:
+        try:
+            _ensure_worker_execution_marker(cfg, task_id, binding)
+        except (OSError, TypeError, ValueError, UnicodeError,
+                TaskLedgerBusy):
+            return False
+        return _fail_worker_locally(
+            cfg, task_id, "ambiguous worker output evidence")
 
     sender = task["peer"]
     try:
@@ -2403,7 +2560,8 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
 
     if not _claim_worker_execution(
             cfg, me, task_id, task, binding, job,
-            prior_journal=prior_journal):
+            prior_journal=prior_journal,
+            recover_interrupted=recover_interrupted):
         # A concurrent claimant or unsafe journal won the race. Never execute
         # from this stale snapshot.
         return False
@@ -2560,12 +2718,23 @@ def _recover_worker_tasks(cfg, pool, me, backend):
             continue
         marker = _load_worker_execution_marker(
             cfg, task_id, expected=expected_marker)
-        if marker != expected_marker:
+        marker_present = os.path.lexists(
+            _worker_execution_marker_file(cfg, task_id))
+        if marker_present and marker != expected_marker:
+            _fail_worker_locally(
+                cfg, task_id,
+                "worker execution marker binding does not match recovery")
+            continue
+        if not marker_present:
             result = _empty_worker_result(
                 backend, "failed",
                 "worker execution marker is missing or invalid")
-            _queue_worker_result(
-                cfg, me, task_id, recovery_binding, result, "failed")
+            try:
+                _queue_worker_result(
+                    cfg, me, task_id, recovery_binding, result, "failed")
+            except (OSError, TypeError, ValueError, UnicodeError,
+                    TaskLedgerBusy):
+                pass
             continue
         journal = _load_worker_journal(
             cfg, me, task_id, expected=recovery_binding)
@@ -3413,7 +3582,28 @@ def _single_line_preview(value, limit):
     return _single_line(_sanitize_delivery_text(text))[:limit]
 
 
-def _emit_message(cfg, me, frm, body, ev, recipient=None):
+def _record_delivery_task(cfg, me, frm, body, recipient=None):
+    """Durably classify a valid A2A task before transport checkpointing."""
+    body = _sanitize_delivery_text(body)
+    env = _parse_envelope(body)
+    if not env:
+        return _TASK_RECORD_UNSET
+    details = _envelope_details(env)
+    if details is None:
+        return _TASK_RECORD_UNSET
+    kind, task_id, ctx, state, efrm, eto, text = details
+    authority_to = me if recipient is None else recipient
+    if (not _valid_task_id(task_id) or efrm != frm
+            or eto != authority_to):
+        return _TASK_RECORD_UNSET
+    disposition = _record_received_task(
+        cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
+        local_node=authority_to)
+    return kind, disposition
+
+
+def _emit_message(cfg, me, frm, body, ev, recipient=None,
+                  task_record=_TASK_RECORD_UNSET):
     """Print one inbound message or task; return its local delivery kind."""
     body = _sanitize_delivery_text(body)
     env = _parse_envelope(body)
@@ -3428,9 +3618,17 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None):
                 eto != authority_to):
             print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             return False
-        disposition = _record_received_task(
-            cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
-            local_node=authority_to)
+        if task_record is _TASK_RECORD_UNSET:
+            disposition = _record_received_task(
+                cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
+                local_node=authority_to)
+        elif (not isinstance(task_record, tuple)
+              or len(task_record) != 2 or task_record[0] != kind):
+            print("MESH_WARN: dropped invalid A2A task disposition",
+                  file=sys.stderr)
+            return False
+        else:
+            disposition = task_record[1]
         if kind == "request":
             if disposition != TASK_RECORD_ACCEPTED:
                 if disposition == TASK_RECORD_COLLISION:
@@ -3653,6 +3851,25 @@ def _cmd_watch_owned(args, cfg, me):
             continue
         if fingerprint in replay_seen:
             continue
+        task_record = _TASK_RECORD_UNSET
+        while not ctl and frm != me:
+            try:
+                task_record = _record_delivery_task(
+                    cfg, me, frm, body, recipient=recipient)
+                break
+            except TaskLedgerBusy as exc:
+                print(f"MESH_WARN: {exc}; retrying same event",
+                      file=sys.stderr)
+                if deadline is not None and time.time() >= deadline:
+                    print(f"MESH_TIMEOUT: no message for "
+                          f"'{_single_line(me)}' in {timeout}s")
+                    return
+                time.sleep(0.05)
+        if not ctl and frm != me and task_record is _TASK_RECORD_UNSET \
+                and _parse_envelope(_sanitize_delivery_text(body)):
+            # The task could not be durably classified before the one-shot
+            # deadline. Leave cursor/replay/ACK untouched for redelivery.
+            continue
         if not save_cursor(ev):
             continue
         if fingerprint:
@@ -3671,8 +3888,13 @@ def _cmd_watch_owned(args, cfg, me):
             continue
         note_peer(cfg, frm, "message")
         _send_ack(cfg, me, frm, ev)
-        delivery_kind = _emit_message(cfg, me, frm, body, ev,
-                                      recipient=recipient)
+        if task_record is _TASK_RECORD_UNSET:
+            delivery_kind = _emit_message(
+                cfg, me, frm, body, ev, recipient=recipient)
+        else:
+            delivery_kind = _emit_message(
+                cfg, me, frm, body, ev, recipient=recipient,
+                task_record=task_record)
         if delivery_kind is not False:
             delivered = True
             if not args.follow:
@@ -4067,7 +4289,8 @@ class MeshMCPServer:
             "maxTokens": MESH_MCP_SAMPLING_MAX_TOKENS,
         }
 
-    def _delivery(self, frm, recipient, body, ev):
+    def _delivery(self, frm, recipient, body, ev,
+                  task_record=_TASK_RECORD_UNSET):
         """Parse one inbound event into a structured delivery (no printing)."""
         body = _sanitize_delivery_text(body)
         env = _parse_envelope(body)
@@ -4080,9 +4303,15 @@ class MeshMCPServer:
             if (not _valid_task_id(task_id) or efrm != frm or
                     eto != authority_to):
                 return None
-            disposition = _record_received_task(
-                self.cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
-                local_node=authority_to)
+            if task_record is _TASK_RECORD_UNSET:
+                disposition = _record_received_task(
+                    self.cfg, kind, task_id, ctx, state, frm, text,
+                    env.get("id"), local_node=authority_to)
+            elif (not isinstance(task_record, tuple)
+                  or len(task_record) != 2 or task_record[0] != kind):
+                return None
+            else:
+                disposition = task_record[1]
             if (kind == "request"
                     and disposition != TASK_RECORD_ACCEPTED):
                 return None
@@ -4158,6 +4387,10 @@ class MeshMCPServer:
                 continue
             if fingerprint in replay_seen:
                 continue
+            task_record = _TASK_RECORD_UNSET
+            if not ctl and frm != me:
+                task_record = _record_delivery_task(
+                    cfg, me, frm, body, recipient=recipient)
             if et == since:
                 seen = [i for i in seen if i]
                 seen.append(ev.get("id"))
@@ -4178,7 +4411,11 @@ class MeshMCPServer:
                 continue
             note_peer(cfg, frm, "message")
             _send_ack(cfg, me, frm, ev)
-            delivery = self._delivery(frm, recipient, body, ev)
+            if task_record is _TASK_RECORD_UNSET:
+                delivery = self._delivery(frm, recipient, body, ev)
+            else:
+                delivery = self._delivery(
+                    frm, recipient, body, ev, task_record=task_record)
             if delivery:
                 self.deliver(delivery)
 
