@@ -9389,18 +9389,40 @@ class PoolLifecycleTests(unittest.TestCase):
 
     def test_worker_log_restores_streams_when_supervisor_raises(self):
         path = os.path.join(self.tmp.name, "worker.log")
-        args = argparse.Namespace(log_path=path)
+        args = argparse.Namespace(
+            backend="copilot", as_node="worker-copilot", interval=1,
+            once=True, stop=False, log_path=path)
         old_stdout, old_stderr = sys.stdout, sys.stderr
         boom = RuntimeError("supervisor failed")
 
-        with mock.patch.object(
-                mesh, "_run_worker_supervisor", side_effect=boom):
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_write_supervisor_pid",
+                               side_effect=boom):
             with self.assertRaises(RuntimeError) as caught:
                 mesh.cmd_worker_supervise(args)
 
         self.assertIs(caught.exception, boom)
         self.assertIs(sys.stdout, old_stdout)
         self.assertIs(sys.stderr, old_stderr)
+
+    def test_duplicate_supervisor_never_opens_or_rotates_worker_log(self):
+        args = argparse.Namespace(
+            backend="copilot", as_node="worker-copilot", interval=1,
+            once=True, stop=False,
+            log_path=os.path.join(self.tmp.name, "worker-copilot.log"))
+
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_acquire_supervise_lock",
+                               return_value=None), \
+             mock.patch.object(mesh, "_RotatingWriter") as writer, \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_worker_supervise(args)
+
+        writer.assert_not_called()
 
     def test_pool_start_bootstraps_and_kickstarts_each_exact_label(self):
         plists = {
@@ -9456,9 +9478,11 @@ class PoolLifecycleTests(unittest.TestCase):
 
     def test_pool_stop_boots_out_exact_labels_and_reports_failure(self):
         results = [
-            self._completed(["launchctl"]),
             self._completed(["launchctl"], returncode=3,
-                            stderr="not permitted"),
+                            stderr="codex denied"),
+            self._completed(["launchctl"], returncode=4,
+                            stderr="copilot denied"),
+            self._completed(["launchctl"]),
         ]
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
              mock.patch.object(mesh, "load_pool_config",
@@ -9467,8 +9491,10 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh.subprocess, "run",
                                side_effect=results) as run, \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(SystemExit, "not permitted"):
+            with self.assertRaises(SystemExit) as caught:
                 mesh.cmd_pool_stop(argparse.Namespace())
+        self.assertIn("codex denied", str(caught.exception))
+        self.assertIn("copilot denied", str(caught.exception))
         domain = f"gui/{os.getuid()}"
         self.assertEqual(run.call_args_list, [
             mock.call(
@@ -9478,6 +9504,10 @@ class PoolLifecycleTests(unittest.TestCase):
             mock.call(
                 ["launchctl", "bootout",
                  f"{domain}/com.a2acast.worker.copilot"],
+                capture_output=True, text=True),
+            mock.call(
+                ["launchctl", "bootout",
+                 f"{domain}/com.a2acast.worker.goose"],
                 capture_output=True, text=True),
         ])
 
@@ -9602,6 +9632,37 @@ class PoolLifecycleTests(unittest.TestCase):
                                  f"com.a2acast.worker.{backend}")
                 self.assertNotIn(self.cfg["key"], repr(value))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX directory-fd semantics")
+    def test_private_atomic_write_pins_parent_across_path_swap(self):
+        safe = os.path.join(self.tmp.name, "safe")
+        moved = os.path.join(self.tmp.name, "moved")
+        attacker = os.path.join(self.tmp.name, "attacker")
+        os.mkdir(safe, 0o700)
+        os.mkdir(attacker, 0o700)
+        path = os.path.join(safe, "worker.plist")
+        attacker_path = os.path.join(attacker, "worker.plist")
+        mesh._write_text_secure(attacker_path, "preserve\n")
+        real_replace = os.replace
+        replace_calls = []
+
+        def swap_parent_then_replace(source, target, *args, **kwargs):
+            replace_calls.append(kwargs)
+            os.rename(safe, moved)
+            os.symlink(attacker, safe)
+            return real_replace(source, target, *args, **kwargs)
+
+        with mock.patch.object(
+                mesh.os, "replace", side_effect=swap_parent_then_replace):
+            with self.assertRaises(OSError):
+                mesh._atomic_write_private_bytes(
+                    path, b"managed\n", "worker plist")
+
+        self.assertTrue(replace_calls)
+        self.assertTrue(all("src_dir_fd" in call and "dst_dir_fd" in call
+                            for call in replace_calls))
+        with open(attacker_path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "preserve\n")
+
     @unittest.skipUnless(os.name == "posix", "POSIX ownership/mode semantics")
     def test_worker_log_rejects_unsafe_parent_symlink_hardlink_and_mode(self):
         unsafe = os.path.join(self.tmp.name, "unsafe")
@@ -9669,6 +9730,38 @@ class PoolLifecycleTests(unittest.TestCase):
         ]
         self.assertTrue(all(size <= 8 for size in sizes))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX directory-fd semantics")
+    def test_worker_log_rotation_pins_parent_across_path_swap(self):
+        safe = os.path.join(self.tmp.name, "safe-log")
+        moved = os.path.join(self.tmp.name, "moved-log")
+        attacker = os.path.join(self.tmp.name, "attacker-log")
+        os.mkdir(safe, 0o700)
+        os.mkdir(attacker, 0o700)
+        path = os.path.join(safe, "worker.log")
+        mesh._write_text_secure(path, "managed\n")
+        attacker_backup = os.path.join(attacker, "worker.log.1")
+        mesh._write_text_secure(attacker_backup, "preserve\n")
+        real_replace = os.replace
+        replace_calls = []
+
+        def swap_parent_then_replace(source, target, *args, **kwargs):
+            replace_calls.append(kwargs)
+            os.rename(safe, moved)
+            os.symlink(attacker, safe)
+            return real_replace(source, target, *args, **kwargs)
+
+        with mock.patch.object(
+                mesh.os, "replace", side_effect=swap_parent_then_replace):
+            with self.assertRaises(OSError):
+                mesh._rotate_worker_log(path, max_bytes=20, backups=1,
+                                        force=True)
+
+        self.assertTrue(replace_calls)
+        self.assertTrue(all("src_dir_fd" in call and "dst_dir_fd" in call
+                            for call in replace_calls))
+        with open(attacker_backup, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "preserve\n")
+
     def test_worker_log_rejects_invalid_limits_without_creating_file(self):
         path = os.path.join(self.tmp.name, "invalid.log")
         for max_bytes, backups in (
@@ -9682,13 +9775,18 @@ class PoolLifecycleTests(unittest.TestCase):
 
     def test_worker_log_constructor_failure_does_not_replace_streams(self):
         args = argparse.Namespace(
+            backend="copilot", as_node="worker-copilot", interval=1,
+            once=True,
             log_path=os.path.join(self.tmp.name, "missing", "worker.log"),
             stop=False)
         old_stdout, old_stderr = sys.stdout, sys.stderr
-        with mock.patch.object(mesh, "_run_worker_supervisor") as run:
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks") as recover:
             with self.assertRaises(OSError):
                 mesh.cmd_worker_supervise(args)
-        run.assert_not_called()
+        recover.assert_not_called()
         self.assertIs(sys.stdout, old_stdout)
         self.assertIs(sys.stderr, old_stderr)
 
@@ -9921,14 +10019,16 @@ class PoolLifecycleTests(unittest.TestCase):
         record = {
             "worker_backend": "copilot", "peer": "worker-copilot",
             "state": "completed", "worker_job_digest": digest,
-            "text": job,
+            "text": job, "result": encoded,
         }
         inbound = {
             task_id: {
                 "direction": "inbound", "local_node": "worker-copilot",
                 "peer": "coordinator", "state": "completed",
                 "worker_backend": "copilot", "worker_job_digest": digest,
-                "worktree_info": info, "text": job,
+                "worktree_info": info, "text": job, "result": encoded,
+                "pending_result": encoded,
+                "pending_terminal_state": "completed",
             },
         }
         journal = {
@@ -9971,14 +10071,16 @@ class PoolLifecycleTests(unittest.TestCase):
         record = {
             "worker_backend": "copilot", "peer": "worker-copilot",
             "state": "completed", "worker_job_digest": digest,
-            "text": job,
+            "text": job, "result": encoded,
         }
         inbound = {
             task_id: {
                 "direction": "inbound", "local_node": "worker-copilot",
                 "peer": "coordinator", "state": "completed",
                 "worker_backend": "copilot", "worker_job_digest": digest,
-                "worktree_info": info, "text": job,
+                "worktree_info": info, "text": job, "result": encoded,
+                "pending_result": encoded,
+                "pending_terminal_state": "completed",
             },
         }
         journal = {
@@ -10040,6 +10142,22 @@ class PoolLifecycleTests(unittest.TestCase):
                 task=task_id, force=True, integrated_into=None))
         self.assertFalse(os.path.exists(info["path"]))
         self.assertEqual(json.loads(output.getvalue())["removed"], [task_id])
+
+    def test_cleanup_rejects_cross_ledger_terminal_result_contradiction(self):
+        task_id = "task-contradiction"
+        self._create_cleanup_evidence(task_id)
+        inbound = mesh._load_json_regular(
+            mesh.tasks_file(self.cfg), require_private=True,
+            max_bytes=mesh.WORKER_DELEGATE_LEDGER_MAX)
+        delegated = mesh._load_delegate_tasks(self.cfg, "coordinator")
+        record = dict(delegated[task_id])
+        parsed = mesh._parse_worker_result(record["result"])
+        parsed["summary"] = "contradictory coordinator result"
+        record["result"] = mesh._encode_worker_result(parsed)
+
+        with self.assertRaisesRegex(ValueError, "result"):
+            mesh._cleanup_candidate(
+                self.cfg, self.pool, inbound, task_id, record)
 
 
 class WorkerSuperviseTests(unittest.TestCase):

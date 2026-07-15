@@ -7363,18 +7363,83 @@ def _inspect_managed_file(path, label, missing_ok=True):
     return identity
 
 
-def _validate_managed_directory(path, label):
-    observed = os.lstat(path)
+def _validate_managed_directory_stat(observed, label):
     if not stat.S_ISDIR(observed.st_mode):
         raise OSError(f"{label} is not a real directory")
+    device = getattr(observed, "st_dev", 0)
+    inode = getattr(observed, "st_ino", 0)
+    if (not isinstance(device, int) or not isinstance(inode, int)
+            or device == 0 or inode == 0):
+        raise WorkerEvidenceUnsupported(
+            f"{label} has no stable directory identity")
     if os.name == "posix":
         if (not hasattr(os, "geteuid")
                 or observed.st_uid != os.geteuid()):
             raise OSError(f"{label} is not owned by the current user")
         if stat.S_IMODE(observed.st_mode) & 0o022:
             raise OSError(f"{label} is group- or world-writable")
-    return (getattr(observed, "st_dev", 0),
-            getattr(observed, "st_ino", 0))
+    return device, inode
+
+
+def _validate_managed_directory(path, label):
+    return _validate_managed_directory_stat(os.lstat(path), label)
+
+
+def _open_managed_directory(path, label):
+    identity = _validate_managed_directory(path, label)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if (os.name != "posix" or not isinstance(directory, int)
+            or not directory or not isinstance(nofollow, int)
+            or not nofollow):
+        raise WorkerEvidenceUnsupported(
+            f"secure directory-relative {label} operations are unavailable")
+    flags = os.O_RDONLY | directory | nofollow
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if isinstance(cloexec, int):
+        flags |= cloexec
+    fd = os.open(path, flags)
+    try:
+        if _validate_managed_directory_stat(
+                os.fstat(fd), label) != identity:
+            raise OSError(f"{label} changed while opening")
+        if _validate_managed_directory(path, label) != identity:
+            raise OSError(f"{label} path changed while opening")
+        os.set_inheritable(fd, False)
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _inspect_managed_file_at(directory_fd, name, label, missing_ok=True):
+    try:
+        observed = os.stat(
+            name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+    return _validate_managed_file_stat(observed, label)
+
+
+def _managed_file_size_at(directory_fd, name, identity, label):
+    if identity is None:
+        return 0
+    observed = os.stat(
+        name, dir_fd=directory_fd, follow_symlinks=False)
+    if _validate_managed_file_stat(observed, label) != identity:
+        raise OSError(f"{label} changed while inspecting its size")
+    return observed.st_size
+
+
+def _remove_managed_file_at(directory_fd, name, identity, label):
+    if identity is None:
+        return
+    if _inspect_managed_file_at(
+            directory_fd, name, label, missing_ok=False) != identity:
+        raise OSError(f"{label} changed before removal")
+    os.unlink(name, dir_fd=directory_fd)
 
 
 def _ensure_managed_directory(path, parent, label):
@@ -7409,14 +7474,19 @@ def _atomic_write_private_bytes(path, value, label):
     if not isinstance(value, bytes):
         raise TypeError(f"{label} payload must be bytes")
     directory = os.path.dirname(path)
-    directory_identity = _validate_managed_directory(
+    name = os.path.basename(path)
+    directory_fd, directory_identity = _open_managed_directory(
         directory, f"{label} directory")
-    _inspect_managed_file(path, label)
     fd = None
     temporary = None
     try:
-        fd, temporary = tempfile.mkstemp(
-            prefix=".%s." % os.path.basename(path), dir=directory)
+        _inspect_managed_file_at(directory_fd, name, label)
+        temporary = ".%s.%s" % (name, secrets.token_hex(16))
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if isinstance(cloexec, int):
+            flags |= cloexec
+        fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
         if os.name == "posix":
             os.fchmod(fd, 0o600)
         offset = 0
@@ -7431,20 +7501,27 @@ def _atomic_write_private_bytes(path, value, label):
         if _validate_managed_directory(
                 directory, f"{label} directory") != directory_identity:
             raise OSError(f"{label} directory changed while writing")
-        _inspect_managed_file(path, label)
-        os.replace(temporary, path)
+        _inspect_managed_file_at(directory_fd, name, label)
+        os.replace(
+            temporary, name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         temporary = None
-        identity = _inspect_managed_file(path, label, missing_ok=False)
+        identity = _inspect_managed_file_at(
+            directory_fd, name, label, missing_ok=False)
         if identity is None:
             raise OSError(f"{label} write did not persist")
+        if _validate_managed_directory(
+                directory, f"{label} directory") != directory_identity:
+            raise OSError(f"{label} directory changed while writing")
     finally:
         if fd is not None:
             os.close(fd)
         if temporary is not None:
             try:
-                os.unlink(temporary)
+                os.unlink(temporary, dir_fd=directory_fd)
             except OSError:
                 pass
+        os.close(directory_fd)
 
 
 def _launch_agent_value(cfg, pool, backend, mesh_executable, log_path):
@@ -7509,111 +7586,154 @@ def _validate_worker_log_parent(path):
     return _validate_managed_directory(directory, "worker log directory")
 
 
-def _remove_managed_file(path, identity, label):
-    if identity is None:
-        return
-    if _inspect_managed_file(path, label, missing_ok=False) != identity:
-        raise OSError(f"{label} changed before removal")
-    os.unlink(path)
-
-
-def _managed_file_size(path, identity, label):
-    if identity is None:
-        return 0
-    if _inspect_managed_file(path, label, missing_ok=False) != identity:
-        raise OSError(f"{label} changed while inspecting its size")
-    return os.lstat(path).st_size
-
-
 def _prune_oversized_worker_log_backups(path, max_bytes, backups):
-    identities = {}
-    for index in range(1, backups + 1):
-        candidate = f"{path}.{index}"
-        identities[candidate] = _worker_log_identity(candidate)
-    for candidate, identity in identities.items():
-        if (identity is not None
-                and _managed_file_size(
-                    candidate, identity, "worker log backup") > max_bytes):
-            _remove_managed_file(
-                candidate, identity, "worker log backup")
+    path = _absolute_managed_path(path, "worker log")
+    directory = os.path.dirname(path)
+    base = os.path.basename(path)
+    directory_fd, directory_identity = _open_managed_directory(
+        directory, "worker log directory")
+    try:
+        identities = {}
+        for index in range(1, backups + 1):
+            name = f"{base}.{index}"
+            identities[name] = _inspect_managed_file_at(
+                directory_fd, name, "worker log backup")
+        for name, identity in identities.items():
+            if (identity is not None
+                    and _managed_file_size_at(
+                        directory_fd, name, identity,
+                        "worker log backup") > max_bytes):
+                _remove_managed_file_at(
+                    directory_fd, name, identity, "worker log backup")
+        if _validate_managed_directory(
+                directory, "worker log directory") != directory_identity:
+            raise OSError("worker log directory changed while pruning")
+    finally:
+        os.close(directory_fd)
 
 
 def _rotate_worker_log(path, max_bytes=WORKER_LOG_MAX_BYTES,
                        backups=WORKER_LOG_BACKUPS, force=False):
     _valid_log_limits(max_bytes, backups)
     path = _absolute_managed_path(path, "worker log")
-    directory_identity = _validate_worker_log_parent(path)
-    identities = {}
-    for index in range(backups + 1):
-        candidate = path if index == 0 else f"{path}.{index}"
-        identities[candidate] = _worker_log_identity(candidate)
-    current = identities[path]
-    if current is None:
-        return False
-    if not force and os.lstat(path).st_size <= max_bytes:
-        return False
-    if backups == 0:
-        _remove_managed_file(path, current, "worker log")
+    directory = os.path.dirname(path)
+    base = os.path.basename(path)
+    directory_fd, directory_identity = _open_managed_directory(
+        directory, "worker log directory")
+    try:
+        identities = {}
+        for index in range(backups + 1):
+            name = base if index == 0 else f"{base}.{index}"
+            label = "worker log" if index == 0 else "worker log backup"
+            identities[name] = _inspect_managed_file_at(
+                directory_fd, name, label)
+        current = identities[base]
+        if current is None:
+            return False
+        if (not force and _managed_file_size_at(
+                directory_fd, base, current, "worker log") <= max_bytes):
+            return False
+        if backups == 0:
+            _remove_managed_file_at(
+                directory_fd, base, current, "worker log")
+            if _validate_managed_directory(
+                    directory,
+                    "worker log directory") != directory_identity:
+                raise OSError(
+                    "worker log directory changed during rotation")
+            return True
+        oldest = f"{base}.{backups}"
+        _remove_managed_file_at(
+            directory_fd, oldest, identities[oldest],
+            "worker log backup")
+        for index in range(backups - 1, 0, -1):
+            source = f"{base}.{index}"
+            target = f"{base}.{index + 1}"
+            if identities[source] is not None:
+                if _managed_file_size_at(
+                        directory_fd, source, identities[source],
+                        "worker log backup") > max_bytes:
+                    _remove_managed_file_at(
+                        directory_fd, source, identities[source],
+                        "worker log backup")
+                    continue
+                if _inspect_managed_file_at(
+                        directory_fd, source, "worker log backup",
+                        missing_ok=False) != identities[source]:
+                    raise OSError(
+                        "worker log backup changed during rotation")
+                os.replace(
+                    source, target,
+                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        if _managed_file_size_at(
+                directory_fd, base, current, "worker log") > max_bytes:
+            _remove_managed_file_at(
+                directory_fd, base, current, "worker log")
+            if _validate_managed_directory(
+                    directory,
+                    "worker log directory") != directory_identity:
+                raise OSError(
+                    "worker log directory changed during rotation")
+            return True
+        if _inspect_managed_file_at(
+                directory_fd, base, "worker log",
+                missing_ok=False) != current:
+            raise OSError("worker log changed during rotation")
+        if _validate_managed_directory(
+                directory, "worker log directory") != directory_identity:
+            raise OSError("worker log directory changed during rotation")
+        os.replace(
+            base, base + ".1",
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        if _validate_managed_directory(
+                directory, "worker log directory") != directory_identity:
+            raise OSError("worker log directory changed during rotation")
         return True
-    oldest = f"{path}.{backups}"
-    _remove_managed_file(oldest, identities[oldest], "worker log backup")
-    for index in range(backups - 1, 0, -1):
-        source = f"{path}.{index}"
-        target = f"{path}.{index + 1}"
-        if identities[source] is not None:
-            if _managed_file_size(
-                    source, identities[source], "worker log backup") \
-                    > max_bytes:
-                _remove_managed_file(
-                    source, identities[source], "worker log backup")
-                continue
-            if _inspect_managed_file(
-                    source, "worker log backup", missing_ok=False) \
-                    != identities[source]:
-                raise OSError("worker log backup changed during rotation")
-            os.replace(source, target)
-    if _managed_file_size(path, current, "worker log") > max_bytes:
-        _remove_managed_file(path, current, "worker log")
-        return True
-    if _inspect_managed_file(
-            path, "worker log", missing_ok=False) != current:
-        raise OSError("worker log changed during rotation")
-    if _validate_worker_log_parent(path) != directory_identity:
-        raise OSError("worker log directory changed during rotation")
-    os.replace(path, path + ".1")
-    return True
+    finally:
+        os.close(directory_fd)
 
 
 def _open_worker_log(path):
     path = _absolute_managed_path(path, "worker log")
-    directory_identity = _validate_worker_log_parent(path)
-    before = _worker_log_identity(path)
-    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not isinstance(nofollow, int) or not nofollow:
-        raise WorkerEvidenceUnsupported(
-            "reliable no-follow worker log open is unavailable")
-    flags |= nofollow
-    cloexec = getattr(os, "O_CLOEXEC", 0)
-    if isinstance(cloexec, int):
-        flags |= cloexec
-    fd = os.open(path, flags, 0o600)
+    directory = os.path.dirname(path)
+    name = os.path.basename(path)
+    directory_fd, directory_identity = _open_managed_directory(
+        directory, "worker log directory")
+    fd = None
     try:
+        before = _inspect_managed_file_at(
+            directory_fd, name, "worker log")
+        flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not isinstance(nofollow, int) or not nofollow:
+            raise WorkerEvidenceUnsupported(
+                "reliable no-follow worker log open is unavailable")
+        flags |= nofollow
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if isinstance(cloexec, int):
+            flags |= cloexec
+        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
         if before is None and os.name == "posix":
             os.fchmod(fd, 0o600)
         identity = _validate_managed_file_stat(
             os.fstat(fd), "worker log")
         if before is not None and identity != before:
             raise OSError("worker log changed while opening")
-        if _worker_log_identity(path) != identity:
+        if _inspect_managed_file_at(
+                directory_fd, name, "worker log",
+                missing_ok=False) != identity:
             raise OSError("worker log path changed while opening")
-        if _validate_worker_log_parent(path) != directory_identity:
+        if _validate_managed_directory(
+                directory, "worker log directory") != directory_identity:
             raise OSError("worker log directory changed while opening")
         os.set_inheritable(fd, False)
-        return os.fdopen(fd, "ab", buffering=0), identity
-    except BaseException:
-        os.close(fd)
-        raise
+        handle = os.fdopen(fd, "ab", buffering=0)
+        fd = None
+        return handle, identity
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
 
 
 def _bounded_worker_log_bytes(text, max_bytes):
@@ -7830,12 +7950,19 @@ def cmd_pool_stop(_args):
             print(shlex.join(command + ["--stop"]))
         return
     domain = f"gui/{os.getuid()}"
+    failures = []
     for backend, _worker in _lifecycle_worker_items(cfg, pool):
-        _run_launchctl(
-            ["launchctl", "bootout",
-             f"{domain}/{_launch_agent_label(backend)}"],
-            "bootout", backend, absent_ok=True)
-        print(f"stopped {backend}")
+        try:
+            _run_launchctl(
+                ["launchctl", "bootout",
+                 f"{domain}/{_launch_agent_label(backend)}"],
+                "bootout", backend, absent_ok=True)
+        except SystemExit as exc:
+            failures.append(str(exc))
+        else:
+            print(f"stopped {backend}")
+    if failures:
+        sys.exit("; ".join(failures))
 
 
 def _supervisor_pid_status(cfg, node):
@@ -7958,6 +8085,15 @@ def _cleanup_candidate(cfg, pool, inbound, task_id, record):
     if (not journal or journal.get("phase") != "replied"
             or journal.get("terminal_state") != task.get("state")):
         raise ValueError("worker journal is not durably replied")
+    journal_result = journal.get("result")
+    terminal_state = journal.get("terminal_state")
+    if (not isinstance(journal_result, str)
+            or record.get("result") != journal_result
+            or task.get("result") != journal_result
+            or task.get("pending_result") != journal_result
+            or task.get("pending_terminal_state") != terminal_state):
+        raise ValueError(
+            "worker terminal result contradicts scoped ledger evidence")
     digest = journal.get("job_digest")
     if (task.get("worker_job_digest") != digest
             or record.get("worker_job_digest") != digest):
@@ -8269,6 +8405,8 @@ def _run_worker_supervisor(args):
             file=sys.stderr)
         return
 
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    worker_log = None
     pid_owner = None
     receiver = None
     receiver_thread = None
@@ -8276,6 +8414,11 @@ def _run_worker_supervisor(args):
     initial_config = os.path.realpath(
         cfg.get("_path") or os.path.join(cfg["_dir"], CONFIG_NAME))
     try:
+        log_path = getattr(args, "log_path", None)
+        if log_path:
+            worker_log = _RotatingWriter(log_path)
+            sys.stdout = worker_log
+            sys.stderr = worker_log
         pid_owner = _write_supervisor_pid(cfg, me, lock)
         signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))
 
@@ -8348,25 +8491,18 @@ def _run_worker_supervisor(args):
                 return
             time.sleep(interval)
     finally:
-        _shutdown_supervisor_receiver(
-            receiver, receiver_thread, receiver_started,
-            lock, pid_owner, me, "worker")
+        try:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            if worker_log is not None:
+                worker_log.close()
+        finally:
+            _shutdown_supervisor_receiver(
+                receiver, receiver_thread, receiver_started,
+                lock, pid_owner, me, "worker")
 
 
 def cmd_worker_supervise(args):
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    worker_log = None
-    try:
-        log_path = getattr(args, "log_path", None)
-        if log_path and not getattr(args, "stop", False):
-            worker_log = _RotatingWriter(log_path)
-            sys.stdout = worker_log
-            sys.stderr = worker_log
-        return _run_worker_supervisor(args)
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-        if worker_log is not None:
-            worker_log.close()
+    return _run_worker_supervisor(args)
 
 
 def cmd_codex_allow(args):
