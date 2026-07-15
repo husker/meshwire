@@ -20,6 +20,7 @@ import argparse
 import base64
 import contextlib
 import email.message
+import errno
 import hashlib
 import hmac
 import io
@@ -52,6 +53,9 @@ ACTIVITY_FILE = ".meshwire.activity"
 SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
 SUPERVISE_MAX_ATTEMPTS = 3
 SUPERVISE_EXEC_TIMEOUT = 600
+SUPERVISE_OWNER_VERSION = 1
+SUPERVISE_METADATA_MAX_BYTES = 4096
+SUPERVISE_RECEIVER_JOIN_TIMEOUT = 5
 
 
 def activity_file(cfg, node):
@@ -4784,34 +4788,288 @@ def _acquire_presence_lock(cfg, node):
 
 
 def supervise_lock_file(cfg, node):
-    """Cross-platform singleton lock: one `mesh codex-supervise` loop per
-    mesh node (same scheme as presence_lock_file)."""
+    """Persistent advisory-lock inode for one supervisor per mesh node."""
     identity = f"{os.path.realpath(cfg['_dir'])}\0{node}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:20]
     return os.path.join(tempfile.gettempdir(), SUPERVISE_LOCK_PREFIX + suffix)
 
 
+@dataclass
+class _SupervisorLockOwnership:
+    path: str
+    fd: int
+    token: str
+    pid: int
+    identity: typing.Tuple[int, int]
+    released: bool = False
+
+
+@dataclass(frozen=True)
+class _SupervisorPidOwnership:
+    path: str
+    token: str
+    pid: int
+    identity: typing.Tuple[int, int]
+
+
+def _validate_supervisor_stat(observed):
+    if not stat.S_ISREG(observed.st_mode):
+        raise OSError("supervisor ownership state is not a regular file")
+    device = getattr(observed, "st_dev", 0)
+    inode = getattr(observed, "st_ino", 0)
+    if (not isinstance(device, int) or not isinstance(inode, int)
+            or device == 0 or inode == 0):
+        raise WorkerEvidenceUnsupported(
+            "supervisor ownership state has no stable file identity")
+    if os.name == "posix":
+        if (not hasattr(os, "geteuid")
+                or observed.st_uid != os.geteuid()):
+            raise OSError(
+                "supervisor ownership state is not owned by current user")
+        if stat.S_IMODE(observed.st_mode) != 0o600:
+            raise OSError(
+                "supervisor ownership state is not private mode 0600")
+    return device, inode
+
+
+def _open_supervisor_state(path, writable=False, create=False):
+    """Open supervisor evidence without following symlinks when supported.
+
+    Windows does not expose O_NOFOLLOW through every supported Python build,
+    so lstat/open/fstat stable-identity checks are mandatory there. A symlink
+    or a path replacement fails closed on every platform.
+    """
+    before_identity = None
+    try:
+        before_identity = _validate_supervisor_stat(os.lstat(path))
+    except FileNotFoundError:
+        if not create:
+            raise
+
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    if create:
+        flags |= os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if isinstance(nofollow, int):
+        flags |= nofollow
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if isinstance(cloexec, int):
+        flags |= cloexec
+    fd = os.open(path, flags, 0o600)
+    try:
+        if before_identity is None and os.name == "posix":
+            os.fchmod(fd, 0o600)
+        os.set_inheritable(fd, False)
+        identity = _validate_supervisor_stat(os.fstat(fd))
+        if before_identity is not None and identity != before_identity:
+            raise OSError("supervisor ownership state changed while opening")
+        if _validate_supervisor_stat(os.lstat(path)) != identity:
+            raise OSError("supervisor ownership path changed while opening")
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _supervisor_metadata(pid, token):
+    value = {
+        "version": SUPERVISE_OWNER_VERSION,
+        "pid": pid,
+        "token": token,
+    }
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1
+            or not isinstance(token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", token) is None):
+        raise ValueError("invalid supervisor owner metadata")
+    return value
+
+
+def _validate_supervisor_metadata(value):
+    if (not isinstance(value, dict)
+            or set(value) != {"version", "pid", "token"}
+            or value.get("version") != SUPERVISE_OWNER_VERSION):
+        raise ValueError("invalid supervisor owner metadata")
+    return _supervisor_metadata(value.get("pid"), value.get("token"))
+
+
+def _read_supervisor_metadata_fd(fd):
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = os.read(fd, SUPERVISE_METADATA_MAX_BYTES + 1)
+    if len(raw) > SUPERVISE_METADATA_MAX_BYTES:
+        raise ValueError("supervisor owner metadata is too large")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("invalid supervisor owner metadata") from exc
+    return _validate_supervisor_metadata(value)
+
+
+def _write_supervisor_metadata_fd(fd, value):
+    value = _validate_supervisor_metadata(value)
+    raw = (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    offset = 0
+    while offset < len(raw):
+        written = os.write(fd, raw[offset:])
+        if written <= 0:
+            raise OSError("could not write supervisor owner metadata")
+        offset += written
+    os.fsync(fd)
+
+
+def _try_supervisor_advisory_lock(fd):
+    """Acquire the first-byte/exclusive lock non-blocking; False means busy."""
+    if os.name == "posix":
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise WorkerEvidenceUnsupported(
+                "POSIX advisory locks are unavailable") from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+            raise
+        return True
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError as exc:
+            raise WorkerEvidenceUnsupported(
+                "Windows advisory locks are unavailable") from exc
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                return False
+            raise
+        return True
+    raise WorkerEvidenceUnsupported(
+        "supervisor advisory locks are unavailable on this platform")
+
+
+def _unlock_supervisor_advisory_lock(fd):
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    raise WorkerEvidenceUnsupported(
+        "supervisor advisory locks are unavailable on this platform")
+
+
+def _supervisor_path_has_identity(path, identity):
+    try:
+        return _validate_supervisor_stat(os.lstat(path)) == identity
+    except (OSError, WorkerEvidenceUnsupported):
+        return False
+
+
 def _acquire_supervise_lock(cfg, node):
     path = supervise_lock_file(cfg, node)
-    for _ in range(3):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if _hook_lock_is_live(path):
-                return None
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                return None
-            continue
-        try:
-            os.write(fd, json.dumps({"pid": os.getpid()}).encode())
-        finally:
+    fd, identity = _open_supervisor_state(
+        path, writable=True, create=True)
+    acquired = False
+    try:
+        acquired = _try_supervisor_advisory_lock(fd)
+        if not acquired:
             os.close(fd)
-        return path
-    return None
+            return None
+        pid = os.getpid()
+        token = secrets.token_hex(32)
+        _write_supervisor_metadata_fd(
+            fd, _supervisor_metadata(pid, token))
+        if not _supervisor_path_has_identity(path, identity):
+            raise OSError(
+                "supervisor lock path changed during acquisition")
+        return _SupervisorLockOwnership(
+            path=path, fd=fd, token=token, pid=pid,
+            identity=identity)
+    except BaseException:
+        if acquired:
+            try:
+                _unlock_supervisor_advisory_lock(fd)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _write_supervisor_pid(cfg, node, lock):
+    if (not isinstance(lock, _SupervisorLockOwnership)
+            or lock.released or lock.fd < 0):
+        raise ValueError("supervisor lock ownership is invalid")
+    path = _supervise_pid_file(cfg, node)
+    expected = _supervisor_metadata(lock.pid, lock.token)
+    _write_json_secure(path, expected)
+    fd = None
+    try:
+        fd, identity = _open_supervisor_state(path)
+        if _read_supervisor_metadata_fd(fd) != expected:
+            raise OSError("supervisor PID metadata readback failed")
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return _SupervisorPidOwnership(
+        path=path, token=lock.token, pid=lock.pid,
+        identity=identity)
+
+
+def _cleanup_supervisor_pid(lock, pid_owner):
+    if (not isinstance(lock, _SupervisorLockOwnership)
+            or not isinstance(pid_owner, _SupervisorPidOwnership)
+            or lock.released
+            or pid_owner.token != lock.token
+            or pid_owner.pid != lock.pid):
+        return False
+    fd = None
+    try:
+        fd, identity = _open_supervisor_state(pid_owner.path)
+        if (identity != pid_owner.identity
+                or _read_supervisor_metadata_fd(fd)
+                != _supervisor_metadata(lock.pid, lock.token)):
+            return False
+        os.close(fd)
+        fd = None
+        if not _supervisor_path_has_identity(
+                pid_owner.path, pid_owner.identity):
+            return False
+        os.unlink(pid_owner.path)
+        return True
+    except (OSError, TypeError, ValueError, UnicodeError,
+            WorkerEvidenceUnsupported):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _release_supervise_lock(lock, pid_owner=None):
+    """Release only this handle; the reusable lock inode stays persistent."""
+    if not isinstance(lock, _SupervisorLockOwnership) or lock.released:
+        return
+    try:
+        if pid_owner is not None:
+            _cleanup_supervisor_pid(lock, pid_owner)
+    finally:
+        try:
+            _unlock_supervisor_advisory_lock(lock.fd)
+        finally:
+            try:
+                os.close(lock.fd)
+            finally:
+                lock.fd = -1
+                lock.released = True
 
 
 def _presence_is_live(cfg, node):
@@ -5855,47 +6113,35 @@ def cmd_codex_supervise(args):
               f"node '{me}'", file=sys.stderr)
         return
 
-    pid_path = _supervise_pid_file(cfg, me)
-    with open(pid_path, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()) + "\n")
-
-    # We hold the singleton lock, so no other codex-supervise process for
-    # this node can be mid-exec right now -- any task still marked
-    # state="working" was stranded by a prior crash/SIGTERM and would
-    # otherwise never be re-selected (_supervise_pending only picks up
-    # "submitted"). Safe to requeue before entering the poll loop.
-    tasks = load_tasks(cfg)
-    stale = [tid for tid, t in tasks.items()
-             if t.get("direction") == "inbound" and t.get("state") == "working"]
-    for tid in stale:
-        save_task(cfg, tid, state="submitted")
-    if stale:
-        print(f"a2acast supervise: requeued {len(stale)} stale 'working' "
-              f"task(s) from a prior crash")
-
+    pid_owner = None
     receiver = None
+    receiver_thread = None
+    receiver_started = False
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        # #32: the exec loop below only ever reads the local task store, and
-        # nothing populates that store unless a harness session's `mesh
-        # mcp-serve` presence server is running to subscribe to the relay
-        # and save inbound A2A tasks. A headless node (no harness session
-        # open) has no such presence server, so it would poll an eternally
-        # empty store. Make the supervisor self-contained by running its
-        # own receiver: a MeshMCPServer's watch_loop, in a daemon thread,
-        # subscribing to the relay and saving inbound tasks (via its normal
-        # delivery path) for the exec loop below to pick up. We deliberately
-        # do NOT coordinate with the presence lock here (kept simple/
-        # correct, out of scope for #32): if a harness session's presence
-        # server is ALSO subscribed for this node, both receive the same
-        # inbound events and both call save_task -- harmless, since
-        # save_task is idempotent by task-id and double receipt just
-        # re-writes the same record.
-        # The receiver intentionally keeps this startup cfg snapshot; its
-        # delivery path never reads live security policy such as exec_allow.
-        receiver = MeshMCPServer(cfg, me)
-        threading.Thread(target=receiver.watch_loop, daemon=True).start()
+        pid_owner = _write_supervisor_pid(cfg, me, lock)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+        # We hold the kernel-backed singleton lock, so any legacy task still
+        # marked working was stranded by a prior owner.
+        tasks = load_tasks(cfg)
+        stale = [tid for tid, task in tasks.items()
+                 if task.get("direction") == "inbound"
+                 and task.get("state") == "working"]
+        for tid in stale:
+            save_task(cfg, tid, state="submitted")
+        if stale:
+            print(f"a2acast supervise: requeued {len(stale)} stale 'working' "
+                  f"task(s) from a prior crash")
+
+        # A one-pass invocation reads already-durable local state and must not
+        # outlive its lock through a background receiver thread.
+        if not args.once:
+            receiver = MeshMCPServer(cfg, me)
+            receiver_thread = threading.Thread(
+                target=receiver.watch_loop, daemon=True)
+            receiver_thread.start()
+            receiver_started = True
 
         while True:
             # Live allowlist reload (#31): re-read the config on every poll
@@ -5910,37 +6156,64 @@ def cmd_codex_supervise(args):
                 return
             time.sleep(args.interval)
     finally:
-        if receiver is not None:
-            receiver._stop.set()
         try:
-            os.unlink(pid_path)
-        except OSError:
-            pass
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+            if receiver is not None:
+                try:
+                    receiver._stop.set()
+                finally:
+                    if receiver_started:
+                        receiver_thread.join(
+                            timeout=SUPERVISE_RECEIVER_JOIN_TIMEOUT)
+        finally:
+            _release_supervise_lock(lock, pid_owner)
 
 
 def _stop_supervisor(cfg, node):
-    """Signal one node-keyed supervisor, preserving the legacy CLI output."""
+    """Signal only a live owner whose private PID and lock tokens match."""
     pid_path = _supervise_pid_file(cfg, node)
+    lock_path = supervise_lock_file(cfg, node)
+    pid_fd = None
+    lock_fd = None
+    probe_acquired = False
     try:
-        with open(pid_path, "r", encoding="utf-8") as handle:
-            pid = int(handle.read().strip())
-    except (OSError, ValueError):
+        pid_fd, _pid_identity = _open_supervisor_state(pid_path)
+        pid_metadata = _read_supervisor_metadata_fd(pid_fd)
+        lock_fd, lock_identity = _open_supervisor_state(
+            lock_path, writable=True)
+        lock_metadata = _read_supervisor_metadata_fd(lock_fd)
+        if pid_metadata != lock_metadata:
+            raise ValueError("supervisor owner tokens do not match")
+        probe_acquired = _try_supervisor_advisory_lock(lock_fd)
+        if probe_acquired:
+            raise ValueError("supervisor lock is not held")
+        if (not _supervisor_path_has_identity(lock_path, lock_identity)
+                or not _supervisor_path_has_identity(
+                    pid_path, _pid_identity)):
+            raise ValueError("supervisor ownership path changed")
+        if (_read_supervisor_metadata_fd(lock_fd) != lock_metadata
+                or _read_supervisor_metadata_fd(pid_fd) != pid_metadata):
+            raise ValueError("supervisor ownership metadata changed")
+        pid = pid_metadata["pid"]
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            print(
+                f"a2acast supervise: could not signal process {pid}: {exc}")
+        else:
+            print(f"a2acast supervise: sent SIGTERM to {pid}")
+    except (OSError, TypeError, ValueError, UnicodeError,
+            WorkerEvidenceUnsupported):
         print(f"a2acast supervise: no running loop found for node '{node}'")
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError) as exc:
-        print(f"a2acast supervise: could not signal process {pid}: {exc}")
-    else:
-        print(f"a2acast supervise: sent SIGTERM to {pid}")
-    try:
-        os.unlink(pid_path)
-    except OSError:
-        pass
+    finally:
+        if probe_acquired and lock_fd is not None:
+            try:
+                _unlock_supervisor_advisory_lock(lock_fd)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if pid_fd is not None:
+            os.close(pid_fd)
 
 
 def _configured_worker(pool, backend):
@@ -5953,11 +6226,33 @@ def _configured_worker(pool, backend):
     if not isinstance(worker, dict):
         sys.exit(f"error: backend '{backend}' is not configured")
     node = worker.get("node")
-    if (not isinstance(node, str)
-            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node)
-            is None
-            or node == BROADCAST):
+    valid_node = lambda value: (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value)
+        is not None
+        and value != BROADCAST
+    )
+    if not valid_node(node):
         sys.exit(f"error: backend '{backend}' has no valid node")
+    coordinator = pool.get("coordinator")
+    configured_nodes = []
+    identities_valid = valid_node(coordinator)
+    for configured in workers.values():
+        if not isinstance(configured, dict):
+            identities_valid = False
+            continue
+        configured_node = configured.get("node")
+        if not valid_node(configured_node):
+            identities_valid = False
+            continue
+        configured_nodes.append(configured_node)
+    if (not identities_valid
+            or len(configured_nodes) != len(workers)
+            or len(set(configured_nodes)) != len(configured_nodes)
+            or coordinator in configured_nodes):
+        sys.exit(
+            "error: worker nodes must be valid, unique, and distinct "
+            "from the pool coordinator")
     return worker, node
 
 
@@ -5995,22 +6290,25 @@ def _run_worker_supervisor(args):
             file=sys.stderr)
         return
 
-    pid_path = _supervise_pid_file(cfg, me)
-    pid_owned = False
+    pid_owner = None
     receiver = None
+    receiver_thread = None
+    receiver_started = False
     initial_config = os.path.realpath(
         cfg.get("_path") or os.path.join(cfg["_dir"], CONFIG_NAME))
     try:
-        _write_text_secure(pid_path, str(os.getpid()) + "\n")
-        pid_owned = True
+        pid_owner = _write_supervisor_pid(cfg, me, lock)
         signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))
 
-        # Recovery must make durable execution decisions before a receiver
-        # can add new work or the poll loop can claim anything.
+        # Recovery makes durable execution decisions before a receiver can
+        # add new work or the poll loop can claim anything.
         _recover_worker_tasks(cfg, pool, me, backend)
-        receiver = MeshMCPServer(cfg, me)
-        threading.Thread(
-            target=receiver.watch_loop, daemon=True).start()
+        if not getattr(args, "once", False):
+            receiver = MeshMCPServer(cfg, me)
+            receiver_thread = threading.Thread(
+                target=receiver.watch_loop, daemon=True)
+            receiver_thread.start()
+            receiver_started = True
 
         while True:
             cfg = load_config()
@@ -6048,17 +6346,16 @@ def _run_worker_supervisor(args):
                 return
             time.sleep(interval)
     finally:
-        if receiver is not None:
-            receiver._stop.set()
-        if pid_owned:
-            try:
-                os.unlink(pid_path)
-            except OSError:
-                pass
         try:
-            os.unlink(lock)
-        except OSError:
-            pass
+            if receiver is not None:
+                try:
+                    receiver._stop.set()
+                finally:
+                    if receiver_started:
+                        receiver_thread.join(
+                            timeout=SUPERVISE_RECEIVER_JOIN_TIMEOUT)
+        finally:
+            _release_supervise_lock(lock, pid_owner)
 
 
 def cmd_worker_supervise(args):
