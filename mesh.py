@@ -106,6 +106,10 @@ class TaskLedgerBusy(TimeoutError):
             lock_path)
 
 
+class WorkerEvidenceUnsupported(OSError):
+    """Secure worker evidence is unavailable on this platform/filesystem."""
+
+
 CODEX_TASK_TURN_GUARD = (
     "An ack alone does not complete this task, and no new turn will be "
     "created after you go idle. Do the requested work and send the result "
@@ -1648,7 +1652,8 @@ def _validate_private_worker_stat(observed):
         # Windows has no meaningful POSIX mode/owner check here, so stable
         # file identity is mandatory there too. If Python/the filesystem
         # cannot provide one, worker state is not trusted.
-        raise OSError("worker state has no stable file identity")
+        raise WorkerEvidenceUnsupported(
+            "worker state has no stable file identity")
     if os.name == "posix":
         if (not hasattr(os, "geteuid")
                 or observed.st_uid != os.geteuid()):
@@ -1664,7 +1669,8 @@ def _open_regular_readonly(path):
     identity = _validate_private_worker_stat(before)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not isinstance(nofollow, int) or not nofollow:
-        raise OSError("reliable no-follow open is unavailable")
+        raise WorkerEvidenceUnsupported(
+            "reliable no-follow open is unavailable")
     fd = os.open(path, os.O_RDONLY | nofollow)
     try:
         after = os.fstat(fd)
@@ -1676,11 +1682,12 @@ def _open_regular_readonly(path):
         raise
 
 
-def _worker_evidence_supported(cfg):
-    """Preflight no-follow and stable identity without writing a claim."""
+def _preflight_worker_evidence(cfg):
+    """Prove no-follow/stable identity, distinguishing transient failure."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not isinstance(nofollow, int) or not nofollow:
-        return False
+        raise WorkerEvidenceUnsupported(
+            "reliable no-follow open is unavailable")
     probe = os.path.join(
         cfg["_dir"], ".meshwire.worker-evidence-probe.%s.%s" % (
             os.getpid(), uuid.uuid4().hex))
@@ -1690,9 +1697,8 @@ def _worker_evidence_supported(cfg):
         fd = _open_regular_readonly(probe)
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = None
-            return handle.read() == "meshwire-evidence-probe\n"
-    except (OSError, TypeError, ValueError, UnicodeError):
-        return False
+            if handle.read() != "meshwire-evidence-probe\n":
+                raise OSError("worker evidence probe readback failed")
     finally:
         if fd is not None:
             os.close(fd)
@@ -1700,6 +1706,15 @@ def _worker_evidence_supported(cfg):
             os.unlink(probe)
         except OSError:
             pass
+    return True
+
+
+def _worker_evidence_supported(cfg):
+    """Compatibility predicate for callers that treat all failures alike."""
+    try:
+        return _preflight_worker_evidence(cfg)
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return False
 
 
 def _worker_regular_file(path):
@@ -1795,10 +1810,11 @@ def _load_worker_execution_marker(cfg, task_id, expected=None):
         return {}
 
 
-def _ensure_worker_execution_marker(cfg, task_id, binding):
+def _ensure_worker_execution_marker(
+        cfg, task_id, binding, evidence_preflighted=False):
     """Create or validate the immutable global claim before durable state."""
-    if not _worker_evidence_supported(cfg):
-        raise OSError("reliable no-follow worker evidence is unavailable")
+    if not evidence_preflighted:
+        _preflight_worker_evidence(cfg)
     expected = _worker_execution_marker(binding)
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
@@ -2159,11 +2175,14 @@ def _safe_worker_failure(binding, reason, journal=None):
 
 
 def _queue_worker_result(cfg, me, task_id, binding, result,
-                         terminal_state, output_path=None):
+                         terminal_state, output_path=None,
+                         evidence_preflighted=False):
     """Persist an encoded result before making it eligible for delivery."""
     if terminal_state not in {"completed", "failed"}:
         raise ValueError("invalid worker terminal state")
-    _ensure_worker_execution_marker(cfg, task_id, binding)
+    _ensure_worker_execution_marker(
+        cfg, task_id, binding,
+        evidence_preflighted=evidence_preflighted)
     _validate_worker_journal(
         cfg, me, task_id, dict(binding, phase="validated"))
     trusted_output = _worker_output_file(cfg, me, task_id)
@@ -2696,6 +2715,17 @@ def _run_worker_task(cfg, pool, me, backend, task_id, task):
 def _recover_worker_tasks(cfg, pool, me, backend):
     """Fail closed for ambiguous executions and restore durable replies."""
     del pool  # Reserved for future worktree inspection; never auto-rerun here.
+    try:
+        _preflight_worker_evidence(cfg)
+    except WorkerEvidenceUnsupported as exc:
+        evidence_supported = False
+        unsupported_reason = str(exc)
+    except (OSError, TypeError, ValueError, UnicodeError, TaskLedgerBusy):
+        # A transient probe failure leaves every working task retryable.
+        return
+    else:
+        evidence_supported = True
+        unsupported_reason = ""
     for task_id, task in load_tasks(cfg).items():
         if (not isinstance(task, dict)
                 or task.get("direction") != "inbound"
@@ -2726,12 +2756,20 @@ def _recover_worker_tasks(cfg, pool, me, backend):
                 "worker execution marker binding does not match recovery")
             continue
         if not marker_present:
+            if not evidence_supported:
+                _fail_worker_locally(
+                    cfg, task_id,
+                    "worker recovery cannot create durable evidence: %s; "
+                    "retry on a filesystem/platform with private no-follow "
+                    "stable file identity" % unsupported_reason)
+                continue
             result = _empty_worker_result(
                 backend, "failed",
                 "worker execution marker is missing or invalid")
             try:
                 _queue_worker_result(
-                    cfg, me, task_id, recovery_binding, result, "failed")
+                    cfg, me, task_id, recovery_binding, result, "failed",
+                    evidence_preflighted=True)
             except (OSError, TypeError, ValueError, UnicodeError,
                     TaskLedgerBusy):
                 pass
@@ -2749,7 +2787,7 @@ def _recover_worker_tasks(cfg, pool, me, backend):
                     binding, "invalid durable worker result", journal)
                 _queue_worker_result(
                     cfg, me, task_id, binding, result, "failed",
-                    output_path=output_path)
+                    output_path=output_path, evidence_preflighted=True)
             else:
                 save_task(
                     cfg, task_id, state="reply_pending",
@@ -2773,7 +2811,7 @@ def _recover_worker_tasks(cfg, pool, me, backend):
             journal)
         _queue_worker_result(
             cfg, me, task_id, binding, result, "failed",
-            output_path=output_path)
+            output_path=output_path, evidence_preflighted=True)
 
 
 def _supervise_preamble(task_id, sender):
@@ -3803,6 +3841,13 @@ def cmd_watch(args):
             pass
 
 
+def _finish_watch_timeout(me, timeout, follow):
+    print(f"MESH_TIMEOUT: no message for "
+          f"'{_single_line(me)}' in {timeout}s")
+    if not follow:
+        print("MESH_WATCH_DONE kind=timeout", flush=True)
+
+
 def _cmd_watch_owned(args, cfg, me):
     # subscribe to own inbox AND the broadcast topic in one stream
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
@@ -3861,15 +3906,9 @@ def _cmd_watch_owned(args, cfg, me):
                 print(f"MESH_WARN: {exc}; retrying same event",
                       file=sys.stderr)
                 if deadline is not None and time.time() >= deadline:
-                    print(f"MESH_TIMEOUT: no message for "
-                          f"'{_single_line(me)}' in {timeout}s")
+                    _finish_watch_timeout(me, timeout, args.follow)
                     return
                 time.sleep(0.05)
-        if not ctl and frm != me and task_record is _TASK_RECORD_UNSET \
-                and _parse_envelope(_sanitize_delivery_text(body)):
-            # The task could not be durably classified before the one-shot
-            # deadline. Leave cursor/replay/ACK untouched for redelivery.
-            continue
         if not save_cursor(ev):
             continue
         if fingerprint:
@@ -3903,10 +3942,7 @@ def _cmd_watch_owned(args, cfg, me):
                 print(f"MESH_WATCH_DONE kind={delivery_kind}", flush=True)
                 return
     if not delivered:
-        print(f"MESH_TIMEOUT: no message for "
-              f"'{_single_line(me)}' in {timeout}s")
-        if not args.follow:
-            print("MESH_WATCH_DONE kind=timeout", flush=True)
+        _finish_watch_timeout(me, timeout, args.follow)
 
 
 def cmd_agent_session_hook(args):
