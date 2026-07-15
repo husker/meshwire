@@ -531,6 +531,9 @@ def _validate_pool_config(cfg, pool):
     coordinator = pool["coordinator"]
     if not _valid_pool_node(coordinator):
         raise ValueError("worker pool coordinator is invalid")
+    if cfg.get("exec_allow") != [coordinator]:
+        raise ValueError(
+            "mesh trust must allow only the worker pool coordinator")
 
     roots = pool["workspace_roots"]
     if not isinstance(roots, list) or not roots:
@@ -587,16 +590,42 @@ def _validate_pool_config(cfg, pool):
 
 def load_pool_config(cfg=None):
     cfg = load_config() if cfg is None else cfg
+    lock = None
     try:
-        pool = _load_json_regular(
-            pool_config_file(cfg), require_private=True,
+        if not isinstance(cfg, dict):
+            raise ValueError("mesh configuration must be an object")
+        lock = _acquire_config_lock(cfg)
+        if lock is None:
+            raise RuntimeError("config lock is unavailable")
+        path = os.path.abspath(cfg.get("_path") or CONFIG_NAME)
+        latest = _load_json_regular(
+            path, require_private=False,
             max_bytes=POOL_CONFIG_MAX_BYTES)
-        return _validate_pool_config(cfg, pool)
+        if not isinstance(latest, dict):
+            raise ValueError("mesh configuration must be an object")
+        latest["_path"] = path
+        latest["_dir"] = os.path.dirname(path)
+        pool = _load_json_regular(
+            pool_config_file(latest), require_private=True,
+            max_bytes=POOL_CONFIG_MAX_BYTES)
+        pool = _validate_pool_config(latest, pool)
+        # Callers use this same object for recipient trust after loading the
+        # pool. Refresh it to the exact safe snapshot validated under lock so
+        # a stale permissive caller cannot survive a concurrent correction.
+        cfg.clear()
+        cfg.update(latest)
+        return pool
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
-            WorkerEvidenceUnsupported) as exc:
+            RuntimeError, WorkerEvidenceUnsupported) as exc:
         raise ValueError(
             "worker pool configuration is unavailable; "
             "run mesh pool-setup") from exc
+    finally:
+        if lock:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
 
 def _write_pool_config(cfg, pool):
@@ -808,7 +837,7 @@ def _acquire_tasks_lock(cfg, attempts=10, wait=0.05):
         _tasks_lock_file(cfg), attempts, wait, reclaim_stale=False)
 
 
-def _mutate_config(cfg, apply):
+def _mutate_config(cfg, apply, publish=None):
     """Read-modify-write a single surgical change against the LATEST
     on-disk config, under a brief lock, rather than blindly overwriting
     with a (possibly stale) in-memory `cfg`.
@@ -826,6 +855,9 @@ def _mutate_config(cfg, apply):
     no config file exists yet, against a plain copy of the non-underscore
     keys of the passed-in `cfg`), and once more against `cfg` itself so the
     caller's in-memory copy stays consistent without a second disk read.
+    When provided, `publish(latest)` runs after the config write but before
+    releasing the same lock, for state that must be published atomically with
+    a config trust prerequisite.
     """
     path = cfg.get("_path") or CONFIG_NAME
     lock = _acquire_config_lock(cfg)
@@ -844,6 +876,8 @@ def _mutate_config(cfg, apply):
         _write_json_secure(
             path, {k: v for k, v in latest.items()
                    if not k.startswith("_")}, indent=2)
+        if publish is not None:
+            publish(latest)
     finally:
         if lock:
             try:
@@ -6682,7 +6716,9 @@ def cmd_pool_setup(args):
             "workers": workers,
             "routing": ["goose", "copilot", "codex"],
         }
-        _validate_pool_config(cfg, pool)
+        prospective_cfg = dict(cfg)
+        prospective_cfg["exec_allow"] = [coordinator]
+        _validate_pool_config(prospective_cfg, pool)
     except (OSError, TypeError, ValueError, UnicodeError) as exc:
         sys.exit(f"error: invalid worker pool configuration: {exc}")
 
@@ -6710,8 +6746,13 @@ def cmd_pool_setup(args):
             if node not in seen_workers:
                 roster.append(node)
 
-    _mutate_config(cfg, apply)
-    _write_pool_config(cfg, pool)
+    def publish(latest):
+        current = dict(latest)
+        current["_path"] = cfg["_path"]
+        current["_dir"] = cfg["_dir"]
+        _write_pool_config(current, pool)
+
+    _mutate_config(cfg, apply, publish=publish)
     print(f"configured worker pool for {', '.join(roots)}")
     print(
         "security: exec_allow trusts the coordinator name inside a "

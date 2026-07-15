@@ -8151,7 +8151,7 @@ class PoolConfigTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.cfg = make_cfg(self.tmp.name)
         self.cfg["nodes"] = ["coordinator"]
-        self.cfg["exec_allow"] = ["legacy-peer"]
+        self.cfg["exec_allow"] = ["coordinator"]
         mesh._save_config(self.cfg)
         self.workspace = os.path.join(self.tmp.name, "projects")
         os.makedirs(self.workspace)
@@ -8204,6 +8204,7 @@ class PoolConfigTests(unittest.TestCase):
         self.assertEqual(called[0].model, "local:7b")
 
     def test_pool_setup_writes_no_secret_and_trusts_only_coordinator(self):
+        self.cfg["exec_allow"] = ["legacy-peer"]
         self.cfg["nodes"].extend([
             "machine-worker-codex", "machine-worker-codex",
         ])
@@ -8244,9 +8245,9 @@ class PoolConfigTests(unittest.TestCase):
         events = []
         mutate = mesh._mutate_config
 
-        def record_mutation(cfg, apply):
+        def record_mutation(cfg, apply, publish=None):
             events.append("config")
-            return mutate(cfg, apply)
+            return mutate(cfg, apply, publish=publish)
 
         def record_pool(cfg, pool):
             events.append("pool")
@@ -8268,6 +8269,57 @@ class PoolConfigTests(unittest.TestCase):
         with open(self.cfg["_path"], encoding="utf-8") as handle:
             disk = json.load(handle)
         self.assertEqual(disk["concurrent"], {"keep": True})
+
+    def test_pool_setup_publishes_while_config_lock_is_held(self):
+        write_pool = mesh._write_pool_config
+
+        def assert_locked(cfg, pool):
+            contender = mesh._acquire_config_lock(
+                cfg, attempts=1, wait=0)
+            if contender is not None:
+                try:
+                    self.fail(
+                        "pool publication ran after releasing config lock")
+                finally:
+                    os.unlink(contender)
+            return write_pool(cfg, pool)
+
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             mock.patch.object(mesh, "_write_pool_config",
+                               side_effect=assert_locked), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_setup(self._setup_args())
+
+        with open(mesh.pool_config_file(self.cfg),
+                  encoding="utf-8") as handle:
+            disk_pool = json.load(handle)
+        self.assertEqual(mesh.load_pool_config(self.cfg), disk_pool)
+
+    def test_load_pool_rechecks_current_trust_not_stale_caller_config(self):
+        stale_safe_cfg = dict(self.cfg)
+        stale_safe_cfg["exec_allow"] = ["coordinator"]
+        self._write_pool()
+        latest = dict(self.cfg)
+        latest["exec_allow"] = ["coordinator", "intruder"]
+        mesh._save_config(latest)
+
+        with self.assertRaisesRegex(ValueError, "pool configuration"):
+            mesh.load_pool_config(stale_safe_cfg)
+
+    def test_load_pool_refreshes_stale_caller_from_current_safe_trust(self):
+        latest = dict(self.cfg)
+        latest["exec_allow"] = ["coordinator"]
+        mesh._save_config(latest)
+        self._write_pool()
+        stale_permissive_cfg = dict(self.cfg)
+        stale_permissive_cfg["exec_allow"] = ["coordinator", "intruder"]
+
+        self.assertEqual(
+            mesh.load_pool_config(stale_permissive_cfg), self.pool)
+        self.assertEqual(stale_permissive_cfg["exec_allow"],
+                         ["coordinator"])
 
     def test_pool_setup_does_not_publish_when_config_mutation_fails(self):
         self._write_pool()
