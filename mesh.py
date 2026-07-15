@@ -1903,6 +1903,71 @@ def _worker_worktree_removal_identity(info):
     return path, root, identity
 
 
+def _quarantine_worker_worktree(info, expected_identity):
+    path = os.path.abspath(info["path"])
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    parent_fd, parent_identity = _open_managed_directory(
+        parent, "worker worktree parent")
+    quarantine_name = ".a2acast-remove-" + secrets.token_hex(16)
+    quarantine_path = os.path.join(parent, quarantine_name)
+    quarantine_fd = None
+    moved = False
+    try:
+        os.mkdir(quarantine_name, 0o700, dir_fd=parent_fd)
+        quarantine_fd, quarantine_identity = _open_managed_directory(
+            quarantine_path, "worker worktree quarantine")
+        observed = os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_validate_managed_directory_stat(
+                observed, "worker worktree") != expected_identity):
+            raise ValueError("worker worktree path changed before quarantine")
+        os.rename(
+            name, "worktree", src_dir_fd=parent_fd,
+            dst_dir_fd=quarantine_fd)
+        moved = True
+        quarantined = os.stat(
+            "worktree", dir_fd=quarantine_fd, follow_symlinks=False)
+        if (_validate_managed_directory_stat(
+                quarantined, "quarantined worker worktree")
+                != expected_identity):
+            raise ValueError("worker worktree changed during quarantine")
+        if _validate_managed_directory(
+                parent, "worker worktree parent") != parent_identity:
+            raise ValueError("worker worktree parent changed during quarantine")
+        if _validate_managed_directory(
+                quarantine_path, "worker worktree quarantine") \
+                != quarantine_identity:
+            raise ValueError("worker worktree quarantine path changed")
+        return (os.path.join(quarantine_path, "worktree"),
+                quarantine_path, quarantine_identity)
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        if not moved:
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        os.close(parent_fd)
+
+
+def _remove_worker_quarantine(path, identity):
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    parent_fd, _parent_identity = _open_managed_directory(
+        parent, "worker worktree parent")
+    try:
+        observed = os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_validate_managed_directory_stat(
+                observed, "worker worktree quarantine") != identity):
+            raise ValueError("worker worktree quarantine changed")
+        os.rmdir(name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _remove_worker_worktree(info, integrated_into=None, force=False):
     path, _root, initial_identity = _worker_worktree_removal_identity(info)
     expected_identity = info.get(
@@ -1926,10 +1991,22 @@ def _remove_worker_worktree(info, integrated_into=None, force=False):
         _worker_worktree_removal_identity(info)
     if final_path != path or final_identity != expected_identity:
         raise ValueError("worker worktree path changed before removal")
+    quarantine_path, quarantine_root, quarantine_identity = \
+        _quarantine_worker_worktree(info, expected_identity)
+    quarantined_info = dict(
+        info, path=quarantine_path,
+        _cleanup_path_identity=expected_identity)
+    _git("-C", info["repo"], "worktree", "repair", quarantine_path)
+    rebound_path, _root, rebound_identity = \
+        _worker_worktree_removal_identity(quarantined_info)
+    if (rebound_path != quarantine_path
+            or rebound_identity != expected_identity):
+        raise ValueError("worker worktree changed after quarantine")
     args = ["-C", info["repo"], "worktree", "remove"]
     if force:
         args.append("--force")
-    _git(*args, path)
+    _git(*args, quarantine_path)
+    _remove_worker_quarantine(quarantine_root, quarantine_identity)
 
 
 def _worker_prompt(task_id, sender, job):
