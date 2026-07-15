@@ -111,7 +111,9 @@ off by default and its allowlist starts empty. See the security model below.
 The worker pool runs repository tasks through local Codex, Copilot, and
 Goose/Ollama CLIs. Run it on a joined worker host only after all three CLIs are
 installed; authenticate Codex and Copilot for the current user, and start
-Ollama with the configured model available (default `qwen3:4b`).
+Ollama with the configured model available (default `qwen3:4b`). The
+coordinator must already be a current known mesh identity; confirm it with
+`mesh status` before setup.
 
 ```bash
 mesh pool-setup --workspace-root ~/Projects \
@@ -129,10 +131,16 @@ cryptographic identity. Configure only a coordinator you trust.
 
 On macOS, `pool-start` manages current-user LaunchAgents. On other operating
 systems, `pool-start` and `pool-stop` print foreground supervisor commands for
-you or your service manager to run; they do not install a service. Normal
-`auto` jobs try Goose/Ollama, Copilot, then Codex, skipping workers that are
-blocked, busy, unavailable, or cooling down. Security and integration jobs
-route only to Codex unless a backend is explicitly named.
+you or your service manager to run; they do not install a service.
+
+For normal `auto` jobs, dispatch selects the first eligible backend in
+Goose/Ollama, Copilot, then Codex order, skipping workers that are blocked,
+busy, unavailable, or cooling down. Nonblocking CLI calls (the default
+`--wait 0`) and the nonblocking MCP tool dispatch that one worker and do not
+auto-redispatch. With a positive `--wait`, the CLI can try the next eligible
+backend only after an authenticated `quota` or `unavailable` result, within
+the same total wait budget. Security and integration jobs select only Codex
+unless a backend is explicitly named.
 
 Each job runs in a separate Git worktree. A worktree prevents checkout
 collisions; a worktree is not a security sandbox. Worker processes still have
@@ -310,7 +318,9 @@ mesh codex-allow <node> [--revoke|--list]   trust (or untrust) a peer to run del
 mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autonomous task actor
 mesh pool-setup --workspace-root DIR --coordinator NODE [--model MODEL]   configure the worker pool
 mesh pool-start|pool-status|pool-stop   manage or inspect worker supervisors
-mesh delegate auto|codex|copilot|goose <task...> --repo ABS [--wait SECS]   run an isolated task
+mesh delegate auto|codex|copilot|goose <task...> --repo ABS [--base COMMIT]
+  [--kind implementation|analysis] [--class normal|security|integration]
+  [--verify TEXT (repeatable)] [--wait 0..300] [--as NODE]   run an isolated task
 mesh pool-clean [--integrated-into REF] [--task ID --force]   remove eligible worktrees
 ```
 

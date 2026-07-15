@@ -4941,6 +4941,17 @@ class OnboardingTextTests(unittest.TestCase):
             self.assertIn(command, readme)
         self.assertIn("worktree is not a security sandbox", readme.lower())
 
+    def test_readme_explains_worker_routing_and_coordinator_precondition(self):
+        with open(os.path.join(self.ROOT, "README.md"),
+                  encoding="utf-8") as f:
+            readme = " ".join(f.read().lower().split())
+        self.assertIn("current known mesh identity", readme)
+        self.assertIn("first eligible", readme)
+        self.assertIn("positive `--wait`", readme)
+        self.assertIn("do not auto-redispatch", readme)
+        self.assertIn("--wait 300", readme)
+        self.assertNotIn("--wait 600", readme)
+
     def test_integrate_codex_mentions_codex_setup(self):
         self.assertIn("mesh codex-setup", mesh._integrate_harness("codex"))
 
