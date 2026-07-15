@@ -5099,6 +5099,63 @@ class WorkerWorktreeTests(unittest.TestCase):
         self.assertEqual(
             self.git("rev-parse", occupied).strip(), self.base)
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_rejects_live_intermediate_symlink_without_checkout_mutation(self):
+        token = mesh._worker_task_token("task-live-parent-link")
+        fingerprint = hashlib.sha256(
+            os.path.realpath(self.repo).encode("utf-8")
+        ).hexdigest()[:16]
+        root = os.path.realpath(self.cache)
+        os.makedirs(root)
+        os.symlink(self.repo, os.path.join(root, fingerprint))
+        status_before = self.git("status", "--porcelain=v1", "-z")
+
+        try:
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                mesh._prepare_worker_worktree(
+                    self.pool, "task-live-parent-link", "codex",
+                    self.repo, self.base)
+        finally:
+            self.assertEqual(
+                self.git("status", "--porcelain=v1", "-z"), status_before)
+            self.assertFalse(os.path.lexists(os.path.join(self.repo, token)))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_rejects_dangling_intermediate_symlink(self):
+        token = mesh._worker_task_token("task-dangling-parent-link")
+        fingerprint = hashlib.sha256(
+            os.path.realpath(self.repo).encode("utf-8")
+        ).hexdigest()[:16]
+        root = os.path.realpath(self.cache)
+        task_parent = os.path.join(root, fingerprint, token)
+        os.makedirs(os.path.dirname(task_parent))
+        target = os.path.join(self.tmp.name, "outside", "missing")
+        os.symlink(target, task_parent)
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            mesh._prepare_worker_worktree(
+                self.pool, "task-dangling-parent-link", "goose",
+                self.repo, self.base)
+        self.assertFalse(os.path.exists(target))
+
+    def test_rejects_non_directory_intermediate_collision(self):
+        token = mesh._worker_task_token("task-file-parent")
+        fingerprint = hashlib.sha256(
+            os.path.realpath(self.repo).encode("utf-8")
+        ).hexdigest()[:16]
+        task_parent = os.path.join(
+            os.path.realpath(self.cache), fingerprint, token)
+        os.makedirs(os.path.dirname(task_parent))
+        with open(task_parent, "w") as handle:
+            handle.write("occupied\n")
+
+        with self.assertRaisesRegex(ValueError, "directory"):
+            mesh._prepare_worker_worktree(
+                self.pool, "task-file-parent", "copilot",
+                self.repo, self.base)
+        with open(task_parent) as handle:
+            self.assertEqual(handle.read(), "occupied\n")
+
     def test_rejects_worktree_root_inside_active_checkout(self):
         pool = dict(
             self.pool,
@@ -5136,6 +5193,28 @@ class WorkerWorktreeTests(unittest.TestCase):
             mesh._remove_worker_worktree(
                 info, integrated_into=self.base)
         self.assertTrue(os.path.exists(info["path"]))
+
+    def test_remove_refuses_ignored_artifact_without_force(self):
+        info = mesh._prepare_worker_worktree(
+            self.pool, "task-ignored", "codex", self.repo, self.base)
+        with open(os.path.join(info["path"], ".gitignore"), "w") as handle:
+            handle.write("worker.log\n")
+        commit, _changed = mesh._commit_worker_changes(
+            info, "task-ignored", "codex")
+        subprocess.run(
+            ["git", "-C", self.repo, "branch", "ignored-integrated",
+             commit],
+            check=True)
+        artifact = os.path.join(info["path"], "worker.log")
+        with open(artifact, "w") as handle:
+            handle.write("preserve me\n")
+
+        with self.assertRaisesRegex(ValueError, "uncommitted changes"):
+            mesh._remove_worker_worktree(
+                info, integrated_into="ignored-integrated")
+        self.assertTrue(os.path.exists(info["path"]))
+        with open(artifact) as handle:
+            self.assertEqual(handle.read(), "preserve me\n")
 
     def test_remove_accepts_commit_reachable_from_integration_ref(self):
         info = mesh._prepare_worker_worktree(

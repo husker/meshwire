@@ -1145,6 +1145,39 @@ def _resolve_worker_base(repo, ref):
     return resolved
 
 
+def _canonical_worker_path(path, root, repo):
+    absolute = os.path.abspath(path)
+    canonical = os.path.realpath(absolute)
+    if not _path_is_within(canonical, root) or canonical == root:
+        raise ValueError("generated worker path is outside worker root")
+    if _path_is_within(canonical, repo):
+        raise ValueError("generated worker path is inside active checkout")
+    return canonical
+
+
+def _validate_worker_parent(path, root, repo):
+    if os.path.islink(path):
+        raise ValueError("worker parent must not be a symlink")
+    if not os.path.isdir(path):
+        raise ValueError("worker parent must be a directory")
+    canonical = _canonical_worker_path(path, root, repo)
+    lexical = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    if lexical != os.path.normcase(os.path.normpath(canonical)):
+        raise ValueError("worker parent must not contain a symlink")
+    return canonical
+
+
+def _ensure_worker_parent(path, root, repo):
+    if not os.path.lexists(path):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            # A concurrent creator is acceptable only if the result passes
+            # the same no-symlink, directory, and containment checks.
+            pass
+    return _validate_worker_parent(path, root, repo)
+
+
 def _prepare_worker_worktree(pool, task_id, backend, repo, base):
     task_token = _worker_task_token(task_id)
     if (not isinstance(backend, str)
@@ -1156,13 +1189,23 @@ def _prepare_worker_worktree(pool, task_id, backend, repo, base):
     root = os.path.realpath(os.path.expanduser(pool["worktree_root"]))
     if _path_is_within(root, repo):
         raise ValueError("worktree root must be outside the active checkout")
-    path_stem = os.path.join(root, fingerprint, task_token, backend)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except FileExistsError as exc:
+        raise ValueError("worktree root must be a directory") from exc
+    if not os.path.isdir(root):
+        raise ValueError("worktree root must be a directory")
+    repo_parent = _ensure_worker_parent(
+        os.path.join(root, fingerprint), root, repo)
+    task_parent = _ensure_worker_parent(
+        os.path.join(repo_parent, task_token), root, repo)
+    path_stem = os.path.join(task_parent, backend)
     path = path_stem
     path_suffix = 1
     while os.path.lexists(path):
         path_suffix += 1
         path = f"{path_stem}-{path_suffix}"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    path = _canonical_worker_path(path, root, repo)
     stem = f"codex/a2acast-{task_token}-{backend}"
     branch = stem
     suffix = 1
@@ -1171,6 +1214,11 @@ def _prepare_worker_worktree(pool, task_id, backend, repo, base):
             f"refs/heads/{branch}", check=False).returncode == 0:
         suffix += 1
         branch = f"{stem}-{suffix}"
+    _validate_worker_parent(repo_parent, root, repo)
+    _validate_worker_parent(task_parent, root, repo)
+    path = _canonical_worker_path(path, root, repo)
+    if os.path.lexists(path):
+        raise ValueError("worker path collision during preparation")
     _git("-C", repo, "worktree", "add", "-b", branch, path, base)
     return {
         "repo": repo,
@@ -1218,7 +1266,8 @@ def _remove_worker_worktree(info, integrated_into=None, force=False):
     commit = _resolve_worker_base(path, "HEAD")
     if not force:
         dirty = _git(
-            "-C", path, "status", "--porcelain=v1", "-z"
+            "-C", path, "status", "--porcelain=v1",
+            "--untracked-files=all", "--ignored", "-z"
         ).stdout
         if dirty:
             raise ValueError("worker worktree has uncommitted changes")
@@ -1229,7 +1278,10 @@ def _remove_worker_worktree(info, integrated_into=None, force=False):
             commit, integrated_into, check=False).returncode == 0
         if not integrated:
             raise ValueError("worker commit is not integrated")
-    _git("-C", info["repo"], "worktree", "remove", "--force", path)
+    args = ["-C", info["repo"], "worktree", "remove"]
+    if force:
+        args.append("--force")
+    _git(*args, path)
 
 
 def _supervise_preamble(task_id, sender):
