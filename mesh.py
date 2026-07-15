@@ -451,6 +451,17 @@ def _contains_config_secret(cfg, value):
     return False
 
 
+def _validate_worktree_anchor(observed):
+    """Require a POSIX worktree anchor controlled only by this user."""
+    if os.name != "posix":
+        return
+    if (hasattr(os, "geteuid") and hasattr(observed, "st_uid")
+            and observed.st_uid != os.geteuid()):
+        raise ValueError("worktree root anchor is not owned by current user")
+    if stat.S_IMODE(observed.st_mode) & 0o022:
+        raise ValueError("worktree root anchor is group- or world-writable")
+
+
 def _canonical_pool_directory(value, must_exist):
     if not _valid_pool_text(value, WORKER_PATH_MAX):
         raise ValueError("pool directory path is invalid")
@@ -473,6 +484,7 @@ def _canonical_pool_directory(value, must_exist):
             raise ValueError("worktree root cannot be inspected") from exc
         if not stat.S_ISDIR(observed.st_mode):
             raise ValueError("worktree root is not a real directory")
+        _validate_worktree_anchor(observed)
     else:
         ancestor = canonical
         while not os.path.lexists(ancestor):
@@ -486,6 +498,7 @@ def _canonical_pool_directory(value, must_exist):
             raise ValueError("worktree root has no trusted parent") from exc
         if not stat.S_ISDIR(observed.st_mode):
             raise ValueError("worktree root parent is not a real directory")
+        _validate_worktree_anchor(observed)
     return canonical
 
 

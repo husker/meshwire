@@ -8510,6 +8510,32 @@ class PoolConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mesh.load_pool_config(self.cfg)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_pool_rejects_existing_shared_writable_worktree_root(self):
+        unsafe_root = os.path.join(self.tmp.name, "shared-worktrees")
+        os.mkdir(unsafe_root)
+        os.chmod(unsafe_root, 0o777)
+        pool = {**self.pool, "worktree_root": os.path.realpath(unsafe_root)}
+        self._write_pool(pool)
+
+        with self.assertRaisesRegex(ValueError, "pool configuration"):
+            mesh.load_pool_config(self.cfg)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_pool_rejects_missing_worktree_root_under_unsafe_ancestor(self):
+        unsafe_parent = os.path.join(self.tmp.name, "shared-cache")
+        os.mkdir(unsafe_parent)
+        os.chmod(unsafe_parent, 0o777)
+        missing_root = os.path.join(unsafe_parent, "future", "worktrees")
+        pool = {
+            **self.pool,
+            "worktree_root": os.path.realpath(missing_root),
+        }
+        self._write_pool(pool)
+
+        with self.assertRaisesRegex(ValueError, "pool configuration"):
+            mesh.load_pool_config(self.cfg)
+
     def test_pool_setup_rejects_unsafe_inputs_before_mutation(self):
         cases = [
             self._setup_args(coordinator="all"),
