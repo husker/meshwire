@@ -392,6 +392,20 @@ def load_config():
     return cfg
 
 
+def load_pool_config(cfg=None):
+    """Fail closed until Task 7 installs validated pool configuration.
+
+    The generic supervisor is user-invokable in this task, so leaving the
+    future Task 7 helper undefined would turn a normal CLI invocation into a
+    NameError.  Tests can inject a validated pool directly; production use
+    remains disabled until the real loader and ``pool-setup`` land.
+    """
+    del cfg
+    sys.exit(
+        "error: worker pool configuration is not available yet; "
+        "install pool configuration support and run `mesh pool-setup`")
+
+
 def node_file(cfg, harness=None):
     base = os.path.join(cfg["_dir"], NODE_NAME)
     return f"{base}.{harness}" if harness else base
@@ -5833,24 +5847,7 @@ def cmd_codex_supervise(args):
     me = my_node(cfg, args.as_node, "codex")
 
     if args.stop:
-        pid_path = _supervise_pid_file(cfg, me)
-        try:
-            with open(pid_path, "r", encoding="utf-8") as f:
-                pid = int(f.read().strip())
-        except (OSError, ValueError):
-            print(f"a2acast supervise: no running loop found for node '{me}'")
-            return
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError) as e:
-            print(f"a2acast supervise: could not signal process {pid}: {e}")
-        else:
-            print(f"a2acast supervise: sent SIGTERM to {pid}")
-        try:
-            os.unlink(pid_path)
-        except OSError:
-            pass
-        return
+        return _stop_supervisor(cfg, me)
 
     lock = _acquire_supervise_lock(cfg, me)
     if not lock:
@@ -5906,7 +5903,8 @@ def cmd_codex_supervise(args):
             # without a restart. _supervise_pending gates strictly on
             # cfg["exec_allow"], so a fresh cfg is all this needs.
             cfg = load_config()
-            for task_id, task in _supervise_pending(cfg, me):
+            for task_id, task in _supervise_pending(
+                    cfg, me, allow_legacy=True):
                 _run_task_with_codex(cfg, me, task_id, task, args.sandbox)
             if args.once:
                 return
@@ -5922,6 +5920,149 @@ def cmd_codex_supervise(args):
             os.unlink(lock)
         except OSError:
             pass
+
+
+def _stop_supervisor(cfg, node):
+    """Signal one node-keyed supervisor, preserving the legacy CLI output."""
+    pid_path = _supervise_pid_file(cfg, node)
+    try:
+        with open(pid_path, "r", encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        print(f"a2acast supervise: no running loop found for node '{node}'")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        print(f"a2acast supervise: could not signal process {pid}: {exc}")
+    else:
+        print(f"a2acast supervise: sent SIGTERM to {pid}")
+    try:
+        os.unlink(pid_path)
+    except OSError:
+        pass
+
+
+def _configured_worker(pool, backend):
+    if not isinstance(pool, dict):
+        sys.exit("error: worker pool configuration must be an object")
+    workers = pool.get("workers")
+    if not isinstance(workers, dict):
+        sys.exit("error: worker pool configuration has no valid workers")
+    worker = workers.get(backend)
+    if not isinstance(worker, dict):
+        sys.exit(f"error: backend '{backend}' is not configured")
+    node = worker.get("node")
+    if (not isinstance(node, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node)
+            is None
+            or node == BROADCAST):
+        sys.exit(f"error: backend '{backend}' has no valid node")
+    return worker, node
+
+
+def _run_worker_supervisor(args):
+    """Run one configured worker without consuming another node's tasks."""
+    backend = getattr(args, "backend", None)
+    if backend not in {"codex", "copilot", "goose"}:
+        sys.exit(f"error: invalid backend '{backend}'")
+    interval = getattr(args, "interval", None)
+    if (not isinstance(interval, int) or isinstance(interval, bool)
+            or interval < 0):
+        sys.exit("error: --interval must be >= 0")
+
+    cfg = load_config()
+    pool = load_pool_config(cfg)
+    _worker, configured_node = _configured_worker(pool, backend)
+    requested_node = getattr(args, "as_node", None)
+    if requested_node is not None and requested_node != configured_node:
+        sys.exit(
+            f"error: --as '{requested_node}' does not match configured "
+            f"node '{configured_node}' for backend '{backend}'")
+    me = my_node(cfg, configured_node)
+    if me != configured_node:
+        sys.exit(
+            f"error: configured worker node '{configured_node}' could not "
+            "be selected")
+
+    if getattr(args, "stop", False):
+        return _stop_supervisor(cfg, me)
+
+    lock = _acquire_supervise_lock(cfg, me)
+    if not lock:
+        print(
+            f"a2acast worker: another supervisor owns node '{me}'",
+            file=sys.stderr)
+        return
+
+    pid_path = _supervise_pid_file(cfg, me)
+    pid_owned = False
+    receiver = None
+    initial_config = os.path.realpath(
+        cfg.get("_path") or os.path.join(cfg["_dir"], CONFIG_NAME))
+    try:
+        _write_text_secure(pid_path, str(os.getpid()) + "\n")
+        pid_owned = True
+        signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))
+
+        # Recovery must make durable execution decisions before a receiver
+        # can add new work or the poll loop can claim anything.
+        _recover_worker_tasks(cfg, pool, me, backend)
+        receiver = MeshMCPServer(cfg, me)
+        threading.Thread(
+            target=receiver.watch_loop, daemon=True).start()
+
+        while True:
+            cfg = load_config()
+            current_config = os.path.realpath(
+                cfg.get("_path") or os.path.join(cfg["_dir"], CONFIG_NAME))
+            if current_config != initial_config:
+                sys.exit(
+                    "error: worker mesh configuration path changed; "
+                    "restart the supervisor")
+            pool = load_pool_config(cfg)
+            _worker, current_node = _configured_worker(pool, backend)
+            if current_node != me:
+                sys.exit(
+                    f"error: configured node for backend '{backend}' "
+                    "changed; restart the supervisor")
+
+            for task_id, task in _supervise_pending(
+                    cfg, me, allow_legacy=False):
+                # Operational failures are represented by the worker runner's
+                # durable result/False contract.  Keep processing this pass;
+                # unexpected and systemic exceptions (including
+                # TaskLedgerBusy) remain visible to the process owner.
+                _run_worker_task(
+                    cfg, pool, me, backend, task_id, task)
+
+            for task_id, task in load_tasks(cfg).items():
+                if (isinstance(task, dict)
+                        and task.get("direction") == "inbound"
+                        and task.get("local_node") == me
+                        and task.get("state") == "reply_pending"):
+                    # Delivery is retry-only. _retry_worker_reply validates
+                    # the durable journal and never invokes the backend.
+                    _retry_worker_reply(cfg, me, task_id, task)
+            if getattr(args, "once", False):
+                return
+            time.sleep(interval)
+    finally:
+        if receiver is not None:
+            receiver._stop.set()
+        if pid_owned:
+            try:
+                os.unlink(pid_path)
+            except OSError:
+                pass
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def cmd_worker_supervise(args):
+    return _run_worker_supervisor(args)
 
 
 def cmd_codex_allow(args):
@@ -6298,6 +6439,21 @@ def main():
                    help="signal a running codex-supervise loop to stop")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_codex_supervise)
+
+    p = sub.add_parser(
+        "worker-supervise",
+        help="run one configured isolated worker backend")
+    p.add_argument(
+        "--backend", required=True,
+        choices=["codex", "copilot", "goose"])
+    p.add_argument("--interval", type=int, default=5,
+                   help="seconds between polls (default 5)")
+    p.add_argument("--once", action="store_true",
+                   help="process one pass of pending tasks and exit")
+    p.add_argument("--stop", action="store_true",
+                   help="signal this configured worker loop to stop")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_worker_supervise)
 
     p = sub.add_parser("codex-allow",
                        help="curate the exec-allowlist gating Codex "

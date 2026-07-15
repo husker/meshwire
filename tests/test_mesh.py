@@ -7895,6 +7895,247 @@ class SuperviseRunTests(unittest.TestCase):
         self.assertNotIn("t1", mesh._load_handled(self.cfg, "me"))
 
 
+class WorkerSuperviseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+        self.cfg["nodes"] = [
+            "coordinator", "worker-copilot", "worker-goose",
+        ]
+        self.cfg["exec_allow"] = ["coordinator"]
+        mesh._save_config(self.cfg)
+        self.pool = {
+            "workers": {
+                "copilot": {"node": "worker-copilot"},
+                "goose": {"node": "worker-goose"},
+            }
+        }
+
+    @staticmethod
+    def _args(**overrides):
+        values = {
+            "backend": "copilot", "as_node": "worker-copilot",
+            "interval": 0, "once": True, "stop": False,
+            "log_path": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_cli_parses_worker_supervise(self):
+        called = []
+        with mock.patch.object(
+                mesh, "cmd_worker_supervise", called.append,
+                create=True), mock.patch.object(sys, "argv", [
+                    "mesh", "worker-supervise", "--backend", "copilot",
+                    "--as", "worker-copilot", "--once"]):
+            mesh.main()
+        self.assertEqual(called[0].backend, "copilot")
+        self.assertEqual(called[0].as_node, "worker-copilot")
+        self.assertTrue(called[0].once)
+
+    def test_worker_loop_passes_strict_recipient_mode_and_reloads_config(self):
+        lock = os.path.join(self.tmp.name, "worker.lock")
+        with open(lock, "w", encoding="utf-8") as handle:
+            handle.write("owned")
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg) as load_cfg, \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True) as load_pool, \
+             mock.patch.object(
+                 mesh, "_acquire_supervise_lock", return_value=lock), \
+             mock.patch.object(
+                 mesh, "_supervise_pending", return_value=[]) as pending, \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(mesh, "_write_text_secure") as write_pid, \
+             mock.patch.object(mesh, "MeshMCPServer"), \
+             mock.patch.object(mesh.threading, "Thread"), \
+             mock.patch.object(mesh.signal, "signal"):
+            mesh.cmd_worker_supervise(self._args())
+        pending.assert_called_once()
+        self.assertIs(pending.call_args.kwargs["allow_legacy"], False)
+        self.assertEqual(load_cfg.call_count, 2)
+        self.assertEqual(load_pool.call_count, 2)
+        write_pid.assert_called_once_with(
+            mesh._supervise_pid_file(self.cfg, "worker-copilot"),
+            str(os.getpid()) + "\n")
+
+    def test_once_processes_only_tasks_and_replies_for_worker_identity(self):
+        for task_id, local_node, state in (
+                ("mine-a", "worker-copilot", "submitted"),
+                ("mine-b", "worker-copilot", "submitted"),
+                ("other", "worker-goose", "submitted"),
+                ("mine-reply", "worker-copilot", "reply_pending"),
+                ("other-reply", "worker-goose", "reply_pending"),
+                ("durable", "worker-copilot", "completed")):
+            mesh.save_task(
+                self.cfg, task_id, direction="inbound", state=state,
+                peer="coordinator", local_node=local_node,
+                text="A2ACAST_JOB_V1\n{}")
+        mesh.save_task(
+            self.cfg, "legacy", direction="inbound", state="submitted",
+            peer="coordinator", text="A2ACAST_JOB_V1\n{}")
+
+        lock = os.path.join(self.tmp.name, "worker.lock")
+        with open(lock, "w", encoding="utf-8") as handle:
+            handle.write("owned")
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True), \
+             mock.patch.object(
+                 mesh, "_acquire_supervise_lock", return_value=lock), \
+             mock.patch.object(mesh, "MeshMCPServer"), \
+             mock.patch.object(mesh.threading, "Thread"), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(
+                 mesh, "_run_worker_task",
+                 side_effect=[False, True]) as run, \
+             mock.patch.object(mesh, "_retry_worker_reply") as retry, \
+             mock.patch.object(mesh.signal, "signal"):
+            mesh.cmd_worker_supervise(self._args())
+
+        self.assertEqual(
+            [call.args[-2] for call in run.call_args_list],
+            ["mine-a", "mine-b"])
+        self.assertEqual(
+            [call.args[2] for call in retry.call_args_list],
+            ["mine-reply"])
+
+    def test_recovery_precedes_receiver_thread_and_processing(self):
+        events = []
+        receiver = mock.Mock()
+
+        def make_receiver(cfg, node):
+            self.assertIs(cfg, self.cfg)
+            self.assertEqual(node, "worker-copilot")
+            events.append("receiver")
+            return receiver
+
+        thread = mock.Mock()
+        thread.start.side_effect = lambda: events.append("thread")
+        lock = os.path.join(self.tmp.name, "worker.lock")
+        with open(lock, "w", encoding="utf-8") as handle:
+            handle.write("owned")
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True), \
+             mock.patch.object(
+                 mesh, "_acquire_supervise_lock", return_value=lock), \
+             mock.patch.object(
+                 mesh, "_recover_worker_tasks",
+                 side_effect=lambda *_args: events.append("recovery")) as recover, \
+             mock.patch.object(
+                 mesh, "MeshMCPServer", side_effect=make_receiver), \
+             mock.patch.object(
+                 mesh.threading, "Thread", return_value=thread) as thread_cls, \
+             mock.patch.object(
+                 mesh, "_supervise_pending",
+                 side_effect=lambda *_args, **_kwargs:
+                 events.append("pending") or []), \
+             mock.patch.object(mesh.signal, "signal"):
+            mesh.cmd_worker_supervise(self._args())
+
+        self.assertEqual(events, ["recovery", "receiver", "thread", "pending"])
+        recover.assert_called_once_with(
+            self.cfg, self.pool, "worker-copilot", "copilot")
+        self.assertEqual(thread_cls.call_args.kwargs["target"],
+                         receiver.watch_loop)
+        self.assertIs(thread_cls.call_args.kwargs["daemon"], True)
+        receiver._stop.set.assert_called_once_with()
+
+    def test_configured_worker_node_is_authoritative(self):
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True), \
+             mock.patch.object(mesh, "my_node") as resolve:
+            with self.assertRaisesRegex(
+                    SystemExit, "does not match configured node"):
+                mesh.cmd_worker_supervise(
+                    self._args(as_node="worker-goose"))
+        resolve.assert_not_called()
+
+    def test_rejects_invalid_backend_pool_and_node_cleanly(self):
+        cases = [
+            (self._args(backend="llama"), self.pool, "invalid backend"),
+            (self._args(), [], "pool configuration"),
+            (self._args(), {"workers": {}}, "is not configured"),
+            (self._args(), {"workers": {"copilot": {}}},
+             "has no valid node"),
+            (self._args(), {
+                "workers": {"copilot": {"node": "../worker"}}},
+             "has no valid node"),
+        ]
+        for args, pool, message in cases:
+            with self.subTest(message=message), \
+                 mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                 mock.patch.object(
+                     mesh, "load_pool_config", return_value=pool,
+                     create=True):
+                with self.assertRaisesRegex(SystemExit, message):
+                    mesh.cmd_worker_supervise(args)
+
+    def test_rejects_negative_interval_before_startup(self):
+        with mock.patch.object(mesh, "load_config") as load_cfg:
+            with self.assertRaisesRegex(SystemExit, "interval must be >= 0"):
+                mesh.cmd_worker_supervise(self._args(interval=-1))
+        load_cfg.assert_not_called()
+
+    def test_missing_pool_loader_exits_cleanly(self):
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg):
+            with self.assertRaisesRegex(SystemExit, "pool configuration"):
+                mesh.cmd_worker_supervise(self._args())
+
+    def test_stop_signals_authoritative_worker_and_preserves_legacy_behavior(self):
+        pid_path = mesh._supervise_pid_file(self.cfg, "worker-copilot")
+        with open(pid_path, "w", encoding="utf-8") as handle:
+            handle.write("4242\n")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True), \
+             mock.patch.object(mesh.os, "kill") as kill, \
+             mock.patch.object(mesh, "_acquire_supervise_lock") as acquire:
+            mesh.cmd_worker_supervise(self._args(stop=True, once=False))
+        kill.assert_called_once_with(4242, mesh.signal.SIGTERM)
+        acquire.assert_not_called()
+        self.assertFalse(os.path.exists(pid_path))
+
+    def test_task_ledger_busy_is_not_swallowed_and_cleanup_is_owned(self):
+        lock = os.path.join(self.tmp.name, "worker.lock")
+        unrelated = os.path.join(self.tmp.name, "unrelated")
+        for path in (lock, unrelated):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("keep" if path == unrelated else "owned")
+        receiver = mock.Mock()
+        with mock.patch.object(
+                mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(
+                 mesh, "load_pool_config", return_value=self.pool,
+                 create=True), \
+             mock.patch.object(
+                 mesh, "_acquire_supervise_lock", return_value=lock), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(mesh, "MeshMCPServer", return_value=receiver), \
+             mock.patch.object(mesh.threading, "Thread"), \
+             mock.patch.object(
+                 mesh, "_supervise_pending",
+                 side_effect=mesh.TaskLedgerBusy("busy")), \
+             mock.patch.object(mesh.signal, "signal"):
+            with self.assertRaises(mesh.TaskLedgerBusy):
+                mesh.cmd_worker_supervise(self._args())
+        receiver._stop.set.assert_called_once_with()
+        self.assertFalse(os.path.exists(lock))
+        self.assertFalse(os.path.exists(
+            mesh._supervise_pid_file(self.cfg, "worker-copilot")))
+        self.assertTrue(os.path.exists(unrelated))
+
+
 class SuperviseLoopTests(unittest.TestCase):
     """cmd_codex_supervise tests run chdir'd into a temp dir (find_config
     walks up from cwd) so load_config() works, mirroring CodexSetupTests /
