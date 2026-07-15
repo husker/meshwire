@@ -56,6 +56,13 @@ SUPERVISE_EXEC_TIMEOUT = 600
 SUPERVISE_OWNER_VERSION = 1
 SUPERVISE_METADATA_MAX_BYTES = 4096
 SUPERVISE_RECEIVER_JOIN_TIMEOUT = 5
+POOL_CONFIG_NAME = ".meshwire.pool.json"
+POOL_CONFIG_MAX_BYTES = 64 * 1024
+WORKER_HEALTH_MAX_BYTES = 16 * 1024
+WORKER_STATES = frozenset({
+    "idle", "busy", "cooldown", "unavailable",
+})
+WORKER_BACKENDS = frozenset({"codex", "copilot", "goose"})
 
 
 def activity_file(cfg, node):
@@ -389,25 +396,213 @@ def load_config():
     if not p:
         sys.exit(f"error: no {CONFIG_NAME} found here or in any parent "
                  f"directory. Run `mesh init` first.")
-    with open(p, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    try:
+        cfg = _load_json_regular(
+            p, require_private=False, max_bytes=POOL_CONFIG_MAX_BYTES)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
+            WorkerEvidenceUnsupported) as exc:
+        sys.exit(
+            "error: mesh configuration is not a trusted regular file: "
+            f"{exc}")
+    if not isinstance(cfg, dict):
+        sys.exit("error: mesh configuration must be a JSON object")
     cfg["_path"] = p
     cfg["_dir"] = os.path.dirname(p)
     return cfg
 
 
-def load_pool_config(cfg=None):
-    """Fail closed until Task 7 installs validated pool configuration.
+def pool_config_file(cfg):
+    return os.path.join(cfg["_dir"], POOL_CONFIG_NAME)
 
-    The generic supervisor is user-invokable in this task, so leaving the
-    future Task 7 helper undefined would turn a normal CLI invocation into a
-    NameError.  Tests can inject a validated pool directly; production use
-    remains disabled until the real loader and ``pool-setup`` land.
-    """
-    del cfg
-    sys.exit(
-        "error: worker pool configuration is not available yet; "
-        "install pool configuration support and run `mesh pool-setup`")
+
+def _valid_pool_node(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value)
+        is not None
+        and value != BROADCAST
+        and not _worker_metadata_has_controls(value)
+    )
+
+
+def _valid_pool_text(value, limit=1024):
+    if (not isinstance(value, str) or not value
+            or value != value.strip()
+            or _worker_metadata_has_controls(value)):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= limit
+    except UnicodeEncodeError:
+        return False
+
+
+def _contains_config_secret(cfg, value):
+    secret = cfg.get("key") if isinstance(cfg, dict) else None
+    if not isinstance(secret, str) or not secret:
+        return False
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, dict):
+        return any(
+            _contains_config_secret(cfg, key)
+            or _contains_config_secret(cfg, item)
+            for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_config_secret(cfg, item) for item in value)
+    return False
+
+
+def _canonical_pool_directory(value, must_exist):
+    if not _valid_pool_text(value, WORKER_PATH_MAX):
+        raise ValueError("pool directory path is invalid")
+    expanded = os.path.expanduser(value)
+    absolute = os.path.abspath(expanded)
+    canonical = os.path.realpath(absolute)
+    if not _valid_pool_text(canonical, WORKER_PATH_MAX):
+        raise ValueError("canonical pool directory path is invalid")
+    if must_exist:
+        try:
+            observed = os.lstat(canonical)
+        except OSError as exc:
+            raise ValueError("workspace root does not exist") from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ValueError("workspace root is not a real directory")
+    elif os.path.lexists(canonical):
+        try:
+            observed = os.lstat(canonical)
+        except OSError as exc:
+            raise ValueError("worktree root cannot be inspected") from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ValueError("worktree root is not a real directory")
+    else:
+        ancestor = canonical
+        while not os.path.lexists(ancestor):
+            parent = os.path.dirname(ancestor)
+            if parent == ancestor:
+                break
+            ancestor = parent
+        try:
+            observed = os.lstat(ancestor)
+        except OSError as exc:
+            raise ValueError("worktree root has no trusted parent") from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ValueError("worktree root parent is not a real directory")
+    return canonical
+
+
+def _pool_paths_overlap(left, right):
+    try:
+        common = os.path.commonpath((left, right))
+    except (TypeError, ValueError):
+        return True
+    return common in {left, right}
+
+
+def _validate_pool_config(cfg, pool):
+    if not isinstance(pool, dict):
+        raise ValueError("worker pool configuration must be an object")
+    top_fields = {
+        "version", "mesh_config", "coordinator", "workspace_roots",
+        "worktree_root", "workers", "routing",
+    }
+    if set(pool) != top_fields:
+        raise ValueError("worker pool configuration fields are invalid")
+    if (not isinstance(pool["version"], int)
+            or isinstance(pool["version"], bool)
+            or pool["version"] != 1):
+        raise ValueError("unsupported worker pool configuration")
+    if _contains_config_secret(cfg, pool):
+        raise ValueError("worker pool must not contain the mesh shared key")
+
+    config_path = cfg.get("_path")
+    if not _valid_pool_text(config_path, WORKER_PATH_MAX):
+        raise ValueError("mesh config binding is invalid")
+    config_path = os.path.abspath(config_path)
+    canonical_config = os.path.realpath(config_path)
+    try:
+        config_fd = _open_regular_readonly(config_path)
+    except (OSError, TypeError, ValueError, WorkerEvidenceUnsupported) as exc:
+        raise ValueError("mesh config binding is not trusted") from exc
+    else:
+        os.close(config_fd)
+    if pool["mesh_config"] != canonical_config:
+        raise ValueError("worker pool is bound to another mesh config")
+
+    coordinator = pool["coordinator"]
+    if not _valid_pool_node(coordinator):
+        raise ValueError("worker pool coordinator is invalid")
+
+    roots = pool["workspace_roots"]
+    if not isinstance(roots, list) or not roots:
+        raise ValueError("workspace roots must be a non-empty list")
+    canonical_roots = []
+    for root in roots:
+        canonical = _canonical_pool_directory(root, must_exist=True)
+        if root != canonical:
+            raise ValueError("workspace root is not canonical")
+        canonical_roots.append(canonical)
+    if canonical_roots != sorted(set(canonical_roots)):
+        raise ValueError("workspace roots must be unique and sorted")
+
+    worktree_root = _canonical_pool_directory(
+        pool["worktree_root"], must_exist=False)
+    if pool["worktree_root"] != worktree_root:
+        raise ValueError("worktree root is not canonical")
+    if any(_pool_paths_overlap(root, worktree_root)
+           for root in canonical_roots):
+        raise ValueError("worktree root must be separate from workspaces")
+
+    workers = pool["workers"]
+    if not isinstance(workers, dict) or set(workers) != WORKER_BACKENDS:
+        raise ValueError("worker pool backends are invalid")
+    worker_nodes = []
+    for backend in ("codex", "copilot", "goose"):
+        worker = workers[backend]
+        required = ({"node"} if backend != "goose" else {
+            "node", "provider", "model", "ollama_host",
+        })
+        if not isinstance(worker, dict) or set(worker) != required:
+            raise ValueError(f"worker backend '{backend}' is invalid")
+        if not _valid_pool_node(worker["node"]):
+            raise ValueError(f"worker backend '{backend}' node is invalid")
+        worker_nodes.append(worker["node"])
+    if (len(set(worker_nodes)) != len(worker_nodes)
+            or coordinator in worker_nodes):
+        raise ValueError(
+            "worker nodes must be unique and distinct from coordinator")
+    goose = workers["goose"]
+    if (goose["provider"] != "ollama"
+            or not _valid_pool_text(goose["model"])
+            or goose["ollama_host"] != "http://127.0.0.1:11434"):
+        raise ValueError("goose backend configuration is invalid")
+
+    routing = pool["routing"]
+    if (not isinstance(routing, list)
+            or len(routing) != len(WORKER_BACKENDS)
+            or set(routing) != WORKER_BACKENDS
+            or any(not isinstance(item, str) for item in routing)):
+        raise ValueError("worker pool routing is invalid")
+    return pool
+
+
+def load_pool_config(cfg=None):
+    cfg = load_config() if cfg is None else cfg
+    try:
+        pool = _load_json_regular(
+            pool_config_file(cfg), require_private=True,
+            max_bytes=POOL_CONFIG_MAX_BYTES)
+        return _validate_pool_config(cfg, pool)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
+            WorkerEvidenceUnsupported) as exc:
+        raise ValueError(
+            "worker pool configuration is unavailable; "
+            "run mesh pool-setup") from exc
+
+
+def _write_pool_config(cfg, pool):
+    _validate_pool_config(cfg, pool)
+    _write_json_secure(pool_config_file(cfg), pool, indent=1)
+    return pool
 
 
 def node_file(cfg, harness=None):
@@ -634,12 +829,17 @@ def _mutate_config(cfg, apply):
     """
     path = cfg.get("_path") or CONFIG_NAME
     lock = _acquire_config_lock(cfg)
+    if lock is None:
+        raise RuntimeError("config lock is unavailable")
     try:
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                latest = json.load(f)
-        except (OSError, ValueError):
+            latest = _load_json_regular(
+                path, require_private=False,
+                max_bytes=POOL_CONFIG_MAX_BYTES)
+        except FileNotFoundError:
             latest = {k: v for k, v in cfg.items() if not k.startswith("_")}
+        if not isinstance(latest, dict):
+            raise ValueError("mesh configuration must be an object")
         apply(latest)
         _write_json_secure(
             path, {k: v for k, v in latest.items()
@@ -1645,6 +1845,79 @@ def _worker_node_token(node):
     return hashlib.sha256(encoded).hexdigest()[:12]
 
 
+def _worker_health_file(cfg, node):
+    return os.path.join(
+        cfg["_dir"],
+        f".meshwire.worker-health.{_worker_node_token(node)}.json")
+
+
+def _validate_worker_health(cfg, node, value):
+    required = {
+        "node", "state", "updated", "backend", "task_id", "error",
+        "cooldown_until",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("worker health fields are invalid")
+    if _contains_config_secret(cfg, value):
+        raise ValueError("worker health must not contain the mesh shared key")
+    if not _valid_pool_node(node) or value["node"] != node:
+        raise ValueError("worker health node binding is invalid")
+    if (not isinstance(value["state"], str)
+            or value["state"] not in WORKER_STATES):
+        raise ValueError("worker health state is invalid")
+    if (not isinstance(value["updated"], int)
+            or isinstance(value["updated"], bool)
+            or not 0 <= value["updated"] <= MAX_RELAY_TIME):
+        raise ValueError("worker health timestamp is invalid")
+    if (not isinstance(value["backend"], str)
+            or value["backend"] not in WORKER_BACKENDS):
+        raise ValueError("worker health backend is invalid")
+    if (value["task_id"] != ""
+            and not _valid_task_id(value["task_id"])):
+        raise ValueError("worker health task id is invalid")
+    error = value["error"]
+    if (not isinstance(error, str)
+            or _worker_metadata_has_controls(error)
+            or len(error.encode("utf-8")) > 8192):
+        raise ValueError("worker health error is invalid")
+    cooldown = value["cooldown_until"]
+    if (not isinstance(cooldown, int) or isinstance(cooldown, bool)
+            or not 0 <= cooldown <= MAX_RELAY_TIME):
+        raise ValueError("worker health cooldown is invalid")
+    return dict(value)
+
+
+def _write_worker_health(cfg, node, state, **fields):
+    allowed = {"backend", "task_id", "error", "cooldown_until"}
+    if set(fields) - allowed:
+        raise ValueError("worker health fields are invalid")
+    value = {
+        "node": node,
+        "state": state,
+        "updated": int(time.time()),
+        "backend": fields.get("backend"),
+        "task_id": fields.get("task_id", ""),
+        "error": fields.get("error", ""),
+        "cooldown_until": fields.get("cooldown_until", 0),
+    }
+    value = _validate_worker_health(cfg, node, value)
+    _write_json_secure(_worker_health_file(cfg, node), value, indent=1)
+    return value
+
+
+def _read_worker_health(cfg, node):
+    if not _valid_pool_node(node):
+        return {}
+    try:
+        value = _load_json_regular(
+            _worker_health_file(cfg, node), require_private=True,
+            max_bytes=WORKER_HEALTH_MAX_BYTES)
+        return _validate_worker_health(cfg, node, value)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError,
+            WorkerEvidenceUnsupported):
+        return {}
+
+
 def _worker_journal_file(cfg, node, task_id):
     return os.path.join(
         cfg["_dir"],
@@ -1660,7 +1933,7 @@ def _write_worker_journal(cfg, node, task_id, value):
         _worker_journal_file(cfg, node, task_id), value, indent=1)
 
 
-def _validate_private_worker_stat(observed):
+def _validate_regular_stat(observed, require_private):
     if not stat.S_ISREG(observed.st_mode):
         raise OSError("worker state is not a regular file")
     device = getattr(observed, "st_dev", 0)
@@ -1676,15 +1949,20 @@ def _validate_private_worker_stat(observed):
         if (not hasattr(os, "geteuid")
                 or observed.st_uid != os.geteuid()):
             raise OSError("worker state is not owned by the current user")
-        if stat.S_IMODE(observed.st_mode) != 0o600:
+        if (require_private
+                and stat.S_IMODE(observed.st_mode) != 0o600):
             raise OSError("worker state is not private mode 0600")
     return device, inode
 
 
-def _open_regular_readonly(path):
+def _validate_private_worker_stat(observed):
+    return _validate_regular_stat(observed, require_private=True)
+
+
+def _open_regular_readonly(path, require_private=True):
     """Open private worker state with stable no-follow identity checks."""
     before = os.lstat(path)
-    identity = _validate_private_worker_stat(before)
+    identity = _validate_regular_stat(before, require_private)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not isinstance(nofollow, int) or not nofollow:
         raise WorkerEvidenceUnsupported(
@@ -1692,12 +1970,26 @@ def _open_regular_readonly(path):
     fd = os.open(path, os.O_RDONLY | nofollow)
     try:
         after = os.fstat(fd)
-        if _validate_private_worker_stat(after) != identity:
+        if _validate_regular_stat(after, require_private) != identity:
             raise OSError("worker state changed while opening")
         return fd
     except BaseException:
         os.close(fd)
         raise
+
+
+def _load_json_regular(path, require_private=True, max_bytes=None):
+    """Read bounded JSON from a stable, same-owner, no-follow regular file."""
+    fd = _open_regular_readonly(path, require_private=require_private)
+    try:
+        if max_bytes is not None and os.fstat(fd).st_size > max_bytes:
+            raise ValueError("JSON file is too large")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            return json.load(handle)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _preflight_worker_evidence(cfg):
@@ -6338,6 +6630,94 @@ def _stop_supervisor(cfg, node):
             os.close(pid_fd)
 
 
+def _unpublish_pool_config(cfg):
+    """Remove any prior published pool without following its file type."""
+    path = pool_config_file(cfg)
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(observed.st_mode):
+        raise ValueError("worker pool path is a directory")
+    os.unlink(path)
+
+
+def cmd_pool_setup(args):
+    cfg = load_config()
+    try:
+        raw_roots = getattr(args, "workspace_root", None)
+        if not isinstance(raw_roots, list) or not raw_roots:
+            raise ValueError("at least one workspace root is required")
+        roots = sorted(set(
+            _canonical_pool_directory(root, must_exist=True)
+            for root in raw_roots
+        ))
+        coordinator = getattr(args, "coordinator", None)
+        model = getattr(args, "model", None)
+        if not _valid_pool_node(coordinator):
+            raise ValueError("coordinator node is invalid")
+        if not _valid_pool_text(model):
+            raise ValueError("goose model is invalid")
+        base = _default_node_name(None)
+        if not _valid_pool_node(base):
+            raise ValueError("machine hostname cannot form worker nodes")
+        workers = {
+            "codex": {"node": f"{base}-worker-codex"},
+            "copilot": {"node": f"{base}-worker-copilot"},
+            "goose": {
+                "node": f"{base}-worker-ollama",
+                "provider": "ollama",
+                "model": model,
+                "ollama_host": "http://127.0.0.1:11434",
+            },
+        }
+        pool = {
+            "version": 1,
+            "mesh_config": os.path.realpath(
+                os.path.abspath(cfg["_path"])),
+            "coordinator": coordinator,
+            "workspace_roots": roots,
+            "worktree_root": _canonical_pool_directory(
+                "~/.cache/a2acast/worktrees", must_exist=False),
+            "workers": workers,
+            "routing": ["goose", "copilot", "codex"],
+        }
+        _validate_pool_config(cfg, pool)
+    except (OSError, TypeError, ValueError, UnicodeError) as exc:
+        sys.exit(f"error: invalid worker pool configuration: {exc}")
+
+    # Invalidate any old pool before changing trust. A failure from this point
+    # can leave a coordinator-only mesh config, but never a stale usable pool.
+    _unpublish_pool_config(cfg)
+
+    def apply(latest):
+        latest["exec_allow"] = [coordinator]
+        roster = latest.setdefault("nodes", [])
+        if not isinstance(roster, list):
+            raise ValueError("mesh node roster must be a list")
+        worker_nodes = [worker["node"] for worker in workers.values()]
+        worker_node_set = set(worker_nodes)
+        seen_workers = set()
+        deduplicated = []
+        for node in roster:
+            if node in worker_node_set:
+                if node in seen_workers:
+                    continue
+                seen_workers.add(node)
+            deduplicated.append(node)
+        roster[:] = deduplicated
+        for node in worker_nodes:
+            if node not in seen_workers:
+                roster.append(node)
+
+    _mutate_config(cfg, apply)
+    _write_pool_config(cfg, pool)
+    print(f"configured worker pool for {', '.join(roots)}")
+    print(
+        "security: exec_allow trusts the coordinator name inside a "
+        "shared-key trust domain; it is not per-node cryptographic proof")
+
+
 def _configured_worker(pool, backend):
     if not isinstance(pool, dict):
         sys.exit("error: worker pool configuration must be an object")
@@ -6348,23 +6728,17 @@ def _configured_worker(pool, backend):
     if not isinstance(worker, dict):
         sys.exit(f"error: backend '{backend}' is not configured")
     node = worker.get("node")
-    valid_node = lambda value: (
-        isinstance(value, str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value)
-        is not None
-        and value != BROADCAST
-    )
-    if not valid_node(node):
+    if not _valid_pool_node(node):
         sys.exit(f"error: backend '{backend}' has no valid node")
     coordinator = pool.get("coordinator")
     configured_nodes = []
-    identities_valid = valid_node(coordinator)
+    identities_valid = _valid_pool_node(coordinator)
     for configured in workers.values():
         if not isinstance(configured, dict):
             identities_valid = False
             continue
         configured_node = configured.get("node")
-        if not valid_node(configured_node):
+        if not _valid_pool_node(configured_node):
             identities_valid = False
             continue
         configured_nodes.append(configured_node)
@@ -6378,10 +6752,43 @@ def _configured_worker(pool, backend):
     return worker, node
 
 
+def _update_worker_health_after_task(
+        cfg, node, backend, task_id, task_raised=False):
+    task = load_tasks(cfg).get(task_id) or {}
+    outcome = None
+    for field in ("pending_result", "result"):
+        encoded = task.get(field)
+        if not (isinstance(encoded, str)
+                and encoded.startswith(WORKER_RESULT_PREFIX)):
+            continue
+        try:
+            result = _parse_worker_result(encoded)
+        except (TypeError, ValueError):
+            continue
+        if result.get("backend") == backend:
+            outcome = result.get("outcome")
+            break
+    if outcome == "quota":
+        return _write_worker_health(
+            cfg, node, "cooldown", backend=backend, task_id=task_id,
+            error="quota", cooldown_until=int(time.time()) + 3600)
+    if outcome == "unavailable":
+        return _write_worker_health(
+            cfg, node, "unavailable", backend=backend, task_id=task_id,
+            error="backend unavailable", cooldown_until=0)
+    if task_raised:
+        return _write_worker_health(
+            cfg, node, "unavailable", backend=backend, task_id=task_id,
+            error="worker task raised", cooldown_until=0)
+    return _write_worker_health(
+        cfg, node, "idle", backend=backend, task_id="", error="",
+        cooldown_until=0)
+
+
 def _run_worker_supervisor(args):
     """Run one configured worker without consuming another node's tasks."""
     backend = getattr(args, "backend", None)
-    if backend not in {"codex", "copilot", "goose"}:
+    if backend not in WORKER_BACKENDS:
         sys.exit(f"error: invalid backend '{backend}'")
     interval = getattr(args, "interval", None)
     if (not isinstance(interval, int) or isinstance(interval, bool)
@@ -6389,7 +6796,10 @@ def _run_worker_supervisor(args):
         sys.exit("error: --interval must be >= 0")
 
     cfg = load_config()
-    pool = load_pool_config(cfg)
+    try:
+        pool = load_pool_config(cfg)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
     _worker, configured_node = _configured_worker(pool, backend)
     requested_node = getattr(args, "as_node", None)
     if requested_node is not None and requested_node != configured_node:
@@ -6425,6 +6835,9 @@ def _run_worker_supervisor(args):
         # Recovery makes durable execution decisions before a receiver can
         # add new work or the poll loop can claim anything.
         _recover_worker_tasks(cfg, pool, me, backend)
+        _write_worker_health(
+            cfg, me, "idle", backend=backend, task_id="", error="",
+            cooldown_until=0)
         if not getattr(args, "once", False):
             receiver = MeshMCPServer(cfg, me)
             receiver.mark_initialized()
@@ -6441,7 +6854,10 @@ def _run_worker_supervisor(args):
                 sys.exit(
                     "error: worker mesh configuration path changed; "
                     "restart the supervisor")
-            pool = load_pool_config(cfg)
+            try:
+                pool = load_pool_config(cfg)
+            except ValueError as exc:
+                sys.exit(f"error: {exc}")
             _worker, current_node = _configured_worker(pool, backend)
             if current_node != me:
                 sys.exit(
@@ -6454,8 +6870,24 @@ def _run_worker_supervisor(args):
                 # durable result/False contract.  Keep processing this pass;
                 # unexpected and systemic exceptions (including
                 # TaskLedgerBusy) remain visible to the process owner.
-                _run_worker_task(
-                    cfg, pool, me, backend, task_id, task)
+                _write_worker_health(
+                    cfg, me, "busy", backend=backend, task_id=task_id,
+                    error="", cooldown_until=0)
+                try:
+                    _run_worker_task(
+                        cfg, pool, me, backend, task_id, task)
+                except BaseException:
+                    # Health is advisory and must never replace the runner's
+                    # original systemic exception. Prefer a durable outcome
+                    # if the runner wrote one before raising.
+                    try:
+                        _update_worker_health_after_task(
+                            cfg, me, backend, task_id, task_raised=True)
+                    except BaseException:
+                        pass
+                    raise
+                _update_worker_health_after_task(
+                    cfg, me, backend, task_id)
 
             for task_id, task in load_tasks(cfg).items():
                 if (isinstance(task, dict)
@@ -6852,6 +7284,15 @@ def main():
                    help="signal a running codex-supervise loop to stop")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_codex_supervise)
+
+    p = sub.add_parser(
+        "pool-setup", help="configure isolated machine-wide AI workers")
+    p.add_argument(
+        "--workspace-root", action="append", required=True,
+        help="existing project root workers may access (repeatable)")
+    p.add_argument("--coordinator", required=True)
+    p.add_argument("--model", default="qwen3:4b")
+    p.set_defaults(fn=cmd_pool_setup)
 
     p = sub.add_parser(
         "worker-supervise",

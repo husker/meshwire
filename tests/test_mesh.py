@@ -8145,6 +8145,450 @@ class SupervisorOwnershipTests(unittest.TestCase):
         self.assertTrue(os.path.exists(lock.path))
 
 
+class PoolConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_cfg(self.tmp.name)
+        self.cfg["nodes"] = ["coordinator"]
+        self.cfg["exec_allow"] = ["legacy-peer"]
+        mesh._save_config(self.cfg)
+        self.workspace = os.path.join(self.tmp.name, "projects")
+        os.makedirs(self.workspace)
+        self.worktree_root = os.path.join(self.tmp.name, "worker-cache")
+        self.pool = {
+            "version": 1,
+            "mesh_config": os.path.realpath(self.cfg["_path"]),
+            "coordinator": "coordinator",
+            "workspace_roots": [os.path.realpath(self.workspace)],
+            "worktree_root": os.path.realpath(self.worktree_root),
+            "workers": {
+                "codex": {"node": "machine-worker-codex"},
+                "copilot": {"node": "machine-worker-copilot"},
+                "goose": {
+                    "node": "machine-worker-ollama",
+                    "provider": "ollama",
+                    "model": "qwen3:4b",
+                    "ollama_host": "http://127.0.0.1:11434",
+                },
+            },
+            "routing": ["goose", "copilot", "codex"],
+        }
+
+    def _setup_args(self, **overrides):
+        values = {
+            "workspace_root": [self.workspace],
+            "coordinator": "coordinator",
+            "model": "qwen3:4b",
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def _write_pool(self, value=None):
+        path = os.path.join(self.tmp.name, ".meshwire.pool.json")
+        mesh._write_json_secure(path, self.pool if value is None else value,
+                                indent=1)
+        return path
+
+    def test_cli_parses_pool_setup(self):
+        called = []
+        with mock.patch.object(mesh, "cmd_pool_setup", called.append,
+                               create=True), \
+             mock.patch.object(sys, "argv", [
+                 "mesh", "pool-setup", "--workspace-root", self.workspace,
+                 "--coordinator", "coordinator", "--model", "local:7b",
+             ]):
+            mesh.main()
+        self.assertEqual(called[0].workspace_root, [self.workspace])
+        self.assertEqual(called[0].coordinator, "coordinator")
+        self.assertEqual(called[0].model, "local:7b")
+
+    def test_pool_setup_writes_no_secret_and_trusts_only_coordinator(self):
+        self.cfg["nodes"].extend([
+            "machine-worker-codex", "machine-worker-codex",
+        ])
+        mesh._save_config(self.cfg)
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_setup(self._setup_args())
+
+        pool = mesh.load_pool_config(self.cfg)
+        self.assertNotIn(self.cfg["key"], json.dumps(pool))
+        self.assertEqual(pool["coordinator"], "coordinator")
+        self.assertEqual(pool["workspace_roots"], [
+            os.path.realpath(self.workspace)])
+        self.assertEqual(
+            pool["worktree_root"],
+            os.path.realpath(os.path.expanduser(
+                "~/.cache/a2acast/worktrees")))
+        with open(self.cfg["_path"], encoding="utf-8") as handle:
+            disk = json.load(handle)
+        self.assertEqual(disk["exec_allow"], ["coordinator"])
+        self.assertEqual(set(pool["workers"]),
+                         {"codex", "copilot", "goose"})
+        worker_nodes = [item["node"]
+                        for item in pool["workers"].values()]
+        self.assertEqual(len(set(worker_nodes)), 3)
+        self.assertEqual(disk["nodes"].count("machine-worker-codex"), 1)
+        self.assertEqual(disk["nodes"].count("machine-worker-copilot"), 1)
+        self.assertEqual(disk["nodes"].count("machine-worker-ollama"), 1)
+        self.assertEqual(stat.S_IMODE(os.stat(
+            mesh.pool_config_file(self.cfg)).st_mode), 0o600)
+
+    def test_pool_setup_preserves_latest_unrelated_config_and_orders_writes(self):
+        latest = dict(self.cfg)
+        latest["concurrent"] = {"keep": True}
+        mesh._save_config(latest)
+        events = []
+        mutate = mesh._mutate_config
+
+        def record_mutation(cfg, apply):
+            events.append("config")
+            return mutate(cfg, apply)
+
+        def record_pool(cfg, pool):
+            events.append("pool")
+            return mesh._write_json_secure(
+                os.path.join(cfg["_dir"], ".meshwire.pool.json"),
+                pool, indent=1)
+
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             mock.patch.object(mesh, "_mutate_config",
+                               side_effect=record_mutation), \
+             mock.patch.object(mesh, "_write_pool_config",
+                               side_effect=record_pool, create=True), \
+             contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_pool_setup(self._setup_args())
+
+        self.assertEqual(events, ["config", "pool"])
+        with open(self.cfg["_path"], encoding="utf-8") as handle:
+            disk = json.load(handle)
+        self.assertEqual(disk["concurrent"], {"keep": True})
+
+    def test_pool_setup_does_not_publish_when_config_mutation_fails(self):
+        self._write_pool()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             mock.patch.object(mesh, "_mutate_config",
+                               side_effect=RuntimeError("locked")), \
+             mock.patch.object(mesh, "_write_pool_config",
+                               create=True) as write_pool:
+            with self.assertRaisesRegex(RuntimeError, "locked"):
+                mesh.cmd_pool_setup(self._setup_args())
+        write_pool.assert_not_called()
+        with self.assertRaises(ValueError):
+            mesh.load_pool_config(self.cfg)
+
+    def test_pool_setup_write_failure_leaves_safe_config_and_no_old_pool(self):
+        self._write_pool()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             mock.patch.object(mesh, "_write_pool_config",
+                               side_effect=OSError("disk full"),
+                               create=True):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                mesh.cmd_pool_setup(self._setup_args())
+        with open(self.cfg["_path"], encoding="utf-8") as handle:
+            disk = json.load(handle)
+        self.assertEqual(disk["exec_allow"], ["coordinator"])
+        with self.assertRaises(ValueError):
+            mesh.load_pool_config(self.cfg)
+
+    def test_pool_setup_fails_closed_when_config_lock_is_unavailable(self):
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "_default_node_name",
+                               return_value="machine"), \
+             mock.patch.object(mesh, "_acquire_config_lock",
+                               return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "config lock"):
+                mesh.cmd_pool_setup(self._setup_args())
+        self.assertFalse(os.path.lexists(os.path.join(
+            self.tmp.name, ".meshwire.pool.json")))
+
+    def test_load_pool_config_validates_complete_schema(self):
+        self._write_pool()
+        self.assertEqual(mesh.load_pool_config(self.cfg), self.pool)
+
+        invalid = []
+        for missing in self.pool:
+            value = dict(self.pool)
+            value.pop(missing)
+            invalid.append(value)
+        invalid.extend([
+            {**self.pool, "extra": True},
+            {**self.pool, "version": True},
+            {**self.pool, "version": 2},
+            {**self.pool, "mesh_config": self.cfg["_path"] + ".other"},
+            {**self.pool, "coordinator": "all"},
+            {**self.pool, "coordinator": "bad\nnode"},
+            {**self.pool, "workspace_roots": []},
+            {**self.pool, "workspace_roots": [self.workspace + "/."]},
+            {**self.pool, "workspace_roots": [
+                os.path.join(self.tmp.name, "missing")]},
+            {**self.pool, "worktree_root": "relative/worktrees"},
+            {**self.pool, "worktree_root": self.workspace},
+            {**self.pool, "routing": ["goose", "copilot"]},
+            {**self.pool, "routing": ["goose", "goose", "codex"]},
+            {**self.pool, "routing": ["goose", "copilot", "other"]},
+            {**self.pool, "workers": {
+                **self.pool["workers"], "other": {"node": "worker-other"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "codex": {"node": "machine-worker-codex", "extra": 1}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "copilot": {"node": "all"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "copilot": {"node": "machine-worker-codex"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "copilot": {"node": "coordinator"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "goose": {**self.pool["workers"]["goose"],
+                            "provider": "openai"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "goose": {**self.pool["workers"]["goose"],
+                            "model": "bad\u200bmodel"}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "goose": {**self.pool["workers"]["goose"],
+                            "model": self.cfg["key"]}}},
+            {**self.pool, "workers": {
+                **self.pool["workers"],
+                "goose": {**self.pool["workers"]["goose"],
+                            "ollama_host": "http://example.com:11434"}}},
+        ])
+        for index, value in enumerate(invalid):
+            with self.subTest(index=index):
+                self._write_pool(value)
+                with self.assertRaises(ValueError):
+                    mesh.load_pool_config(self.cfg)
+
+    def test_pool_and_mesh_config_reads_reject_untrusted_file_types(self):
+        pool_path = self._write_pool()
+        pool_target = pool_path + ".target"
+        os.replace(pool_path, pool_target)
+        os.symlink(pool_target, pool_path)
+        with self.assertRaises(ValueError):
+            mesh.load_pool_config(self.cfg)
+        os.unlink(pool_path)
+        os.mkdir(pool_path)
+        with self.assertRaises(ValueError):
+            mesh.load_pool_config(self.cfg)
+
+        config_target = self.cfg["_path"]
+        config_link = config_target + ".link"
+        os.symlink(config_target, config_link)
+        old = os.environ.get("A2ACAST_CONFIG")
+        self.addCleanup(os.environ.pop, "A2ACAST_CONFIG", None)
+        if old is not None:
+            self.addCleanup(os.environ.__setitem__, "A2ACAST_CONFIG", old)
+        os.environ["A2ACAST_CONFIG"] = config_link
+        with self.assertRaisesRegex(SystemExit, "trusted regular file"):
+            mesh.load_config()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_pool_read_rejects_non_private_file(self):
+        path = self._write_pool()
+        os.chmod(path, 0o644)
+        with self.assertRaises(ValueError):
+            mesh.load_pool_config(self.cfg)
+
+    def test_pool_setup_rejects_unsafe_inputs_before_mutation(self):
+        cases = [
+            self._setup_args(coordinator="all"),
+            self._setup_args(coordinator="bad\nnode"),
+            self._setup_args(model="bad\u200bmodel"),
+            self._setup_args(workspace_root=[
+                os.path.join(self.tmp.name, "missing")]),
+        ]
+        for args in cases:
+            with self.subTest(args=args), \
+                 mock.patch.object(mesh, "load_config",
+                                   return_value=self.cfg), \
+                 mock.patch.object(mesh, "_default_node_name",
+                                   return_value="machine"), \
+                 mock.patch.object(mesh, "_mutate_config") as mutate:
+                with self.assertRaises(SystemExit):
+                    mesh.cmd_pool_setup(args)
+                mutate.assert_not_called()
+
+    def test_worker_health_round_trip_is_private_and_secret_free(self):
+        health = mesh._write_worker_health(
+            self.cfg, "machine-worker-ollama", "cooldown",
+            backend="goose", error="quota", cooldown_until=123)
+        loaded = mesh._read_worker_health(
+            self.cfg, "machine-worker-ollama")
+        self.assertEqual(loaded, health)
+        self.assertEqual(loaded["state"], "cooldown")
+        self.assertEqual(loaded["cooldown_until"], 123)
+        self.assertNotIn(self.cfg["key"], json.dumps(loaded))
+        path = mesh._worker_health_file(
+            self.cfg, "machine-worker-ollama")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_worker_health_rejects_invalid_writes_and_contents(self):
+        invalid_writes = [
+            ("all", "idle", {"backend": "goose"}),
+            ("bad/node", "idle", {"backend": "goose"}),
+            ("worker-goose", "unknown", {"backend": "goose"}),
+            ("worker-goose", [], {"backend": "goose"}),
+            ("worker-goose", "idle", {"backend": "other"}),
+            ("worker-goose", "idle", {"backend": []}),
+            ("worker-goose", "idle", {"backend": "goose",
+                                       "task_id": True}),
+            ("worker-goose", "idle", {"backend": "goose",
+                                       "cooldown_until": True}),
+            ("worker-goose", "idle", {"backend": "goose",
+                                       "error": "bad\nerror"}),
+            ("worker-goose", "idle", {"backend": "goose",
+                                       "error": "bad\ud800error"}),
+            ("worker-goose", "idle", {"backend": "goose",
+                                       "error": self.cfg["key"]}),
+            ("worker-goose", "idle", {"backend": "goose", "extra": 1}),
+        ]
+        for node, state, fields in invalid_writes:
+            with self.subTest(node=node, state=state, fields=fields):
+                with self.assertRaises(ValueError):
+                    mesh._write_worker_health(
+                        self.cfg, node, state, **fields)
+
+        valid = mesh._write_worker_health(
+            self.cfg, "worker-goose", "idle", backend="goose")
+        path = mesh._worker_health_file(self.cfg, "worker-goose")
+        invalid_records = [
+            {**valid, "node": "worker-other"},
+            {**valid, "unknown": True},
+            {key: value for key, value in valid.items() if key != "state"},
+            {**valid, "updated": True},
+            {**valid, "updated": -1},
+            {**valid, "updated": mesh.MAX_RELAY_TIME + 1},
+            {**valid, "task_id": "bad/task"},
+            {**valid, "backend": "other"},
+            {**valid, "error": "bad\u200berror"},
+            {**valid, "cooldown_until": -1},
+            {**valid, "cooldown_until": mesh.MAX_RELAY_TIME + 1},
+        ]
+        for index, record in enumerate(invalid_records):
+            with self.subTest(index=index):
+                mesh._write_json_secure(path, record, indent=1)
+                self.assertEqual(
+                    mesh._read_worker_health(self.cfg, "worker-goose"), {})
+
+    def test_worker_health_reads_reject_symlink_and_non_regular_files(self):
+        mesh._write_worker_health(
+            self.cfg, "worker-goose", "idle", backend="goose")
+        path = mesh._worker_health_file(self.cfg, "worker-goose")
+        target = path + ".target"
+        os.replace(path, target)
+        os.symlink(target, path)
+        self.assertEqual(
+            mesh._read_worker_health(self.cfg, "worker-goose"), {})
+        os.unlink(path)
+        os.mkdir(path)
+        self.assertEqual(
+            mesh._read_worker_health(self.cfg, "worker-goose"), {})
+
+    def test_worker_loop_records_idle_busy_and_result_health(self):
+        mesh.save_task(
+            self.cfg, "task-quota", direction="inbound", state="submitted",
+            peer="coordinator", local_node="machine-worker-copilot",
+            text="A2ACAST_JOB_V1\n{}",
+            pending_result=mesh._encode_worker_result(
+                mesh._empty_worker_result(
+                    "copilot", "quota", "quota exceeded")))
+        states = []
+        write_health = getattr(mesh, "_write_worker_health", None)
+
+        def record_health(*args, **kwargs):
+            value = write_health(*args, **kwargs)
+            states.append(value["state"])
+            return value
+
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(mesh, "_supervise_pending", return_value=[
+                 ("task-quota", mesh.load_tasks(self.cfg)["task-quota"])]), \
+             mock.patch.object(mesh, "_run_worker_task", return_value=True), \
+             mock.patch.object(mesh, "_write_worker_health",
+                               side_effect=record_health), \
+             mock.patch.object(mesh.signal, "signal"):
+            mesh.cmd_worker_supervise(argparse.Namespace(
+                backend="copilot", as_node="machine-worker-copilot",
+                interval=0, once=True, stop=False, log_path=None))
+
+        self.assertEqual(states, ["idle", "busy", "cooldown"])
+        health = mesh._read_worker_health(
+            self.cfg, "machine-worker-copilot")
+        self.assertEqual(health["error"], "quota")
+        self.assertGreater(health["cooldown_until"], health["updated"])
+
+    def test_worker_exception_preserves_error_and_records_unavailable(self):
+        task = {
+            "direction": "inbound", "state": "submitted",
+            "peer": "coordinator", "local_node": "machine-worker-copilot",
+            "text": "A2ACAST_JOB_V1\n{}",
+        }
+        boom = RuntimeError("backend exploded")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(mesh, "_supervise_pending",
+                               return_value=[("task-boom", task)]), \
+             mock.patch.object(mesh, "_run_worker_task", side_effect=boom), \
+             mock.patch.object(mesh.signal, "signal"):
+            with self.assertRaises(RuntimeError) as caught:
+                mesh.cmd_worker_supervise(argparse.Namespace(
+                    backend="copilot", as_node="machine-worker-copilot",
+                    interval=0, once=True, stop=False, log_path=None))
+        self.assertIs(caught.exception, boom)
+        health = mesh._read_worker_health(
+            self.cfg, "machine-worker-copilot")
+        self.assertEqual(health["state"], "unavailable")
+        self.assertEqual(health["task_id"], "task-boom")
+
+    def test_worker_exception_uses_valid_durable_quota_result(self):
+        task_id = "task-durable-quota"
+        mesh.save_task(
+            self.cfg, task_id, direction="inbound", state="reply_pending",
+            peer="coordinator", local_node="machine-worker-copilot",
+            text="A2ACAST_JOB_V1\n{}",
+            pending_result=mesh._encode_worker_result(
+                mesh._empty_worker_result(
+                    "copilot", "quota", "quota exceeded")))
+        task = dict(mesh.load_tasks(self.cfg)[task_id], state="submitted")
+        boom = RuntimeError("after durable write")
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_recover_worker_tasks"), \
+             mock.patch.object(mesh, "_supervise_pending",
+                               return_value=[(task_id, task)]), \
+             mock.patch.object(mesh, "_run_worker_task", side_effect=boom), \
+             mock.patch.object(mesh.signal, "signal"):
+            with self.assertRaises(RuntimeError) as caught:
+                mesh.cmd_worker_supervise(argparse.Namespace(
+                    backend="copilot", as_node="machine-worker-copilot",
+                    interval=0, once=True, stop=False, log_path=None))
+        self.assertIs(caught.exception, boom)
+        health = mesh._read_worker_health(
+            self.cfg, "machine-worker-copilot")
+        self.assertEqual(health["state"], "cooldown")
+        self.assertEqual(health["error"], "quota")
+
+
 class WorkerSuperviseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
