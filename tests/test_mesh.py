@@ -4645,6 +4645,96 @@ class RecipientScopedTaskTests(unittest.TestCase):
         task = mesh.load_tasks(self.cfg)["t1"]
         self.assertEqual(task["local_node"], "worker-copilot")
 
+    def test_request_collision_cannot_overwrite_active_inbound_task(self):
+        mesh.save_task(
+            self.cfg, "same-id", direction="inbound", state="working",
+            peer="coordinator", text="original job", contextId="original",
+            rpcId="rpc-original", local_node="worker-copilot")
+
+        collision = mesh._record_received_task(
+            self.cfg, "request", "same-id", "attacker-context",
+            "submitted", "attacker", "redirected job",
+            rpc_id="rpc-attacker", local_node="worker-copilot")
+
+        self.assertTrue(collision)
+        saved = mesh.load_tasks(self.cfg)["same-id"]
+        self.assertEqual(saved["state"], "working")
+        self.assertEqual(saved["peer"], "coordinator")
+        self.assertEqual(saved["text"], "original job")
+        self.assertEqual(saved["contextId"], "original")
+        self.assertEqual(saved["rpcId"], "rpc-original")
+        self.assertEqual(saved["local_node"], "worker-copilot")
+
+    def test_request_collision_is_dropped_from_delivery(self):
+        mesh.save_task(
+            self.cfg, "same-delivery-id", direction="inbound",
+            state="working", peer="coordinator", text="original job",
+            local_node="worker-copilot")
+        attacker = mesh.make_send_envelope(
+            "attacker", "worker-copilot", "redirected job",
+            task_id="same-delivery-id")
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            delivered = mesh._emit_message(
+                self.cfg, "worker-copilot", "attacker",
+                json.dumps(attacker), {"id": "relay-collision"},
+                recipient="worker-copilot")
+
+        self.assertFalse(delivered)
+        self.assertIn("task ID collision", errors.getvalue())
+
+    def test_request_collision_cannot_reset_reply_or_terminal_result(self):
+        for state in ("reply_pending", "completed"):
+            task_id = f"same-{state}"
+            mesh.save_task(
+                self.cfg, task_id, direction="inbound", state=state,
+                peer="coordinator", text="original job",
+                local_node="worker-copilot",
+                pending_result="durable" if state == "reply_pending" else None,
+                result="durable" if state == "completed" else None)
+
+            collision = mesh._record_received_task(
+                self.cfg, "request", task_id, "attacker-context",
+                "submitted", "attacker", "redirected job",
+                local_node="worker-copilot")
+
+            with self.subTest(state=state):
+                self.assertTrue(collision)
+                saved = mesh.load_tasks(self.cfg)[task_id]
+                self.assertEqual(saved["state"], state)
+                self.assertEqual(saved["peer"], "coordinator")
+                self.assertEqual(saved["text"], "original job")
+
+    def test_concurrent_request_collision_accepts_only_one_origin(self):
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def receive(peer):
+            barrier.wait()
+            collision = mesh._record_received_task(
+                self.cfg, "request", "racing-id", f"ctx-{peer}",
+                "submitted", peer, f"job-{peer}",
+                rpc_id=f"rpc-{peer}", local_node="worker-copilot")
+            outcomes.append((peer, collision))
+
+        threads = [
+            threading.Thread(target=receive, args=(peer,))
+            for peer in ("coordinator-a", "coordinator-b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        accepted = [peer for peer, collision in outcomes if not collision]
+        self.assertEqual(len(accepted), 1)
+        saved = mesh.load_tasks(self.cfg)["racing-id"]
+        winner = accepted[0]
+        self.assertEqual(saved["peer"], winner)
+        self.assertEqual(saved["text"], f"job-{winner}")
+        self.assertEqual(saved["contextId"], f"ctx-{winner}")
+        self.assertEqual(saved["rpcId"], f"rpc-{winner}")
+
     def test_strict_worker_selection_does_not_race_other_recipient(self):
         self.cfg["exec_allow"] = ["coordinator"]
         mesh.save_task(
@@ -5672,12 +5762,65 @@ class WorkerRunTests(unittest.TestCase):
             "local_node": "worker-copilot",
         }
 
+    def bound_journal(self, task_id, phase, task=None, backend="copilot",
+                      **fields):
+        task = self.task if task is None else task
+        value = {
+            "version": 1,
+            "node": "worker-copilot",
+            "task_id": task_id,
+            "backend": backend,
+            "origin_peer": task["peer"],
+            "local_node": task["local_node"],
+            "job_digest": hashlib.sha256(
+                task["text"].encode("utf-8")).hexdigest(),
+            "attempt": int(task.get("attempts", 0)) + 1,
+            "phase": phase,
+        }
+        value.update(fields)
+        return value
+
+    def durable_result(self, task_id, task=None, backend="copilot",
+                       outcome="completed", terminal_state="completed",
+                       output="original output"):
+        task = self.task if task is None else task
+        output_path = mesh._write_worker_output(
+            self.cfg, "worker-copilot", task_id, output)
+        result = {
+            "backend": backend,
+            "outcome": outcome,
+            "branch": "codex/a2acast-safe-copilot",
+            "commit": "a" * 40 if outcome == "completed" else "",
+            "changed_files": ["worker.txt"] if outcome == "completed" else [],
+            "summary": mesh._worker_result_summary(
+                output, output_path, fallback=outcome),
+            "verification": output,
+            "runtime_seconds": 1,
+            "worktree": "/tmp/preserved",
+        }
+        encoded = mesh._encode_worker_result(result)
+        journal = self.bound_journal(
+            task_id, "reply_pending", task=task, backend=backend,
+            output_path=output_path, worktree="/tmp/preserved",
+            result=encoded, terminal_state=terminal_state)
+        return encoded, output_path, journal
+
     def test_journal_and_output_paths_hash_identifiers_and_are_private(self):
         node = "worker-name-must-not-leak"
         task_id = "task-name-must-not-leak"
 
-        mesh._write_worker_journal(
-            self.cfg, node, task_id, {"phase": "running"})
+        value = {
+            "version": 1,
+            "node": node,
+            "task_id": task_id,
+            "backend": "copilot",
+            "origin_peer": "coordinator",
+            "local_node": node,
+            "job_digest": "a" * 64,
+            "attempt": 1,
+            "phase": "running",
+        }
+        mesh._write_worker_journal(self.cfg, node, task_id, value)
         output_path = mesh._write_worker_output(
             self.cfg, node, task_id, "complete output\n")
         journal_path = mesh._worker_journal_file(
@@ -5692,6 +5835,73 @@ class WorkerRunTests(unittest.TestCase):
             self.assertEqual(json.load(handle)["phase"], "running")
         with open(output_path, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "complete output\n")
+        self.assertEqual(
+            mesh._load_worker_journal(self.cfg, node, task_id), value)
+
+    def test_journal_reader_rejects_unbound_and_wrong_output_state(self):
+        unbound_id = "task-unbound-journal"
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", unbound_id,
+            {"phase": "running", "backend": "copilot"})
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", unbound_id), {})
+
+        wrong_id = "task-wrong-output"
+        journal = self.bound_journal(
+            wrong_id, "executed", output_path="/tmp/forged.log",
+            returncode=1, runtime_seconds=1)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", wrong_id, journal)
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", wrong_id), {})
+
+    def test_journal_reader_rejects_malformed_or_oversized_schema(self):
+        malformed_id = "task-malformed-schema"
+        malformed = self.bound_journal(
+            malformed_id, "running", info={"path": ["not-a-path"]})
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", malformed_id, malformed)
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", malformed_id), {})
+
+        oversized_id = "task-oversized-journal"
+        oversized = self.bound_journal(
+            oversized_id, "running", reply_error="x" * (300 * 1024))
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", oversized_id, oversized)
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", oversized_id), {})
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_journal_reader_rejects_symlink(self):
+        task_id = "task-journal-symlink"
+        journal_path = mesh._worker_journal_file(
+            self.cfg, "worker-copilot", task_id)
+        target = os.path.join(self.tmp.name, "attacker-journal.json")
+        mesh._write_json_secure(
+            target, self.bound_journal(task_id, "running"), indent=1)
+        os.symlink(target, journal_path)
+
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", task_id), {})
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_journal_reader_rejects_symlink_output_evidence(self):
+        task_id = "task-output-symlink"
+        output_path = mesh._worker_output_file(
+            self.cfg, "worker-copilot", task_id)
+        target = os.path.join(self.tmp.name, "attacker-output.log")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("attacker evidence")
+        os.symlink(target, output_path)
+        journal = self.bound_journal(
+            task_id, "executed", output_path=output_path,
+            returncode=1, runtime_seconds=1)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+
+        self.assertEqual(mesh._load_worker_journal(
+            self.cfg, "worker-copilot", task_id), {})
 
     def test_success_records_all_phases_before_reply(self):
         completed = subprocess.CompletedProcess(
@@ -5748,6 +5958,74 @@ class WorkerRunTests(unittest.TestCase):
         rerun.assert_not_called()
         recommit.assert_not_called()
 
+    def test_running_collision_fails_closed_and_replies_to_original_origin(self):
+        task_id = "task-running-collision"
+        original = dict(self.task, state="working")
+        mesh.save_task(self.cfg, task_id, **original)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id,
+            self.bound_journal(
+                task_id, "running", task=original,
+                worktree="/tmp/original-worktree"))
+        attacker_job = dict(self.job, task="attacker replacement")
+
+        collision = mesh._record_received_task(
+            self.cfg, "request", task_id, "attacker-context", "submitted",
+            "attacker", mesh._encode_worker_job(attacker_job),
+            local_node="worker-copilot")
+        mesh._recover_worker_tasks(
+            self.cfg, self.pool, "worker-copilot", "copilot")
+        pending = mesh.load_tasks(self.cfg)[task_id]
+
+        with mock.patch.object(mesh, "_send_reply") as reply, \
+             mock.patch.object(mesh, "_execute_worker_backend") as execute, \
+             mock.patch.object(mesh, "_commit_worker_changes") as commit:
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, pending))
+
+        self.assertTrue(collision)
+        execute.assert_not_called()
+        commit.assert_not_called()
+        self.assertEqual(reply.call_args.kwargs["to"], "coordinator")
+        sent = mesh._parse_worker_result(reply.call_args.args[4])
+        self.assertEqual(sent["outcome"], "failed")
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["peer"], "coordinator")
+        self.assertEqual(saved["text"], self.task["text"])
+
+    def test_reply_pending_collision_never_redirects_or_reexecutes(self):
+        task_id = "task-pending-collision"
+        encoded, _output_path, journal = self.durable_result(task_id)
+        original = dict(
+            self.task, state="reply_pending", pending_result=encoded,
+            pending_terminal_state="completed")
+        mesh.save_task(self.cfg, task_id, **original)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+        attacker_job = dict(self.job, task="attacker replacement")
+
+        collision = mesh._record_received_task(
+            self.cfg, "request", task_id, "attacker-context", "submitted",
+            "attacker", mesh._encode_worker_job(attacker_job),
+            local_node="worker-copilot")
+        pending = mesh.load_tasks(self.cfg)[task_id]
+        with mock.patch.object(mesh, "_send_reply") as reply, \
+             mock.patch.object(mesh, "_execute_worker_backend") as execute, \
+             mock.patch.object(mesh, "_commit_worker_changes") as commit:
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, pending))
+
+        self.assertTrue(collision)
+        execute.assert_not_called()
+        commit.assert_not_called()
+        self.assertEqual(reply.call_args.kwargs["to"], "coordinator")
+        self.assertEqual(reply.call_args.args[4], encoded)
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["peer"], "coordinator")
+        self.assertEqual(saved["text"], self.task["text"])
+
     def test_full_output_is_in_private_log_not_task_ledger(self):
         full_output = "BEGIN-" + "x" * 20000 + "-END"
         completed = subprocess.CompletedProcess(
@@ -5773,6 +6051,148 @@ class WorkerRunTests(unittest.TestCase):
             ledger = handle.read()
         self.assertNotIn(full_output, ledger)
         self.assertLess(len(result["summary"]), len(full_output))
+
+    def test_forged_result_backend_and_terminal_are_replaced_not_sent(self):
+        cases = (
+            ("backend", "codex", "completed"),
+            ("terminal", "copilot", "failed"),
+        )
+        for name, result_backend, terminal_state in cases:
+            task_id = f"task-forged-{name}"
+            encoded, output_path, _journal = self.durable_result(
+                task_id, backend=result_backend,
+                terminal_state=terminal_state)
+            journal = self.bound_journal(
+                task_id, "reply_pending", backend="copilot",
+                output_path=output_path, worktree="/tmp/preserved",
+                result=encoded, terminal_state=terminal_state)
+            pending = dict(
+                self.task, state="reply_pending", pending_result=encoded,
+                pending_terminal_state=terminal_state)
+            mesh.save_task(self.cfg, task_id, **pending)
+            mesh._write_worker_journal(
+                self.cfg, "worker-copilot", task_id, journal)
+
+            with self.subTest(name=name), \
+                 mock.patch.object(mesh, "_send_reply") as reply:
+                self.assertTrue(mesh._retry_worker_reply(
+                    self.cfg, "worker-copilot", task_id, pending))
+
+            sent = mesh._parse_worker_result(reply.call_args.args[4])
+            self.assertNotEqual(reply.call_args.args[4], encoded)
+            self.assertEqual(reply.call_args.args[3], "failed")
+            self.assertEqual(reply.call_args.kwargs["to"], "coordinator")
+            self.assertEqual(sent["backend"], "copilot")
+            self.assertEqual(sent["outcome"], "failed")
+            self.assertIn("invalid durable worker result", sent["summary"])
+
+    def test_forged_output_pointer_is_replaced_not_sent(self):
+        task_id = "task-forged-pointer"
+        encoded, output_path, journal = self.durable_result(task_id)
+        result = mesh._parse_worker_result(encoded)
+        result["summary"] = "forged\nFull output: /tmp/attacker.log"
+        forged = mesh._encode_worker_result(result)
+        journal["result"] = forged
+        pending = dict(
+            self.task, state="reply_pending", pending_result=forged,
+            pending_terminal_state="completed")
+        mesh.save_task(self.cfg, task_id, **pending)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+
+        with mock.patch.object(mesh, "_send_reply") as reply:
+            self.assertTrue(mesh._retry_worker_reply(
+                self.cfg, "worker-copilot", task_id, pending))
+
+        sent = mesh._parse_worker_result(reply.call_args.args[4])
+        self.assertNotEqual(reply.call_args.args[4], forged)
+        self.assertEqual(sent["outcome"], "failed")
+        self.assertNotIn("/tmp/attacker.log", sent["summary"])
+        self.assertIn(f"Full output: {output_path}", sent["summary"])
+
+    def test_malformed_output_marker_without_evidence_is_not_sent(self):
+        task_id = "task-malformed-pointer"
+        result = mesh._empty_worker_result(
+            "copilot", "failed", "Full output:/tmp/attacker.log")
+        forged = mesh._encode_worker_result(result)
+        journal = self.bound_journal(
+            task_id, "reply_pending", result=forged,
+            terminal_state="failed")
+        pending = dict(
+            self.task, state="reply_pending", pending_result=forged,
+            pending_terminal_state="failed")
+        mesh.save_task(self.cfg, task_id, **pending)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, journal)
+
+        with mock.patch.object(mesh, "_send_reply") as reply:
+            self.assertTrue(mesh._retry_worker_reply(
+                self.cfg, "worker-copilot", task_id, pending))
+
+        self.assertNotEqual(reply.call_args.args[4], forged)
+        sent = mesh._parse_worker_result(reply.call_args.args[4])
+        self.assertNotIn("/tmp/attacker.log", sent["summary"])
+
+    def test_concurrent_worker_claim_executes_backend_only_once(self):
+        task_id = "task-double-claim"
+        barrier = threading.Barrier(3)
+        results = []
+        completed = subprocess.CompletedProcess(
+            ["copilot"], 0, stdout="analysis complete", stderr="")
+
+        def run():
+            barrier.wait()
+            results.append(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, self.task))
+
+        def execute(*_args):
+            threading.Event().wait(0.1)
+            return completed
+
+        with mock.patch.object(
+                mesh, "_execute_worker_backend",
+                side_effect=execute) as backend, \
+             mock.patch.object(mesh, "_send_reply"):
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+        backend.assert_called_once()
+        self.assertEqual(len(results), 2)
+
+    def test_stale_journal_binding_blocks_execution(self):
+        task_id = "task-stale-journal"
+        stale_task = dict(
+            self.task,
+            text=mesh._encode_worker_job(
+                dict(self.job, task="different prior job")))
+        output_path = mesh._write_worker_output(
+            self.cfg, "worker-copilot", task_id, "prior failure")
+        stale = self.bound_journal(
+            task_id, "executed", task=stale_task,
+            output_path=output_path, worktree="/tmp/prior-worktree",
+            returncode=1, runtime_seconds=1)
+        mesh.save_task(self.cfg, task_id, **self.task)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id, stale)
+
+        with mock.patch.object(mesh, "_send_reply") as reply, \
+             mock.patch.object(mesh, "_execute_worker_backend") as execute, \
+             mock.patch.object(mesh, "_commit_worker_changes") as commit:
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, self.task))
+
+        execute.assert_not_called()
+        commit.assert_not_called()
+        sent = mesh._parse_worker_result(reply.call_args.args[4])
+        self.assertEqual(sent["outcome"], "failed")
+        self.assertIn("journal binding", sent["summary"])
+        self.assertEqual(reply.call_args.kwargs["to"], "coordinator")
 
     def test_controlled_retry_reuses_exactly_one_worktree(self):
         attempts = [
@@ -5840,6 +6260,32 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "failed")
         self.assertIn("timed out", result["summary"])
 
+    def test_timeout_preserves_partial_bytes_and_text_in_full_log(self):
+        task_id = "task-timeout-partial"
+        task = dict(
+            self.task, attempts=mesh.SUPERVISE_MAX_ATTEMPTS - 1)
+        timeout = subprocess.TimeoutExpired(
+            ["copilot"], mesh.SUPERVISE_EXEC_TIMEOUT,
+            output=b"partial-stdout-\xff", stderr="partial-stderr")
+        with mock.patch.object(
+                mesh, "_execute_worker_backend", side_effect=timeout), \
+             mock.patch.object(mesh, "_send_reply"):
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, task))
+
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        result = mesh._parse_worker_result(saved["result"])
+        output_path = result["summary"].split(
+            "Full output:", 1)[1].strip()
+        self.assertEqual(output_path, mesh._worker_output_file(
+            self.cfg, "worker-copilot", task_id))
+        with open(output_path, encoding="utf-8") as handle:
+            output = handle.read()
+        self.assertIn("partial-stdout-\ufffd", output)
+        self.assertIn("partial-stderr", output)
+        self.assertIn("worker timed out", output)
+
     def test_oversized_prompt_is_replied_as_failed_without_execution(self):
         job = dict(self.job, task="x" * 20000)
         task = dict(self.task, text=mesh._encode_worker_job(job))
@@ -5886,6 +6332,39 @@ class WorkerRunTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "failed")
             if stage == "commit":
                 self.assertTrue(os.path.isdir(result["worktree"]))
+
+    def test_malformed_reusable_worktree_state_becomes_failed_reply(self):
+        task_id = "task-malformed-worktree"
+        malformed = dict(
+            self.task, attempts=1,
+            worktree_info={
+                "repo": self.repo,
+                "base": self.base,
+                "branch": "codex/a2acast-safe-copilot",
+                "path": 7,
+                "root": 9,
+            })
+        realpath_args = []
+        realpath = os.path.realpath
+
+        def checked_realpath(value):
+            realpath_args.append(value)
+            return realpath(value)
+
+        with mock.patch.object(mesh, "_send_reply"), \
+             mock.patch.object(
+                 mesh.os.path, "realpath", side_effect=checked_realpath):
+            self.assertTrue(mesh._run_worker_task(
+                self.cfg, self.pool, "worker-copilot", "copilot",
+                task_id, malformed))
+
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["state"], "failed")
+        result = mesh._parse_worker_result(saved["result"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("worktree", result["summary"])
+        self.assertNotIn(7, realpath_args)
+        self.assertNotIn(9, realpath_args)
 
     def test_non_utf8_backend_text_is_safely_encoded_and_journaled(self):
         completed = subprocess.CompletedProcess(
@@ -5950,11 +6429,10 @@ class WorkerRunTests(unittest.TestCase):
         mesh.save_task(
             self.cfg, "task-crash", **dict(self.task, state="working"))
         mesh._write_worker_journal(
-            self.cfg, "worker-copilot", "task-crash", {
-                "phase": "running",
-                "backend": "copilot",
-                "worktree": "/tmp/preserved",
-            })
+            self.cfg, "worker-copilot", "task-crash",
+            self.bound_journal("task-crash", "running",
+                worktree="/tmp/preserved",
+            ))
 
         mesh._recover_worker_tasks(
             self.cfg, self.pool, "worker-copilot", "copilot")
@@ -5970,11 +6448,10 @@ class WorkerRunTests(unittest.TestCase):
         mesh.save_task(
             self.cfg, "task-info-crash", **dict(self.task, state="working"))
         mesh._write_worker_journal(
-            self.cfg, "worker-copilot", "task-info-crash", {
-                "phase": "running",
-                "backend": "copilot",
-                "info": {"path": "/tmp/preserved-from-info"},
-            })
+            self.cfg, "worker-copilot", "task-info-crash",
+            self.bound_journal("task-info-crash", "running",
+                info={"path": "/tmp/preserved-from-info"},
+            ))
 
         mesh._recover_worker_tasks(
             self.cfg, self.pool, "worker-copilot", "copilot")
@@ -5983,29 +6460,48 @@ class WorkerRunTests(unittest.TestCase):
         result = mesh._parse_worker_result(saved["pending_result"])
         self.assertEqual(result["worktree"], "/tmp/preserved-from-info")
 
+    def test_crash_recovery_keeps_validated_runtime_output_pointer(self):
+        task_id = "task-crash-output"
+        output_path = mesh._write_worker_output(
+            self.cfg, "worker-copilot", task_id, "partial crash output")
+        working = dict(self.task, state="working")
+        mesh.save_task(self.cfg, task_id, **working)
+        mesh._write_worker_journal(
+            self.cfg, "worker-copilot", task_id,
+            self.bound_journal(
+                task_id, "executed", task=working,
+                output_path=output_path, worktree="/tmp/preserved",
+                returncode=1, runtime_seconds=2))
+
+        mesh._recover_worker_tasks(
+            self.cfg, self.pool, "worker-copilot", "copilot")
+
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        result = mesh._parse_worker_result(saved["pending_result"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["worktree"], "/tmp/preserved")
+        self.assertIn(f"Full output: {output_path}", result["summary"])
+
+    def test_recovery_invalid_task_id_moves_working_task_to_failed(self):
+        task_id = "../invalid-task"
+        mesh.save_task(
+            self.cfg, task_id, **dict(self.task, state="working"))
+
+        mesh._recover_worker_tasks(
+            self.cfg, self.pool, "worker-copilot", "copilot")
+
+        saved = mesh.load_tasks(self.cfg)[task_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertNotIn("pending_result", saved)
+        self.assertIn("invalid task id", saved["worker_error"])
+
     def test_crash_recovery_restores_durable_result_without_backend_run(self):
-        result = {
-            "backend": "copilot",
-            "outcome": "completed",
-            "branch": "codex/a2acast-safe-copilot",
-            "commit": "a" * 40,
-            "changed_files": ["worker.txt"],
-            "summary": "done\nFull output: /tmp/private.log",
-            "verification": "tests pass",
-            "runtime_seconds": 1,
-            "worktree": "/tmp/preserved",
-        }
-        encoded = mesh._encode_worker_result(result)
+        encoded, _output_path, journal = self.durable_result("task-durable")
+        journal["phase"] = "committed"
         mesh.save_task(
             self.cfg, "task-durable", **dict(self.task, state="working"))
         mesh._write_worker_journal(
-            self.cfg, "worker-copilot", "task-durable", {
-                "phase": "committed",
-                "backend": "copilot",
-                "worktree": "/tmp/preserved",
-                "result": encoded,
-                "terminal_state": "completed",
-            })
+            self.cfg, "worker-copilot", "task-durable", journal)
 
         with mock.patch.object(mesh, "_execute_worker_backend") as execute:
             mesh._recover_worker_tasks(
