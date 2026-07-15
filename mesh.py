@@ -105,6 +105,22 @@ DELIVERY_FRAMING_TAGS = frozenset(
 )
 MAX_FRAMING_PASSES = 32
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+WORKER_JOB_PREFIX = "A2ACAST_JOB_V1\n"
+WORKER_RESULT_PREFIX = "A2ACAST_RESULT_V1\n"
+WORKER_JOB_MAX = 64 * 1024
+WORKER_RESULT_MAX = 128 * 1024
+WORKER_TASK_MAX = 48 * 1024
+WORKER_PATH_MAX = 4096
+WORKER_VERIFY_MAX = 16
+WORKER_VERIFY_ITEM_MAX = 2048
+WORKER_JOB_FIELDS = frozenset(
+    {"repo", "base", "task", "verification", "kind", "class"})
+WORKER_RESULT_FIELDS = frozenset({
+    "backend", "outcome", "branch", "commit", "changed_files", "summary",
+    "verification", "runtime_seconds", "worktree",
+})
+WORKER_OUTCOMES = frozenset(
+    {"completed", "no_change", "failed", "unavailable", "quota"})
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1732,166 @@ def _sanitize_delivery_text(value):
     # Pathological nesting can reveal one new tag per pass. Bound the work,
     # then make any remaining tag syntax inert without discarding its text.
     return text.replace("<", "\u2039").replace(">", "\u203a")
+
+
+def _decode_prefixed_json(text, prefix, limit, noun):
+    if not isinstance(text, str) or not text.startswith(prefix):
+        raise ValueError(f"not a versioned {noun}")
+    if len(text.encode("utf-8")) > limit:
+        raise ValueError(f"{noun} exceeds {limit} bytes")
+    try:
+        value = json.loads(text[len(prefix):])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {noun} JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{noun} must be an object")
+    return value
+
+
+def _worker_metadata_has_controls(value):
+    return any(
+        unicodedata.category(ch) in {"Cc", "Cf"} for ch in str(value))
+
+
+def _sanitize_worker_human_text(value):
+    text = ANSI_ESCAPE_RE.sub("", str(value))
+    text = "".join(
+        ch for ch in text
+        if ch in "\n\t" or unicodedata.category(ch) not in {"Cc", "Cf"})
+    return _sanitize_delivery_text(text)
+
+
+def _validate_worker_job(job):
+    try:
+        job = dict(job)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("worker job must be an object") from exc
+    unknown = set(job) - WORKER_JOB_FIELDS
+    if unknown:
+        raise ValueError(
+            f"unknown job fields: {sorted(unknown, key=str)}")
+    if set(job) != WORKER_JOB_FIELDS:
+        raise ValueError("job is missing required fields")
+
+    repo = job["repo"]
+    if isinstance(repo, str) and _worker_metadata_has_controls(repo):
+        raise ValueError("repo contains control or format characters")
+    if (not isinstance(repo, str) or not os.path.isabs(repo)
+            or len(repo) > WORKER_PATH_MAX):
+        raise ValueError("repo must be a bounded absolute path")
+
+    base = job["base"]
+    if (not isinstance(base, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", base) is None):
+        raise ValueError("base must be a 40-hex commit")
+
+    task = job["task"]
+    if (not isinstance(task, str)
+            or len(task.encode("utf-8")) > WORKER_TASK_MAX):
+        raise ValueError("task must be nonempty and bounded")
+    job["task"] = _sanitize_worker_human_text(task)
+    if not job["task"].strip():
+        raise ValueError("task must be nonempty after sanitizing")
+
+    verification = job["verification"]
+    if (not isinstance(verification, list)
+            or len(verification) > WORKER_VERIFY_MAX
+            or any(not isinstance(item, str)
+                   or len(item.encode("utf-8")) > WORKER_VERIFY_ITEM_MAX
+                   for item in verification)):
+        raise ValueError("verification entries are invalid")
+    job["verification"] = [
+        _sanitize_worker_human_text(item) for item in verification]
+    if any(not item.strip() for item in job["verification"]):
+        raise ValueError(
+            "verification entries must be nonempty after sanitizing")
+
+    if (not isinstance(job["kind"], str)
+            or job["kind"] not in {"implementation", "analysis"}):
+        raise ValueError("invalid job kind")
+    if (not isinstance(job["class"], str)
+            or job["class"] not in {"normal", "security", "integration"}):
+        raise ValueError("invalid job class")
+    return job
+
+
+def _encode_worker_job(job):
+    value = _validate_worker_job(job)
+    text = WORKER_JOB_PREFIX + json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"))
+    if len(text.encode("utf-8")) > WORKER_JOB_MAX:
+        raise ValueError("worker job exceeds 65536 bytes")
+    return text
+
+
+def _parse_worker_job(text):
+    return _validate_worker_job(_decode_prefixed_json(
+        text, WORKER_JOB_PREFIX, WORKER_JOB_MAX, "worker job"))
+
+
+def _validate_worker_result(result):
+    try:
+        result = dict(result)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("worker result must be an object") from exc
+    if set(result) != WORKER_RESULT_FIELDS:
+        raise ValueError("worker result fields are invalid")
+
+    if (not isinstance(result["backend"], str)
+            or result["backend"] not in {"codex", "copilot", "goose"}):
+        raise ValueError("invalid result backend")
+    if (not isinstance(result["outcome"], str)
+            or result["outcome"] not in WORKER_OUTCOMES):
+        raise ValueError("invalid result outcome")
+
+    changed_files = result["changed_files"]
+    if (not isinstance(changed_files, list)
+            or any(not isinstance(path, str)
+                   or len(path) > WORKER_PATH_MAX
+                   or _worker_metadata_has_controls(path)
+                   for path in changed_files)):
+        raise ValueError("changed_files paths are invalid")
+    if (not isinstance(result["runtime_seconds"], int)
+            or isinstance(result["runtime_seconds"], bool)):
+        raise ValueError("runtime_seconds must be an integer")
+
+    for name in ("branch", "commit", "summary", "verification", "worktree"):
+        if not isinstance(result[name], str):
+            raise ValueError(f"{name} must be a string")
+    if (result["commit"]
+            and re.fullmatch(r"[0-9a-f]{40}", result["commit"]) is None):
+        raise ValueError("commit must be empty or 40 lowercase hex")
+    for name in ("branch", "commit", "worktree"):
+        if _worker_metadata_has_controls(result[name]):
+            raise ValueError(
+                f"{name} contains control or format characters")
+    if len(result["worktree"]) > WORKER_PATH_MAX:
+        raise ValueError("worktree path is too long")
+
+    for name in ("summary", "verification"):
+        result[name] = _sanitize_worker_human_text(result[name])
+        if not result[name].strip():
+            raise ValueError(f"{name} must be nonempty after sanitizing")
+    return result
+
+
+def _encode_worker_result(result):
+    value = _validate_worker_result(result)
+    text = WORKER_RESULT_PREFIX + json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"))
+    if len(text.encode("utf-8")) > WORKER_RESULT_MAX:
+        value["summary"] = value["summary"][:8192]
+        value["verification"] = value["verification"][:8192]
+        text = WORKER_RESULT_PREFIX + json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"))
+    if len(text.encode("utf-8")) > WORKER_RESULT_MAX:
+        raise ValueError("worker result exceeds 131072 bytes")
+    return text
+
+
+def _parse_worker_result(text):
+    return _validate_worker_result(_decode_prefixed_json(
+        text, WORKER_RESULT_PREFIX, WORKER_RESULT_MAX, "worker result"))
 
 
 def _single_line_preview(value, limit):
