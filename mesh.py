@@ -1873,11 +1873,40 @@ def _commit_worker_changes(info, task_id, backend):
     return commit, changed
 
 
-def _remove_worker_worktree(info, integrated_into=None, force=False):
-    path = os.path.realpath(info["path"])
-    root = os.path.realpath(info["root"])
+def _worker_worktree_removal_identity(info):
+    if not isinstance(info, dict):
+        raise ValueError("worker worktree removal evidence is invalid")
+    raw_path = info.get("path")
+    raw_root = info.get("root")
+    if not isinstance(raw_path, str) or not isinstance(raw_root, str):
+        raise ValueError("worker worktree removal path is invalid")
+    absolute = os.path.abspath(raw_path)
+    path = os.path.realpath(absolute)
+    root = os.path.realpath(raw_root)
     if not _path_is_within(path, root) or path == root:
         raise ValueError("refusing to remove path outside worker root")
+    lexical = os.path.normcase(os.path.normpath(absolute))
+    if lexical != os.path.normcase(os.path.normpath(path)):
+        raise ValueError("worker worktree path changed or contains a symlink")
+    observed = os.lstat(absolute)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ValueError("worker worktree path changed or is not a directory")
+    identity = (getattr(observed, "st_dev", 0),
+                getattr(observed, "st_ino", 0))
+    if (not all(isinstance(value, int) for value in identity)
+            or 0 in identity):
+        raise WorkerEvidenceUnsupported(
+            "worker worktree has no stable directory identity")
+    expected = info.get("_cleanup_path_identity")
+    if expected is not None and expected != identity:
+        raise ValueError("worker worktree path changed before removal")
+    return path, root, identity
+
+
+def _remove_worker_worktree(info, integrated_into=None, force=False):
+    path, _root, initial_identity = _worker_worktree_removal_identity(info)
+    expected_identity = info.get(
+        "_cleanup_path_identity", initial_identity)
     commit = _resolve_worker_base(path, "HEAD")
     if not force:
         dirty = _git(
@@ -1893,6 +1922,10 @@ def _remove_worker_worktree(info, integrated_into=None, force=False):
             commit, integrated_into, check=False).returncode == 0
         if not integrated:
             raise ValueError("worker commit is not integrated")
+    final_path, _root, final_identity = \
+        _worker_worktree_removal_identity(info)
+    if final_path != path or final_identity != expected_identity:
+        raise ValueError("worker worktree path changed before removal")
     args = ["-C", info["repo"], "worktree", "remove"]
     if force:
         args.append("--force")
@@ -8130,10 +8163,12 @@ def _cleanup_candidate(cfg, pool, inbound, task_id, record):
         raise ValueError("worker job does not match worktree evidence")
     if result.get("branch") != info["branch"]:
         raise ValueError("worker result branch does not match ledger")
-    head = _resolve_worker_base(info["path"], "HEAD")
+    path, _root, path_identity = _worker_worktree_removal_identity(info)
+    head = _resolve_worker_base(path, "HEAD")
     expected_head = result.get("commit") or info["base"]
     if head != expected_head:
         raise ValueError("worker result commit does not match worktree")
+    info["_cleanup_path_identity"] = path_identity
     return info
 
 
@@ -8175,7 +8210,6 @@ def cmd_pool_clean(args):
         except (OSError, TypeError, ValueError, UnicodeError,
                 WorkerEvidenceUnsupported) as exc:
             sys.exit(f"error: worker task ledger is unavailable: {exc}")
-        candidates = []
         for candidate in selected:
             try:
                 info = _cleanup_candidate(
@@ -8184,8 +8218,6 @@ def cmd_pool_clean(args):
                     ValueError, UnicodeError) as exc:
                 preserved.append({"task_id": candidate, "reason": str(exc)})
                 continue
-            candidates.append((candidate, info))
-        for candidate, info in candidates:
             try:
                 _remove_worker_worktree(
                     info, integrated_into=integrated_into, force=force)

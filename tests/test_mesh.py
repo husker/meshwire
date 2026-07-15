@@ -10143,6 +10143,37 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertFalse(os.path.exists(info["path"]))
         self.assertEqual(json.loads(output.getvalue())["removed"], [task_id])
 
+    def test_pool_clean_rechecks_worktree_identity_at_removal_boundary(self):
+        task_id = "task-race"
+        info = self._create_cleanup_evidence(task_id, commit_change=True)
+        victim = os.path.join(os.path.dirname(info["path"]), "victim")
+        subprocess.run([
+            "git", "-C", info["repo"], "worktree", "add", "-q", "-b",
+            "victim-branch", victim, info["base"],
+        ], check=True)
+        held = info["path"] + ".held"
+        real_remove = mesh._remove_worker_worktree
+
+        def swap_before_remove(candidate, **kwargs):
+            os.rename(candidate["path"], held)
+            os.symlink(victim, candidate["path"])
+            return real_remove(candidate, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_remove_worker_worktree",
+                               side_effect=swap_before_remove), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=True, integrated_into=None))
+
+        self.assertTrue(os.path.isdir(victim))
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["removed"], [])
+        self.assertIn("changed", result["preserved"][0]["reason"])
+
     def test_cleanup_rejects_cross_ledger_terminal_result_contradiction(self):
         task_id = "task-contradiction"
         self._create_cleanup_evidence(task_id)
