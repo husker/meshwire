@@ -1968,6 +1968,60 @@ def _remove_worker_quarantine(path, identity):
         os.close(parent_fd)
 
 
+def _restore_quarantined_worker_worktree(
+        info, quarantine_path, quarantine_root, quarantine_identity,
+        expected_identity):
+    original = os.path.abspath(info["path"])
+    parent = os.path.dirname(original)
+    name = os.path.basename(original)
+    if os.path.realpath(os.path.dirname(quarantine_root)) != \
+            os.path.realpath(parent):
+        raise ValueError("worker worktree quarantine parent changed")
+    parent_fd, parent_identity = _open_managed_directory(
+        parent, "worker worktree parent")
+    quarantine_fd = None
+    restored = False
+    try:
+        quarantine_fd, observed_quarantine = _open_managed_directory(
+            quarantine_root, "worker worktree quarantine")
+        if observed_quarantine != quarantine_identity:
+            raise ValueError("worker worktree quarantine changed")
+        observed = os.stat(
+            "worktree", dir_fd=quarantine_fd, follow_symlinks=False)
+        if (_validate_managed_directory_stat(
+                observed, "quarantined worker worktree")
+                != expected_identity):
+            raise ValueError("quarantined worker worktree changed")
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("original worker worktree path is occupied")
+        os.rename(
+            "worktree", name, src_dir_fd=quarantine_fd,
+            dst_dir_fd=parent_fd)
+        restored = True
+        restored_stat = os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_validate_managed_directory_stat(
+                restored_stat, "restored worker worktree")
+                != expected_identity):
+            raise ValueError("restored worker worktree changed")
+        if _validate_managed_directory(
+                parent, "worker worktree parent") != parent_identity:
+            raise ValueError("worker worktree parent changed during restore")
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        os.close(parent_fd)
+    if not restored:
+        raise OSError(
+            f"worker worktree remains quarantined at {quarantine_path}")
+    _git("-C", info["repo"], "worktree", "repair", original)
+    _remove_worker_quarantine(quarantine_root, quarantine_identity)
+
+
 def _remove_worker_worktree(info, integrated_into=None, force=False):
     path, _root, initial_identity = _worker_worktree_removal_identity(info)
     expected_identity = info.get(
@@ -1996,17 +2050,38 @@ def _remove_worker_worktree(info, integrated_into=None, force=False):
     quarantined_info = dict(
         info, path=quarantine_path,
         _cleanup_path_identity=expected_identity)
-    _git("-C", info["repo"], "worktree", "repair", quarantine_path)
-    rebound_path, _root, rebound_identity = \
-        _worker_worktree_removal_identity(quarantined_info)
-    if (rebound_path != quarantine_path
-            or rebound_identity != expected_identity):
-        raise ValueError("worker worktree changed after quarantine")
-    args = ["-C", info["repo"], "worktree", "remove"]
-    if force:
-        args.append("--force")
-    _git(*args, quarantine_path)
-    _remove_worker_quarantine(quarantine_root, quarantine_identity)
+    removed = False
+    try:
+        _git("-C", info["repo"], "worktree", "repair", quarantine_path)
+        rebound_path, _root, rebound_identity = \
+            _worker_worktree_removal_identity(quarantined_info)
+        if (rebound_path != quarantine_path
+                or rebound_identity != expected_identity):
+            raise ValueError("worker worktree changed after quarantine")
+        args = ["-C", info["repo"], "worktree", "remove"]
+        if force:
+            args.append("--force")
+        _git(*args, quarantine_path)
+        removed = True
+    except BaseException as exc:
+        try:
+            _restore_quarantined_worker_worktree(
+                info, quarantine_path, quarantine_root,
+                quarantine_identity, expected_identity)
+        except BaseException as rollback_exc:
+            raise OSError(
+                "worker worktree removal failed and rollback failed; "
+                f"quarantine was {quarantine_path}: {rollback_exc}") \
+                from exc
+        raise
+    finally:
+        if removed:
+            try:
+                _remove_worker_quarantine(
+                    quarantine_root, quarantine_identity)
+            except (OSError, TypeError, ValueError,
+                    WorkerEvidenceUnsupported):
+                pass
 
 
 def _worker_prompt(task_id, sender, job):

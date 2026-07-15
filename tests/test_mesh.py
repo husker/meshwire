@@ -10209,6 +10209,39 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertNotEqual(removal_paths[-1], info["path"])
         self.assertEqual(json.loads(output.getvalue())["removed"], [task_id])
 
+    def test_pool_clean_rolls_back_quarantine_when_git_removal_fails(self):
+        task_id = "task-quarantine-rollback"
+        info = self._create_cleanup_evidence(task_id, commit_change=True)
+        real_git = mesh._git
+
+        def fail_removal(*args, **kwargs):
+            if "worktree" in args and "remove" in args:
+                raise subprocess.CalledProcessError(1, ["git", *args])
+            return real_git(*args, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_git", side_effect=fail_removal), \
+             contextlib.redirect_stdout(output):
+            mesh.cmd_pool_clean(argparse.Namespace(
+                task=task_id, force=True, integrated_into=None))
+
+        self.assertTrue(os.path.isdir(info["path"]))
+        self.assertEqual(
+            mesh._resolve_worker_base(info["path"], "HEAD"),
+            subprocess.run(
+                ["git", "-C", info["path"], "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip())
+        self.assertFalse(any(
+            name.startswith(".a2acast-remove-")
+            for name in os.listdir(os.path.dirname(info["path"]))))
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["preserved"][0]["task_id"], task_id)
+
     def test_cleanup_rejects_cross_ledger_terminal_result_contradiction(self):
         task_id = "task-contradiction"
         self._create_cleanup_evidence(task_id)
