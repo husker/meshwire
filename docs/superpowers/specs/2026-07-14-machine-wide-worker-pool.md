@@ -184,6 +184,13 @@ canonicalizes `repo`, resolves `base` to an exact commit, and rejects malformed
 or unsupported versions. Verification entries are instructions to the model,
 not shell commands executed blindly by the supervisor.
 
+Transport sanitization runs before JSON decoding, so escaped JSON controls can
+become real characters afterward. The job/result parsers therefore sanitize
+decoded human-text fields (task, verification entries, summary, and
+verification output) a second time before they reach a prompt or coordinator
+context. Metadata paths and refs reject control/format characters rather than
+normalizing them.
+
 The complete encoded job is limited to 64 KiB; `task` is limited to 48 KiB;
 paths are limited to 4,096 characters; and `verification` is limited to 16
 entries of at most 2 KiB each. `kind` is `implementation` or `analysis`.
@@ -219,9 +226,10 @@ For a validated implementation task, the supervisor:
 1. Confirms `repo` is a Git worktree beneath an allowed root.
 2. Resolves the requested base to an exact commit object.
 3. Creates a collision-resistant branch such as
-   `codex/a2acast-<task-prefix>-<backend>`.
+   `codex/a2acast-<task-token>-<backend>`, where the filesystem/Git-safe task
+   token is a stable SHA-256 prefix of the original A2A task ID.
 4. Adds a worktree beneath
-   `~/.cache/a2acast/worktrees/<repo-fingerprint>/<task-id>/<backend>`.
+   `~/.cache/a2acast/worktrees/<repo-fingerprint>/<task-token>/<backend>`.
 5. Starts the backend with that directory as its working root.
 6. On successful exit, independently inspects `git status` and the diff.
 7. If files changed, stages and commits them with a local a2acast worker
@@ -448,6 +456,9 @@ changes incorporated above:
 13. **Automatic routing guesses risk from attacker-controlled prose:** resolved
     by an explicit coordinator-supplied task class; security/integration default
     to Codex.
+14. **JSON escapes restore framing after transport sanitization:** resolved by
+    sanitizing decoded human-text fields again and rejecting controls in typed
+    metadata.
 
 ## Delivery sequence
 
