@@ -711,7 +711,7 @@ def _migrate_identity(cfg, harness):
     return name
 
 
-def my_node(cfg, override=None, harness=None):
+def my_node(cfg, override=None, harness=None, learn=True):
     """Resolve this machine's node name.
 
     Precedence: --as override > A2ACAST_NODE env > per-harness pin
@@ -732,7 +732,7 @@ def my_node(cfg, override=None, harness=None):
                 name = f.read().strip()
         if not name:
             name = _default_node_name(harness)
-            if name:
+            if name and learn:
                 _pin_node_name(cfg, name, harness)
     if not name and not harness and os.path.isfile(node_file(cfg)):
         with open(node_file(cfg), "r", encoding="utf-8") as f:
@@ -741,6 +741,8 @@ def my_node(cfg, override=None, harness=None):
         sys.exit("error: this machine has no node identity. Run "
                  "`mesh iam <node>` (or pass --as / set A2ACAST_NODE).")
     if name not in cfg["nodes"]:
+        if not learn:
+            return name
         if cfg.get("_path"):
             def _add_node(latest):
                 latest.setdefault("nodes", [])
@@ -6677,7 +6679,7 @@ def cmd_delegate(args):
     cfg = load_config()
     try:
         pool = load_pool_config(cfg)
-        me = my_node(cfg, args.as_node)
+        me = my_node(cfg, args.as_node, learn=False)
         _delegate_pool_workers(cfg, pool, me=me)
         job = _build_delegate_job(
             pool, args.repo, args.base, task, args.kind,

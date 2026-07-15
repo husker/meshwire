@@ -3524,6 +3524,21 @@ class WorkerDispatchTests(unittest.TestCase):
                 mesh.cmd_delegate(self.args(wait=-1))
         load.assert_not_called()
 
+    def test_wrong_coordinator_identity_is_rejected_without_learning_it(self):
+        mesh._save_config(self.cfg)
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "load_pool_config",
+                               return_value=self.pool), \
+             mock.patch.object(mesh, "_build_delegate_job") as build:
+            with self.assertRaisesRegex(
+                    SystemExit, "configured coordinator"):
+                mesh.cmd_delegate(self.args(as_node="attacker"))
+        build.assert_not_called()
+        with open(self.cfg["_path"], encoding="utf-8") as handle:
+            disk = json.load(handle)
+        self.assertNotIn("attacker", disk["nodes"])
+        self.assertNotIn("attacker", self.cfg["nodes"])
+
     def test_no_candidate_opens_no_stream_and_persists_no_task(self):
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
              mock.patch.object(mesh, "load_pool_config",
