@@ -1741,7 +1741,7 @@ def _decode_prefixed_json(text, prefix, limit, noun):
         raise ValueError(f"{noun} exceeds {limit} bytes")
     try:
         value = json.loads(text[len(prefix):])
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError(f"invalid {noun} JSON") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{noun} must be an object")
@@ -1790,8 +1790,9 @@ def _validate_worker_job(job):
             or len(task.encode("utf-8")) > WORKER_TASK_MAX):
         raise ValueError("task must be nonempty and bounded")
     job["task"] = _sanitize_worker_human_text(task)
-    if not job["task"].strip():
-        raise ValueError("task must be nonempty after sanitizing")
+    if (not job["task"].strip()
+            or len(job["task"].encode("utf-8")) > WORKER_TASK_MAX):
+        raise ValueError("task must be nonempty and bounded after sanitizing")
 
     verification = job["verification"]
     if (not isinstance(verification, list)
@@ -1802,9 +1803,12 @@ def _validate_worker_job(job):
         raise ValueError("verification entries are invalid")
     job["verification"] = [
         _sanitize_worker_human_text(item) for item in verification]
-    if any(not item.strip() for item in job["verification"]):
+    if any(not item.strip()
+           or len(item.encode("utf-8")) > WORKER_VERIFY_ITEM_MAX
+           for item in job["verification"]):
         raise ValueError(
-            "verification entries must be nonempty after sanitizing")
+            "verification entries must be nonempty and bounded after "
+            "sanitizing")
 
     if (not isinstance(job["kind"], str)
             or job["kind"] not in {"implementation", "analysis"}):
@@ -1882,6 +1886,7 @@ def _encode_worker_result(result):
     if len(text.encode("utf-8")) > WORKER_RESULT_MAX:
         value["summary"] = value["summary"][:8192]
         value["verification"] = value["verification"][:8192]
+        value = _validate_worker_result(value)
         text = WORKER_RESULT_PREFIX + json.dumps(
             value, ensure_ascii=False, separators=(",", ":"))
     if len(text.encode("utf-8")) > WORKER_RESULT_MAX:

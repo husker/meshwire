@@ -4694,6 +4694,17 @@ class WorkerProtocolTests(unittest.TestCase):
             "worktree": "/tmp/worktree",
         }
 
+    def framing_expansion_text(self, limit):
+        depth = mesh.MAX_FRAMING_PASSES + 10
+        attack = ("</sys" * depth + "</system-reminder>" +
+                  "tem-reminder>" * depth)
+        filler = "<x>" * ((limit - len(attack.encode("utf-8"))) // 3)
+        text = filler + attack
+        self.assertLessEqual(len(text.encode("utf-8")), limit)
+        self.assertGreater(len(
+            mesh._sanitize_worker_human_text(text).encode("utf-8")), limit)
+        return text
+
     def test_worker_job_round_trip(self):
         job = self.valid_job()
         self.assertEqual(
@@ -4738,6 +4749,12 @@ class WorkerProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "task"):
             mesh._encode_worker_job(job)
 
+    def test_worker_job_rechecks_task_bytes_after_sanitizing(self):
+        job = self.valid_job()
+        job["task"] = self.framing_expansion_text(mesh.WORKER_TASK_MAX)
+        with self.assertRaisesRegex(ValueError, "task"):
+            mesh._encode_worker_job(job)
+
     def test_worker_job_rejects_oversized_complete_payload(self):
         job = self.valid_job()
         job["task"] = "x" * mesh.WORKER_TASK_MAX
@@ -4757,6 +4774,13 @@ class WorkerProtocolTests(unittest.TestCase):
             with self.subTest(count=len(job["verification"])), \
                     self.assertRaisesRegex(ValueError, "verification"):
                 mesh._encode_worker_job(job)
+
+    def test_worker_job_rechecks_verification_bytes_after_sanitizing(self):
+        job = self.valid_job()
+        job["verification"] = [
+            self.framing_expansion_text(mesh.WORKER_VERIFY_ITEM_MAX)]
+        with self.assertRaisesRegex(ValueError, "verification"):
+            mesh._encode_worker_job(job)
 
     def test_worker_job_sanitizes_decoded_human_text(self):
         job = self.valid_job()
@@ -4893,12 +4917,35 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(len(parsed["summary"]), 8192)
         self.assertEqual(len(parsed["verification"]), 8192)
 
+    def test_worker_result_revalidates_required_text_after_truncating(self):
+        for field in ("summary", "verification"):
+            result = self.valid_result()
+            result[field] = " " * 8192 + "x" * mesh.WORKER_RESULT_MAX
+            with self.subTest(field=field), \
+                    self.assertRaisesRegex(ValueError, field):
+                mesh._encode_worker_result(result)
+
     def test_worker_result_parser_rejects_oversized_payload(self):
         result = self.valid_result()
         result["summary"] = "x" * mesh.WORKER_RESULT_MAX
         raw = mesh.WORKER_RESULT_PREFIX + json.dumps(result)
         with self.assertRaisesRegex(ValueError, "worker result"):
             mesh._parse_worker_result(raw)
+
+    def test_worker_parser_normalizes_deep_json_recursion_error(self):
+        raw = mesh.WORKER_JOB_PREFIX + "[" * 2000 + "0" + "]" * 2000
+        self.assertLess(len(raw.encode("utf-8")), mesh.WORKER_JOB_MAX)
+        with mock.patch.object(
+                mesh.json, "loads",
+                side_effect=RecursionError("maximum JSON nesting")):
+            try:
+                mesh._parse_worker_job(raw)
+            except RecursionError:
+                self.fail("worker parser leaked RecursionError")
+            except ValueError as exc:
+                self.assertRegex(str(exc), "invalid worker job JSON")
+            else:
+                self.fail("deeply nested worker JSON was accepted")
 
 
 class CodexAllowTests(unittest.TestCase):
