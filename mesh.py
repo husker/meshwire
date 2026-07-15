@@ -89,6 +89,10 @@ TASKS_LOCK_PREFIX = "mw-tasks-"
 UNSOLICITED_TASK_UPDATE = (
     "UNSOLICITED \u2014 no local record of sending this task"
 )
+TASK_RECORD_ACCEPTED = "accepted"
+TASK_RECORD_DUPLICATE = "duplicate"
+TASK_RECORD_COLLISION = "collision"
+TASK_RECORD_UNSOLICITED = "unsolicited"
 CODEX_TASK_TURN_GUARD = (
     "An ack alone does not complete this task, and no new turn will be "
     "created after you go idle. Do the requested work and send the result "
@@ -110,6 +114,7 @@ WORKER_JOB_PREFIX = "A2ACAST_JOB_V1\n"
 WORKER_RESULT_PREFIX = "A2ACAST_RESULT_V1\n"
 WORKER_JOB_MAX = 64 * 1024
 WORKER_RESULT_MAX = 128 * 1024
+WORKER_RESULT_TEXT_MAX = 8192
 WORKER_TASK_MAX = 48 * 1024
 WORKER_PROMPT_MAX = 16 * 1024
 WORKER_WINDOWS_COMMAND_MAX = 30000
@@ -130,6 +135,26 @@ WORKER_JOURNAL_PHASES = frozenset({
     "validated", "prepared", "running", "executed", "committed",
     "reply_pending", "replied",
 })
+WORKER_JOURNAL_PHASE_FIELDS = {
+    "validated": frozenset({"repo", "base"}),
+    "prepared": frozenset({"worktree", "info"}),
+    "running": frozenset({"worktree", "info"}),
+    "executed": frozenset({
+        "worktree", "info", "output_path", "returncode",
+        "runtime_seconds",
+    }),
+    "committed": frozenset({
+        "worktree", "output_path", "result", "terminal_state",
+    }),
+    "reply_pending": frozenset({
+        "worktree", "output_path", "result", "terminal_state",
+        "reply_error",
+    }),
+    "replied": frozenset({
+        "worktree", "output_path", "result", "terminal_state",
+        "reply_error",
+    }),
+}
 WORKER_ENV_ALLOW = frozenset({
     "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
     "SHELL", "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM",
@@ -1037,6 +1062,20 @@ def tasks_file(cfg):
     return os.path.join(cfg["_dir"], TASKS_NAME)
 
 
+def _worker_task_has_journal(cfg, task_id):
+    """Fail closed when any worker identity has journaled this task."""
+    try:
+        suffix = f".{_worker_task_token(task_id)}.json"
+        with os.scandir(cfg["_dir"]) as entries:
+            return any(
+                entry.name.startswith(".meshwire.worker-journal.")
+                and entry.name.endswith(suffix)
+                for entry in entries
+            )
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return True
+
+
 def load_tasks(cfg):
     try:
         with open(tasks_file(cfg), "r", encoding="utf-8") as f:
@@ -1070,28 +1109,91 @@ def save_task(cfg, task_id, **fields):
                 pass
 
 
-def _record_received_request(cfg, task_id, context_id, state, peer, text,
-                             rpc_id, local_node):
-    """Atomically accept a new inbound task or reject an ID collision.
+def _record_received_task(cfg, kind, task_id, context_id, state, peer,
+                          text, rpc_id=None, local_node=None):
+    """Atomically record a request/result and return its disposition.
 
-    Existing task identity is immutable. An exact duplicate of an untouched
-    submitted request is idempotent; every other reuse of the task ID is
-    rejected without changing the ledger record.
+    A result is correlated only when this node already has the task recorded
+    as outbound. Any result colliding with an existing inbound task is dropped
+    without changing a single ledger field.
     """
-    if not _valid_task_id(task_id):
-        return True
+    if kind not in {"request", "result"} or not _valid_task_id(task_id):
+        return TASK_RECORD_COLLISION
     lock = _acquire_tasks_lock(cfg)
     if lock is None:
-        # Collision checks are security-sensitive. Never fall back to an
-        # unlocked read-modify-write for an inbound request.
-        return True
+        return TASK_RECORD_COLLISION
     try:
         tasks = load_tasks(cfg)
         existing = tasks.get(task_id)
-        handled = (
-            isinstance(local_node, str)
-            and task_id in _load_handled(cfg, local_node)
-        )
+        if kind == "request":
+            fields = {
+                "contextId": context_id,
+                "state": state,
+                "peer": peer,
+                "direction": "inbound",
+                "text": text,
+                "rpcId": rpc_id,
+            }
+            if local_node is not None:
+                fields["local_node"] = local_node
+            handled = (
+                isinstance(local_node, str)
+                and task_id in _load_handled(cfg, local_node)
+            )
+            journaled = _worker_task_has_journal(cfg, task_id)
+            pristine_keys = set(fields) | {"updated"}
+            duplicate = (
+                not handled
+                and not journaled
+                and isinstance(existing, dict)
+                and set(existing).issubset(pristine_keys)
+                and set(fields).issubset(existing)
+                and existing.get("state") == "submitted"
+                and all(existing.get(key) == value
+                        for key, value in fields.items())
+            )
+            if existing is not None or handled or journaled:
+                return (TASK_RECORD_DUPLICATE if duplicate
+                        else TASK_RECORD_COLLISION)
+            fields["updated"] = int(time.time())
+            tasks[task_id] = fields
+            _write_json_secure(tasks_file(cfg), tasks, indent=1)
+            return TASK_RECORD_ACCEPTED
+
+        if existing is not None:
+            if (not isinstance(existing, dict)
+                    or existing.get("direction") != "outbound"):
+                return TASK_RECORD_COLLISION
+            updated = dict(existing)
+            if existing.get("peer") == peer:
+                updated.update({
+                    "contextId": context_id,
+                    "state": state,
+                    "peer": peer,
+                    "direction": "outbound",
+                    "result": text,
+                    "rpcId": rpc_id,
+                    "unsolicited": False,
+                    "updated": int(time.time()),
+                })
+                tasks[task_id] = updated
+                _write_json_secure(tasks_file(cfg), tasks, indent=1)
+                return TASK_RECORD_ACCEPTED
+
+            prior_updates = existing.get("unsolicited_updates")
+            updates = list(prior_updates) if isinstance(
+                prior_updates, list) else []
+            updates.append({"contextId": context_id, "state": state,
+                            "peer": peer, "text": text, "rpcId": rpc_id})
+            updated.update({
+                "has_unsolicited_updates": True,
+                "unsolicited_updates": updates,
+                "updated": int(time.time()),
+            })
+            tasks[task_id] = updated
+            _write_json_secure(tasks_file(cfg), tasks, indent=1)
+            return TASK_RECORD_UNSOLICITED
+
         fields = {
             "contextId": context_id,
             "state": state,
@@ -1099,78 +1201,19 @@ def _record_received_request(cfg, task_id, context_id, state, peer, text,
             "direction": "inbound",
             "text": text,
             "rpcId": rpc_id,
+            "unsolicited": True,
+            "updated": int(time.time()),
         }
         if local_node is not None:
             fields["local_node"] = local_node
-        if existing is not None or handled:
-            duplicate = (
-                not handled
-                and isinstance(existing, dict)
-                and existing.get("direction") == "inbound"
-                and existing.get("state") == "submitted"
-                and all(existing.get(key) == value
-                        for key, value in fields.items())
-            )
-            return False if duplicate else True
-        fields["updated"] = int(time.time())
         tasks[task_id] = fields
         _write_json_secure(tasks_file(cfg), tasks, indent=1)
-        return False
+        return TASK_RECORD_UNSOLICITED
     finally:
         try:
             os.unlink(lock)
         except OSError:
             pass
-
-
-def _record_received_task(cfg, kind, task_id, context_id, state, peer,
-                          text, rpc_id=None, local_node=None):
-    """Record an inbound task request or result.
-
-    Return true when a request was rejected for an ID collision or a result
-    was unsolicited.
-
-    A result is correlated only when this node already has the task recorded
-    as outbound. Correlated updates preserve that direction and the original
-    request text; unmatched updates remain visible as inbound records but are
-    explicitly tagged for verification.
-    """
-    if kind == "request":
-        return _record_received_request(
-            cfg, task_id, context_id, state, peer, text, rpc_id, local_node)
-
-    existing = load_tasks(cfg).get(task_id) or {}
-    outbound = existing.get("direction") == "outbound"
-    correlated = outbound and existing.get("peer") == peer
-    if correlated:
-        save_task(cfg, task_id, contextId=context_id, state=state,
-                  peer=peer, direction="outbound", result=text,
-                  rpcId=rpc_id, unsolicited=False)
-        return False
-
-    if outbound:
-        # Do not let a conflicting peer overwrite the real outbound task.
-        # Preserve the suspicious update alongside it for audit/review.
-        updates = list(existing.get("unsolicited_updates") or [])
-        updates.append({"contextId": context_id, "state": state,
-                        "peer": peer, "text": text, "rpcId": rpc_id})
-        save_task(cfg, task_id, has_unsolicited_updates=True,
-                  unsolicited_updates=updates)
-        return True
-
-    fields = {
-        "contextId": context_id,
-        "state": state,
-        "peer": peer,
-        "direction": "inbound",
-        "text": text,
-        "rpcId": rpc_id,
-        "unsolicited": True,
-    }
-    if local_node is not None:
-        fields["local_node"] = local_node
-    save_task(cfg, task_id, **fields)
-    return True
 
 
 def _supervise_handled_file(cfg, node):
@@ -1565,11 +1608,30 @@ def _write_worker_journal(cfg, node, task_id, value):
         _worker_journal_file(cfg, node, task_id), value, indent=1)
 
 
-def _open_regular_readonly(path):
-    """Open an existing regular file without following a symlink."""
-    before = os.lstat(path)
-    if not stat.S_ISREG(before.st_mode):
+def _validate_private_worker_stat(observed):
+    if not stat.S_ISREG(observed.st_mode):
         raise OSError("worker state is not a regular file")
+    device = getattr(observed, "st_dev", 0)
+    inode = getattr(observed, "st_ino", 0)
+    if (not isinstance(device, int) or not isinstance(inode, int)
+            or device == 0 or inode == 0):
+        # Windows has no meaningful POSIX mode/owner check here, so stable
+        # file identity is mandatory there too. If Python/the filesystem
+        # cannot provide one, worker state is not trusted.
+        raise OSError("worker state has no stable file identity")
+    if os.name == "posix":
+        if (not hasattr(os, "geteuid")
+                or observed.st_uid != os.geteuid()):
+            raise OSError("worker state is not owned by the current user")
+        if stat.S_IMODE(observed.st_mode) != 0o600:
+            raise OSError("worker state is not private mode 0600")
+    return device, inode
+
+
+def _open_regular_readonly(path):
+    """Open private worker state with stable no-follow identity checks."""
+    before = os.lstat(path)
+    identity = _validate_private_worker_stat(before)
     flags = os.O_RDONLY
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
@@ -1577,15 +1639,7 @@ def _open_regular_readonly(path):
     fd = os.open(path, flags)
     try:
         after = os.fstat(fd)
-        if not stat.S_ISREG(after.st_mode):
-            raise OSError("worker state is not a regular file")
-        # On platforms without O_NOFOLLOW, make the lstat/open race fail
-        # closed. st_ino may be zero on Windows, where symlinks were already
-        # rejected by lstat and the opened handle is still checked as regular.
-        if (getattr(before, "st_ino", 0)
-                and getattr(after, "st_ino", 0)
-                and (before.st_dev, before.st_ino)
-                != (after.st_dev, after.st_ino)):
+        if _validate_private_worker_stat(after) != identity:
             raise OSError("worker state changed while opening")
         return fd
     except BaseException:
@@ -1669,6 +1723,10 @@ def _validate_worker_journal(cfg, node, task_id, value, expected=None):
             or value["attempt"] < 1
             or value["phase"] not in WORKER_JOURNAL_PHASES):
         raise ValueError("worker journal binding is invalid")
+    phase_fields = set(value) - binding_fields - {"phase"}
+    if not phase_fields.issubset(
+            WORKER_JOURNAL_PHASE_FIELDS[value["phase"]]):
+        raise ValueError("worker journal fields do not match its phase")
     for field in ("repo", "base", "worktree"):
         if field in value and (
                 not isinstance(value[field], str)
@@ -1774,7 +1832,7 @@ def _write_worker_phase(cfg, node, task_id, binding, phase, **fields):
 
 
 def _bounded_worker_text(value, fallback="worker produced no output",
-                         limit=8192):
+                         limit=WORKER_RESULT_TEXT_MAX):
     text = _sanitize_worker_human_text(_worker_utf8_text(value)).strip()
     if not text:
         text = fallback
@@ -1787,10 +1845,23 @@ def _bounded_worker_text(value, fallback="worker produced no output",
 def _worker_result_summary(output, output_path, fallback):
     # Keep the supervisor-owned log pointer unambiguous even when backend
     # output tries to mimic it.
-    preview = _bounded_worker_text(output, fallback=fallback).replace(
-        "Full output:", "Full output (backend):")
     path = _sanitize_worker_human_text(_worker_utf8_text(output_path)).strip()
-    return f"{preview}\nFull output: {path}"
+    suffix = f"\nFull output: {path}"
+    preview_budget = WORKER_RESULT_TEXT_MAX - len(suffix.encode("utf-8"))
+    if preview_budget < 1:
+        raise ValueError("worker output path leaves no summary budget")
+    preview_source = _sanitize_worker_human_text(
+        _worker_utf8_text(output)).strip()
+    fallback_source = _sanitize_worker_human_text(
+        _worker_utf8_text(fallback)).strip()
+    preview_source = (preview_source or fallback_source).replace(
+        "Full output:", "Full output (backend):")
+    preview = _bounded_worker_text(
+        preview_source,
+        fallback="worker produced no output",
+        limit=preview_budget,
+    )
+    return preview + suffix
 
 
 def _empty_worker_result(backend, outcome, summary, worktree="",
@@ -1856,17 +1927,23 @@ def _worker_terminal_for_outcome(outcome):
     raise ValueError("invalid worker result outcome")
 
 
-def _worker_result_output_pointer(result):
-    markers = [
-        line for line in result.get("summary", "").splitlines()
-        if line.startswith("Full output:")
-    ]
-    if any(not line.startswith("Full output: ") for line in markers):
-        raise ValueError("worker result has malformed output evidence")
-    pointers = [line[len("Full output: "):] for line in markers]
-    if len(pointers) > 1 or any(not pointer for pointer in pointers):
-        raise ValueError("worker result has ambiguous output evidence")
-    return pointers[0] if pointers else None
+def _validate_worker_result_text(result, expected_output):
+    for field in ("summary", "verification"):
+        if len(result[field].encode("utf-8")) > WORKER_RESULT_TEXT_MAX:
+            raise ValueError(
+                f"worker result {field} exceeds {WORKER_RESULT_TEXT_MAX} bytes")
+    summary = result["summary"]
+    occurrences = summary.count("Full output:")
+    if expected_output is None:
+        if occurrences:
+            raise ValueError("worker result has untrusted output evidence")
+        return
+    final_line = f"Full output: {expected_output}"
+    if (occurrences != 1
+            or not summary.endswith(final_line)
+            or (summary != final_line
+                and summary[-len(final_line) - 1] != "\n")):
+        raise ValueError("worker result output evidence is not the final line")
 
 
 def _validate_bound_worker_result(cfg, node, task_id, journal, encoded):
@@ -1876,10 +1953,8 @@ def _validate_bound_worker_result(cfg, node, task_id, journal, encoded):
     terminal_state = _worker_terminal_for_outcome(result["outcome"])
     if journal.get("terminal_state") != terminal_state:
         raise ValueError("worker result terminal state does not match outcome")
-    pointer = _worker_result_output_pointer(result)
     expected_output = journal.get("output_path")
-    if pointer != expected_output:
-        raise ValueError("worker result output evidence does not match journal")
+    _validate_worker_result_text(result, expected_output)
     if expected_output is not None:
         exact_output = _worker_output_file(cfg, node, task_id)
         if (expected_output != exact_output
@@ -1939,17 +2014,22 @@ def _queue_worker_result(cfg, me, task_id, binding, result,
     if output_path != trusted_output or not _worker_regular_file(
             trusted_output):
         output_path = None
+
+    def validate_encoded(value, state, evidence_path):
+        candidate = dict(
+            binding, phase="committed", result=value,
+            terminal_state=state)
+        if evidence_path is not None:
+            candidate["output_path"] = evidence_path
+        _validate_bound_worker_result(
+            cfg, me, task_id, candidate, value)
+
     try:
         encoded = _encode_worker_result(result)
-        candidate = dict(
-            binding, phase="committed", result=encoded,
-            terminal_state=terminal_state)
-        if output_path is not None:
-            candidate["output_path"] = output_path
-        _validate_bound_worker_result(
-            cfg, me, task_id, candidate, encoded)
+        validate_encoded(encoded, terminal_state, output_path)
     except (TypeError, ValueError, UnicodeError) as exc:
-        summary = f"worker result encoding failed: {exc}"
+        summary = f"worker result encoding failed: {exc}".replace(
+            "Full output:", "Full output (error):")
         if output_path is not None:
             summary = _worker_result_summary(
                 summary, output_path,
@@ -1970,6 +2050,18 @@ def _queue_worker_result(cfg, me, task_id, binding, result,
         )
         encoded = _encode_worker_result(fallback)
         terminal_state = "failed"
+        try:
+            validate_encoded(encoded, terminal_state, output_path)
+        except (TypeError, ValueError, UnicodeError):
+            # Evidence can disappear or fail privacy checks between the first
+            # open and commit. Fall back once more without any pointer.
+            output_path = None
+            fallback = _empty_worker_result(
+                binding["backend"], "failed",
+                "worker result rejected by durable validation",
+                fallback["worktree"])
+            encoded = _encode_worker_result(fallback)
+            validate_encoded(encoded, terminal_state, output_path)
     durable_result = _parse_worker_result(encoded)
     fields = {
         "result": encoded,
@@ -3224,14 +3316,15 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None):
                 eto != authority_to):
             print("MESH_WARN: dropped invalid A2A envelope", file=sys.stderr)
             return False
-        unsolicited = _record_received_task(
+        disposition = _record_received_task(
             cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
             local_node=authority_to)
         if kind == "request":
-            if unsolicited:
-                print(
-                    f"MESH_WARN: dropped task ID collision for {task_id}",
-                    file=sys.stderr)
+            if disposition != TASK_RECORD_ACCEPTED:
+                if disposition == TASK_RECORD_COLLISION:
+                    print(
+                        f"MESH_WARN: dropped task ID collision for {task_id}",
+                        file=sys.stderr)
                 return False
             print(f"MESH_TASK from={_single_line(frm)} task={task_id} "
                   f"state=submitted: {_single_line(text)}")
@@ -3239,6 +3332,13 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None):
                   f"\"<result>\"")
             delivery_kind = "task"
         else:
+            if disposition == TASK_RECORD_COLLISION:
+                print(
+                    f"MESH_WARN: dropped task result ID collision for "
+                    f"{task_id}",
+                    file=sys.stderr)
+                return False
+            unsolicited = disposition == TASK_RECORD_UNSOLICITED
             warning = f" ({UNSOLICITED_TASK_UPDATE})" if unsolicited else ""
             print(f"MESH_TASK_UPDATE{warning} from={_single_line(frm)} "
                   f"task={task_id} state={_single_line(state)}: "
@@ -3868,10 +3968,13 @@ class MeshMCPServer:
             if (not _valid_task_id(task_id) or efrm != frm or
                     eto != authority_to):
                 return None
-            unsolicited = _record_received_task(
+            disposition = _record_received_task(
                 self.cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
                 local_node=authority_to)
-            if kind == "request" and unsolicited:
+            if (kind == "request"
+                    and disposition != TASK_RECORD_ACCEPTED):
+                return None
+            if kind == "result" and disposition == TASK_RECORD_COLLISION:
                 return None
             delivery = {
                 "kind": "task" if kind == "request" else "task_update",
@@ -3881,6 +3984,7 @@ class MeshMCPServer:
                 "text": text,
             }
             if kind == "result":
+                unsolicited = disposition == TASK_RECORD_UNSOLICITED
                 delivery["unsolicited"] = unsolicited
                 if unsolicited:
                     delivery["warning"] = UNSOLICITED_TASK_UPDATE
