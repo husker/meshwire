@@ -111,6 +111,7 @@ WORKER_JOB_MAX = 64 * 1024
 WORKER_RESULT_MAX = 128 * 1024
 WORKER_TASK_MAX = 48 * 1024
 WORKER_PROMPT_MAX = 16 * 1024
+WORKER_WINDOWS_COMMAND_MAX = 30000
 WORKER_PATH_MAX = 4096
 WORKER_VERIFY_MAX = 16
 WORKER_VERIFY_ITEM_MAX = 2048
@@ -1382,12 +1383,12 @@ def _worker_command(backend, worktree, prompt, pool):
         raise ValueError(
             f"worker prompt exceeds {WORKER_PROMPT_MAX} UTF-8 bytes")
     if backend == "codex":
-        return [
+        command = [
             "codex", "exec", "--sandbox", "workspace-write",
             "--cd", worktree, "--ephemeral", prompt,
         ]
-    if backend == "copilot":
-        return [
+    elif backend == "copilot":
+        command = [
             "copilot", "--no-ask-user", "--no-remote",
             "--no-remote-export", "--no-auto-update",
             "--disable-builtin-mcps",
@@ -1413,21 +1414,27 @@ def _worker_command(backend, worktree, prompt, pool):
             ),
             "--output-format=text", "-p", prompt,
         ]
-    if backend == "goose":
-        return [
+    elif backend == "goose":
+        command = [
             "goose", "run", "--no-session", "--quiet",
             "--max-turns", "12", "--text", prompt,
         ]
-    raise ValueError(f"unknown worker backend: {backend}")
+    else:
+        raise ValueError(f"unknown worker backend: {backend}")
+    rendered = subprocess.list2cmdline(command)
+    if len(rendered) > WORKER_WINDOWS_COMMAND_MAX:
+        raise ValueError(
+            "worker command exceeds "
+            f"{WORKER_WINDOWS_COMMAND_MAX} rendered Windows characters")
+    return command
 
 
 def _classify_worker_failure(text):
     value = str(text).casefold()
     if re.search(r"\bnot logged in\b", value):
         return "unavailable"
-    context_re = re.compile(
-        r"\b(api|backend|cli|codex|copilot|goose|ollama|openai|anthropic|"
-        r"provider|http)\b")
+    context_re = re.compile(r"\b(codex|copilot|goose|ollama|openai)\b")
+    precise_http_quota_re = re.compile(r"\bhttp(?: status)?\s+429\b")
     quota_re = re.compile(
         r"\b(?:quota|usage limit|monthly limit)[_ -]+"
         r"(?:exceeded|exhausted|reached)\b|"
@@ -1439,11 +1446,12 @@ def _classify_worker_failure(text):
             r"model .{1,200} not found|connection refused)",
     )
     for line in value.splitlines() or [value]:
-        if not context_re.search(line):
-            continue
-        if quota_re.search(line):
+        quota_signal = quota_re.search(line)
+        if quota_signal and (
+                context_re.search(line)
+                or precise_http_quota_re.search(line)):
             return "quota"
-        if unavailable_re.search(line):
+        if context_re.search(line) and unavailable_re.search(line):
             return "unavailable"
     return "failed"
 

@@ -5502,7 +5502,9 @@ class WorkerBackendTests(unittest.TestCase):
         for text in (
                 "HTTP 429 rate limit exceeded",
                 "Copilot API quota exceeded",
-                "codex CLI usage limit reached"):
+                "codex CLI usage limit reached",
+                "GitHub Copilot rate limit reached",
+                "OpenAI quota exhausted"):
             with self.subTest(text=text):
                 self.assertEqual(mesh._classify_worker_failure(text), "quota")
 
@@ -5511,7 +5513,9 @@ class WorkerBackendTests(unittest.TestCase):
                 "not logged in",
                 "Copilot API authentication required",
                 "Ollama provider model qwen3:4b not found",
-                "Goose provider connection refused"):
+                "Goose provider connection refused",
+                "Codex executable not found",
+                "OpenAI model gpt-worker not found"):
             with self.subTest(text=text):
                 self.assertEqual(
                     mesh._classify_worker_failure(text), "unavailable")
@@ -5522,7 +5526,11 @@ class WorkerBackendTests(unittest.TestCase):
                 "database connection refused", "quota test failed",
                 "model fixture not found", "test expected 429 but got 500",
                 "Copilot API fixture passed\ndatabase connection refused",
-                "provider fixture passed\nmodel fixture not found"):
+                "provider fixture passed\nmodel fixture not found",
+                "database backend connection refused",
+                "HTTP fixture expected rate limit exceeded",
+                "application provider model fixture not found",
+                "CLI integration test reports unauthorized user"):
             with self.subTest(text=text):
                 self.assertEqual(mesh._classify_worker_failure(text), "failed")
 
@@ -5531,7 +5539,6 @@ class WorkerBackendTests(unittest.TestCase):
         self.assertLess(limit, mesh.WORKER_TASK_MAX)
         accepted = "é" * (limit // 2)
         rejected = accepted + "x"
-        longest = "x" * limit
 
         for backend in ("codex", "copilot", "goose"):
             with self.subTest(backend=backend, boundary="accepted"):
@@ -5539,16 +5546,61 @@ class WorkerBackendTests(unittest.TestCase):
                     backend, "/tmp/w", accepted, self.pool)
                 self.assertEqual(command[-1], accepted)
                 self.assertEqual(len(command[-1].encode("utf-8")), limit)
-                longest_command = mesh._worker_command(
-                    backend, "/tmp/w", longest, self.pool)
-                self.assertEqual(longest_command[-1], longest)
-                self.assertLessEqual(
-                    sum(len(part) + 1 for part in longest_command), 32767)
             with self.subTest(backend=backend, boundary="rejected"):
                 with self.assertRaisesRegex(
                         ValueError, "worker prompt exceeds"):
                     mesh._worker_command(
                         backend, "/tmp/w", rejected, self.pool)
+
+    def test_worker_command_enforces_rendered_windows_argv_budget(self):
+        windows_limit = 30000
+        self.assertEqual(
+            getattr(mesh, "WORKER_WINDOWS_COMMAND_MAX", None), windows_limit)
+        worktree_prefix = "C:\\worker path\\"
+        worktree = worktree_prefix + "\\" * (
+            mesh.WORKER_PATH_MAX - len(worktree_prefix))
+        self.assertEqual(len(worktree), mesh.WORKER_PATH_MAX)
+
+        def prompt_value(kind, size):
+            if size == 0:
+                return ""
+            if kind == "quotes":
+                return '"' * size
+            if kind == "trailing_backslashes":
+                return " " + "\\" * (size - 1)
+            return " " * size
+
+        for backend in ("codex", "copilot", "goose"):
+            for kind in ("quotes", "trailing_backslashes", "whitespace"):
+                with self.subTest(backend=backend, kind=kind):
+                    base = mesh._worker_command(
+                        backend, worktree, "", self.pool)[:-1]
+                    low, high = 0, mesh.WORKER_PROMPT_MAX
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        candidate = base + [prompt_value(kind, middle)]
+                        if (len(subprocess.list2cmdline(candidate))
+                                <= windows_limit):
+                            low = middle
+                        else:
+                            high = middle - 1
+
+                    accepted = prompt_value(kind, low)
+                    command = mesh._worker_command(
+                        backend, worktree, accepted, self.pool)
+                    self.assertEqual(command, base + [accepted])
+                    self.assertLessEqual(
+                        len(subprocess.list2cmdline(command)), windows_limit)
+                    if kind != "whitespace" or backend == "copilot":
+                        self.assertLess(low, mesh.WORKER_PROMPT_MAX)
+                    if low < mesh.WORKER_PROMPT_MAX:
+                        rejected = prompt_value(kind, low + 1)
+                        rendered = subprocess.list2cmdline(base + [rejected])
+                        self.assertGreater(len(rendered), windows_limit)
+                        with self.assertRaisesRegex(
+                                ValueError, "worker command exceeds"):
+                            mesh._worker_command(
+                                backend, worktree, rejected, self.pool)
 
     def test_worker_command_rejects_non_utf8_prompt_explicitly(self):
         with self.assertRaisesRegex(ValueError, "valid UTF-8"):
