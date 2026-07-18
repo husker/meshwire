@@ -106,6 +106,64 @@ then name the peers you trust to run code on this machine with
 `mesh codex-allow <node>`. Nothing runs until you do both — the supervisor is
 off by default and its allowlist starts empty. See the security model below.
 
+## Machine-wide worker pool (opt-in)
+
+The worker pool runs repository tasks through local Codex, Copilot, and
+Goose/Ollama CLIs. Run it on a joined worker host only after all three CLIs are
+installed; authenticate Codex and Copilot for the current user, and start
+Ollama with the configured model available (default `qwen3:4b`). The
+coordinator must already be a current known mesh identity; confirm it with
+`mesh status` before setup.
+
+```bash
+mesh pool-setup --workspace-root ~/Projects \
+  --coordinator jamess-macbook-air-2
+mesh pool-start
+mesh pool-status
+mesh delegate auto "add a regression test" --repo /abs/repo --wait 300
+```
+
+`pool-setup` permits repositories only below the listed workspace roots and
+sets `exec_allow` to the single named coordinator. It does not start a worker;
+`pool-start` is the explicit activation step. Because every mesh member has
+the shared key and can assert any sender name, this allowlist is not per-node
+cryptographic identity. Configure only a coordinator you trust.
+
+On macOS, `pool-start` manages current-user LaunchAgents. On other operating
+systems, `pool-start` and `pool-stop` print foreground supervisor commands for
+you or your service manager to run; they do not install a service.
+
+For normal `auto` jobs, dispatch selects the first eligible backend in
+Goose/Ollama, Copilot, then Codex order, skipping workers that are blocked,
+busy, unavailable, or cooling down. Nonblocking CLI calls (the default
+`--wait 0`) and the nonblocking MCP tool dispatch that one worker and do not
+auto-redispatch. With a positive `--wait`, the CLI can try the next eligible
+backend only after an authenticated `quota` or `unavailable` result, within
+the same total wait budget. Security and integration jobs select only Codex
+unless a backend is explicitly named.
+
+Each job runs in a separate Git worktree. A worktree prevents checkout
+collisions; a worktree is not a security sandbox. Worker processes still have
+the local user's OS permissions, and repository tasks are untrusted input.
+Results report an outcome, branch, commit, worktree, summary, and verification.
+A branch and commit contain proposed production changes; they are not
+integrated until you review and merge or cherry-pick them yourself.
+
+The pool creates worktrees and local commits. Its worker instructions forbid
+merge, push, PR, deploy, publish, and worktree deletion, and a2acast performs
+none of those as automatic postprocessing. Cleanup is an explicit command:
+
+```bash
+mesh pool-clean --integrated-into main
+mesh pool-stop
+```
+
+Normal cleanup removes only terminal, clean worktrees with consistent durable
+records whose commits are integrated into the named ref; uncertain or
+unintegrated work is preserved. `mesh pool-clean --task <id> --force` is an
+explicit escape hatch for exactly one terminal task and may discard its
+unintegrated or dirty worktree.
+
 ## How it works
 
 One file, `mesh.py`, Python stdlib only. Messages travel through an
@@ -148,9 +206,10 @@ mesh a2a-serve         # → http://127.0.0.1:4737/agents/<node> per remote node
 ```
 
 See [docs/AGENTS.md](docs/AGENTS.md) for per-harness wiring (Codex CLI,
-Copilot CLI, Gemini CLI, A2A frameworks, cron). `mesh` moves messages; it
-never calls a model. Each node answers with whatever brain, tools, and
-permissions its own harness has.
+Copilot CLI, Gemini CLI, A2A frameworks, cron). By default, `mesh` only moves
+messages; the explicitly started worker pool is the exception and invokes its
+configured local CLI. Interactive nodes answer with whatever brain, tools,
+and permissions their own harness has.
 
 ## Security model (read this)
 
@@ -257,6 +316,12 @@ mesh codex-setup [--supervise] arm Codex presence; --supervise also launches the
 mesh copilot-setup             register the Copilot CLI presence watcher
 mesh codex-allow <node> [--revoke|--list]   trust (or untrust) a peer to run delegated tasks here
 mesh codex-supervise [--once] [--sandbox S] [--interval N] [--stop]   the autonomous task actor
+mesh pool-setup --workspace-root DIR --coordinator NODE [--model MODEL]   configure the worker pool
+mesh pool-start|pool-status|pool-stop   manage or inspect worker supervisors
+mesh delegate auto|codex|copilot|goose <task...> --repo ABS [--base COMMIT]
+  [--kind implementation|analysis] [--class normal|security|integration]
+  [--verify TEXT (repeatable)] [--wait 0..300] [--as NODE]   run an isolated task
+mesh pool-clean [--integrated-into REF] [--task ID [--force]]   remove eligible worktrees
 ```
 
 The blocking commands use shell-friendly exit codes: `tasks --wait` exits

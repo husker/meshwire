@@ -7,6 +7,8 @@ dist/
 # a2acast runtime state (per-machine, never shared)
 .meshwire.*
 .gstack/
+.worktrees/
+.superpowers/
 
 # Personal Claude Code settings (not shared)
 .claude/settings.local.json

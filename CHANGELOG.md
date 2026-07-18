@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.15.0
+- Add an opt-in machine-wide worker pool with distinct Codex, Copilot, and
+  Goose/Ollama identities.
+- Add versioned isolated-worktree jobs, structured branch/commit results, and
+  recipient-scoped task records so parallel supervisors cannot race.
+- Add journaled execution, reply-only retries, health/cooldown routing, MCP
+  delegation, conservative worktree cleanup, and macOS LaunchAgent lifecycle.
+- Preserve the existing default-off, default-empty-allowlist Codex supervisor
+  and document that worktrees are not security sandboxes.
+
 ## 0.14.1
 - Fix (security): config writes are now durable read-modify-write under a
   lock — an incoming message (note_peer) or `mesh iam` can no longer clobber
