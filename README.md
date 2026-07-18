@@ -371,9 +371,9 @@ whatever you run — a harness plugin (`--format codex`/`copilot`), a CLAUDE.md
 snippet (`--format claude`), a paste-in skill (`--format skill`), or the MCP
 config (`--format mcp`). For GUI/desktop agents, `mesh mcp` runs a stdio MCP
 **tool** server (add it with `mesh integrate --format mcp`) exposing
-`mesh_send` / `mesh_pending` / `mesh_ask` / `mesh_reply` / `mesh_list_agents`,
-so Claude Desktop, Cursor, or any MCP host can talk to the mesh — no plugin
-needed. (This is the pull-mode tool server; the Copilot plugin's `mcp-serve`
+`mesh_send` / `mesh_pending` / `mesh_ask` / `mesh_reply` / `mesh_delegate` /
+`mesh_list_agents`, so Claude Desktop, Cursor, or any MCP host can talk to
+the mesh — no plugin needed. (This is the pull-mode tool server; the Copilot plugin's `mcp-serve`
 is the push-mode watcher that wakes an idle session.)
 
 ## How it compares
