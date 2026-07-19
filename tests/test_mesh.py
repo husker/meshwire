@@ -1072,8 +1072,18 @@ class SendStatusInviteTests(MembershipCmdTests):
             mesh.cmd_invite(argparse.Namespace())
         text = out.getvalue()
         self.assertIn("curl -fsSLO https://raw.githubusercontent.com/husker/"
-                      "a2acast/main/mesh.py", text)
+                      f"a2acast/v{mesh.VERSION}/mesh.py", text)
         self.assertIn("python3 mesh.py join mesh1-", text)
+
+    def test_invite_bootstrap_pinned_not_main(self):
+        # New joiners must fetch the release this node runs, not whatever
+        # main happens to be — a bad push to main must not break or
+        # compromise every subsequent join.
+        self._write_cfg()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_invite(argparse.Namespace())
+        self.assertNotIn("/main/mesh.py", out.getvalue())
 
 
 class _TestDone(Exception):
@@ -3798,7 +3808,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.15.0")
+        self.assertEqual(release, "0.15.1")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]

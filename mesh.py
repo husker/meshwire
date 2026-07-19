@@ -87,7 +87,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -3981,8 +3981,11 @@ def _print_invite(cfg):
     print("Paste this on the new machine (share PRIVATELY — the code IS the")
     print("mesh secret). It downloads a2acast, joins as the machine's")
     print("hostname, and starts listening:\n")
+    # Pin the bootstrap to this node's release tag: a bad push to main must
+    # never break or compromise a future join. The tag exists for every
+    # released VERSION (CI's consistency job enforces the version fields).
     print("  curl -fsSLO https://raw.githubusercontent.com/husker/a2acast/"
-          "main/mesh.py")
+          f"v{VERSION}/mesh.py")
     print(f"  python3 mesh.py join {code}\n")
     print(f"  # pick a name instead:  python3 mesh.py join {code} "
           f"--as <name>")

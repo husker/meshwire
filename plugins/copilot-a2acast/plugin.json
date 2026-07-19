@@ -1,6 +1,6 @@
 {
   "name": "a2acast",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "Let this Copilot CLI session exchange encrypted messages and A2A tasks with agents on other machines.",
   "author": {
     "name": "James Gagan"
