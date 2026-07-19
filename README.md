@@ -18,7 +18,7 @@ mesh init home   # prints a block to paste on machine B, then starts listening
 **Machine B** — paste the block `mesh init` printed. It looks like:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/husker/a2acast/main/mesh.py
+curl -fsSLO https://raw.githubusercontent.com/husker/a2acast/vX.Y.Z/mesh.py
 python3 mesh.py join mesh1-XXXX...
 ```
 

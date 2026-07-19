@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.1
+- Security: invite bootstrap blocks now download `mesh.py` pinned to the
+  inviting node's release tag (`v<VERSION>`) instead of the tip of `main`,
+  so a bad or malicious push to main cannot break or compromise future
+  joins.
+- Add GitHub Actions CI: the unittest suite runs on Linux, macOS, and
+  Windows across Python 3.8–3.13, a consistency job keeps
+  `mesh.py`/`pyproject.toml`/plugin manifest versions in lock-step, and a
+  gitleaks job scans full history for leaked secrets on every push.
+- Add a PyPI publish workflow (trusted publishing, runs on GitHub release).
+- Docs: list `mesh_delegate` in the MCP tools roster.
+
 ## 0.15.0
 - Add an opt-in machine-wide worker pool with distinct Codex, Copilot, and
   Goose/Ollama identities.

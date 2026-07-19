@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.8/3.9 need ubuntu-22.04: setup-python has no builds for them
+          # on newer runner images.
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-22.04, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests
+
+  # Observational until proven green in real runs, then move into the
+  # required `test` matrix. The README claims Windows support; the suite
+  # has FakeMSVCRT coverage but has never run on a real Windows host.
+  test-windows:
+    name: test (windows, py${{ matrix.python }}) [observational]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests
+
+  consistency:
+    name: version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: all version fields agree and CHANGELOG covers the release
+        run: |
+          python3 - <<'EOF'
+          import json, re, sys
+
+          mesh_v = re.search(r'^VERSION = "([^"]+)"',
+                             open("mesh.py").read(), re.M).group(1)
+          py_v = re.search(r'^version = "([^"]+)"',
+                           open("pyproject.toml").read(), re.M).group(1)
+          plugin_vs = set()
+          for p in (".claude-plugin/plugin.json",
+                    "plugins/copilot-a2acast/plugin.json",
+                    "plugins/a2acast/.codex-plugin/plugin.json"):
+              plugin_vs.add(json.load(open(p))["version"])
+          for p in (".claude-plugin/marketplace.json",
+                    ".plugin/marketplace.json"):
+              plugin_vs.update(
+                  re.findall(r'"version":\s*"([^"]+)"', open(p).read()))
+          vals = {mesh_v, py_v} | plugin_vs
+          if len(vals) != 1:
+              sys.exit("version drift: mesh.py=%s pyproject=%s plugins=%s"
+                       % (mesh_v, py_v, sorted(plugin_vs)))
+          if ("## " + mesh_v) not in open("CHANGELOG.md").read():
+              sys.exit("CHANGELOG.md has no '## %s' section" % mesh_v)
+          print("all version fields agree:", mesh_v)
+          EOF
+
+  gitleaks:
+    name: secrets scan (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: run gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source . --no-banner --redact
