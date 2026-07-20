@@ -815,6 +815,13 @@ def _acquire_path_lock(lock_path, attempts=10, wait=0.05,
     for i in range(attempts):
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except PermissionError:
+            # Windows: a lock its owner is unlinking is briefly "delete
+            # pending", and a concurrent create fails EACCES instead of
+            # FileExistsError. Transient -- treat as busy and retry.
+            if i < attempts - 1:
+                time.sleep(wait * (0.5 + secrets.randbelow(101) / 100))
+            continue
         except FileExistsError:
             # The creator writes PID metadata immediately after O_EXCL, but
             # another thread can observe the file in that tiny empty/partial
@@ -827,7 +834,9 @@ def _acquire_path_lock(lock_path, attempts=10, wait=0.05,
             if (not reclaim_stale
                     or _hook_lock_is_live(lock_path) or fresh):
                 if i < attempts - 1:
-                    time.sleep(wait)
+                    # Jittered: aligned fixed-interval wakeups let one
+                    # contender lose every round under sustained load.
+                    time.sleep(wait * (0.5 + secrets.randbelow(101) / 100))
                 continue
             try:
                 os.unlink(lock_path)
@@ -854,8 +863,12 @@ def _tasks_lock_file(cfg):
     return os.path.join(tempfile.gettempdir(), TASKS_LOCK_PREFIX + suffix)
 
 
-def _acquire_tasks_lock(cfg, attempts=10, wait=0.05):
-    """Acquire task-store ownership without racing stale-lock deletion."""
+def _acquire_tasks_lock(cfg, attempts=60, wait=0.05):
+    """Acquire task-store ownership without racing stale-lock deletion.
+
+    Ledger writers must not drop tasks: contenders get a generous retry
+    budget, because a holder's fsync-backed write can take tens of
+    milliseconds on Windows (filter drivers scan fresh files)."""
     return _acquire_path_lock(
         _tasks_lock_file(cfg), attempts, wait, reclaim_stale=False)
 
@@ -1914,20 +1927,16 @@ def _quarantine_worker_worktree(info, expected_identity):
     quarantine_fd = None
     moved = False
     try:
-        os.mkdir(quarantine_name, 0o700, dir_fd=parent_fd)
+        _managed_mkdir_at(parent_fd, quarantine_name, 0o700)
         quarantine_fd, quarantine_identity = _open_managed_directory(
             quarantine_path, "worker worktree quarantine")
-        observed = os.stat(
-            name, dir_fd=parent_fd, follow_symlinks=False)
+        observed = _managed_stat_at(parent_fd, name)
         if (_validate_managed_directory_stat(
                 observed, "worker worktree") != expected_identity):
             raise ValueError("worker worktree path changed before quarantine")
-        os.rename(
-            name, "worktree", src_dir_fd=parent_fd,
-            dst_dir_fd=quarantine_fd)
+        _managed_rename_at(parent_fd, name, quarantine_fd, "worktree")
         moved = True
-        quarantined = os.stat(
-            "worktree", dir_fd=quarantine_fd, follow_symlinks=False)
+        quarantined = _managed_stat_at(quarantine_fd, "worktree")
         if (_validate_managed_directory_stat(
                 quarantined, "quarantined worker worktree")
                 != expected_identity):
@@ -1943,13 +1952,13 @@ def _quarantine_worker_worktree(info, expected_identity):
                 quarantine_path, quarantine_identity)
     finally:
         if quarantine_fd is not None:
-            os.close(quarantine_fd)
+            _close_managed_directory(quarantine_fd)
         if not moved:
             try:
-                os.rmdir(quarantine_name, dir_fd=parent_fd)
+                _managed_rmdir_at(parent_fd, quarantine_name)
             except OSError:
                 pass
-        os.close(parent_fd)
+        _close_managed_directory(parent_fd)
 
 
 def _remove_worker_quarantine(path, identity):
@@ -1958,14 +1967,13 @@ def _remove_worker_quarantine(path, identity):
     parent_fd, _parent_identity = _open_managed_directory(
         parent, "worker worktree parent")
     try:
-        observed = os.stat(
-            name, dir_fd=parent_fd, follow_symlinks=False)
+        observed = _managed_stat_at(parent_fd, name)
         if (_validate_managed_directory_stat(
                 observed, "worker worktree quarantine") != identity):
             raise ValueError("worker worktree quarantine changed")
-        os.rmdir(name, dir_fd=parent_fd)
+        _managed_rmdir_at(parent_fd, name)
     finally:
-        os.close(parent_fd)
+        _close_managed_directory(parent_fd)
 
 
 def _restore_quarantined_worker_worktree(
@@ -1986,24 +1994,20 @@ def _restore_quarantined_worker_worktree(
             quarantine_root, "worker worktree quarantine")
         if observed_quarantine != quarantine_identity:
             raise ValueError("worker worktree quarantine changed")
-        observed = os.stat(
-            "worktree", dir_fd=quarantine_fd, follow_symlinks=False)
+        observed = _managed_stat_at(quarantine_fd, "worktree")
         if (_validate_managed_directory_stat(
                 observed, "quarantined worker worktree")
                 != expected_identity):
             raise ValueError("quarantined worker worktree changed")
         try:
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _managed_stat_at(parent_fd, name)
         except FileNotFoundError:
             pass
         else:
             raise ValueError("original worker worktree path is occupied")
-        os.rename(
-            "worktree", name, src_dir_fd=quarantine_fd,
-            dst_dir_fd=parent_fd)
+        _managed_rename_at(quarantine_fd, "worktree", parent_fd, name)
         restored = True
-        restored_stat = os.stat(
-            name, dir_fd=parent_fd, follow_symlinks=False)
+        restored_stat = _managed_stat_at(parent_fd, name)
         if (_validate_managed_directory_stat(
                 restored_stat, "restored worker worktree")
                 != expected_identity):
@@ -2013,8 +2017,8 @@ def _restore_quarantined_worker_worktree(
             raise ValueError("worker worktree parent changed during restore")
     finally:
         if quarantine_fd is not None:
-            os.close(quarantine_fd)
-        os.close(parent_fd)
+            _close_managed_directory(quarantine_fd)
+        _close_managed_directory(parent_fd)
     if not restored:
         raise OSError(
             f"worker worktree remains quarantined at {quarantine_path}")
@@ -6042,6 +6046,11 @@ def _write_supervisor_metadata_fd(fd, value):
     os.fsync(fd)
 
 
+# Sentinel byte for Windows advisory locks: far beyond any supervisor
+# metadata so mandatory region locking never blocks metadata reads.
+_NT_ADVISORY_LOCK_OFFSET = 1 << 30
+
+
 def _try_supervisor_advisory_lock(fd):
     """Acquire the first-byte/exclusive lock non-blocking; False means busy."""
     if os.name == "posix":
@@ -6063,13 +6072,19 @@ def _try_supervisor_advisory_lock(fd):
         except ImportError as exc:
             raise WorkerEvidenceUnsupported(
                 "Windows advisory locks are unavailable") from exc
-        os.lseek(fd, 0, os.SEEK_SET)
+        # msvcrt region locks are mandatory: locking byte 0 would make
+        # every metadata read through another handle fail with EACCES.
+        # Lock a sentinel byte far past any metadata instead (locking
+        # beyond EOF is allowed and contenders collide on the same byte).
+        os.lseek(fd, _NT_ADVISORY_LOCK_OFFSET, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                 return False
             raise
+        finally:
+            os.lseek(fd, 0, os.SEEK_SET)
         return True
     raise WorkerEvidenceUnsupported(
         "supervisor advisory locks are unavailable on this platform")
@@ -6082,8 +6097,11 @@ def _unlock_supervisor_advisory_lock(fd):
         return
     if os.name == "nt":
         import msvcrt
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        os.lseek(fd, _NT_ADVISORY_LOCK_OFFSET, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.lseek(fd, 0, os.SEEK_SET)
         return
     raise WorkerEvidenceUnsupported(
         "supervisor advisory locks are unavailable on this platform")
@@ -7625,10 +7643,105 @@ def _validate_managed_directory(path, label):
     return _validate_managed_directory_stat(os.lstat(path), label)
 
 
+class _ManagedDirectoryPath:
+    """Windows stand-in for a pinned managed-directory fd.
+
+    dir_fd operations are unsupported on Windows, so managed entries are
+    addressed by joining bare names against the validated absolute
+    directory path, and the directory's identity is re-verified before
+    every operation -- the same verified-identity posture the evidence
+    readers use there (#50 Phase C).
+    """
+
+    __slots__ = ("path", "label", "identity")
+
+    def __init__(self, path, label, identity):
+        self.path = path
+        self.label = label
+        self.identity = identity
+
+    def verify(self):
+        if _validate_managed_directory(
+                self.path, self.label) != self.identity:
+            raise OSError(f"{self.label} changed while operating")
+
+    def join(self, name):
+        if os.path.basename(name) != name or name in ("", ".", ".."):
+            raise OSError("managed entry name must be a bare filename")
+        return os.path.join(self.path, name)
+
+
+def _managed_stat_at(handle, name, follow_symlinks=False):
+    if isinstance(handle, int):
+        return os.stat(name, dir_fd=handle, follow_symlinks=follow_symlinks)
+    handle.verify()
+    return os.stat(handle.join(name), follow_symlinks=follow_symlinks)
+
+
+def _managed_open_at(handle, name, flags, mode):
+    if isinstance(handle, int):
+        return os.open(name, flags, mode, dir_fd=handle)
+    handle.verify()
+    return os.open(handle.join(name), flags, mode)
+
+
+def _managed_replace_at(src_handle, src_name, dst_handle, dst_name):
+    if isinstance(src_handle, int):
+        os.replace(src_name, dst_name,
+                   src_dir_fd=src_handle, dst_dir_fd=dst_handle)
+        return
+    src_handle.verify()
+    if dst_handle is not src_handle:
+        dst_handle.verify()
+    os.replace(src_handle.join(src_name), dst_handle.join(dst_name))
+
+
+def _managed_rename_at(src_handle, src_name, dst_handle, dst_name):
+    if isinstance(src_handle, int):
+        os.rename(src_name, dst_name,
+                  src_dir_fd=src_handle, dst_dir_fd=dst_handle)
+        return
+    src_handle.verify()
+    if dst_handle is not src_handle:
+        dst_handle.verify()
+    os.rename(src_handle.join(src_name), dst_handle.join(dst_name))
+
+
+def _managed_mkdir_at(handle, name, mode):
+    if isinstance(handle, int):
+        os.mkdir(name, mode, dir_fd=handle)
+        return
+    handle.verify()
+    os.mkdir(handle.join(name), mode)
+
+
+def _managed_rmdir_at(handle, name):
+    if isinstance(handle, int):
+        os.rmdir(name, dir_fd=handle)
+        return
+    handle.verify()
+    os.rmdir(handle.join(name))
+
+
+def _managed_unlink_at(handle, name):
+    if isinstance(handle, int):
+        os.unlink(name, dir_fd=handle)
+        return
+    handle.verify()
+    os.unlink(handle.join(name))
+
+
+def _close_managed_directory(handle):
+    if isinstance(handle, int):
+        os.close(handle)
+
+
 def _open_managed_directory(path, label):
     identity = _validate_managed_directory(path, label)
     directory = getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if os.name == "nt":
+        return _ManagedDirectoryPath(path, label, identity), identity
     if (os.name != "posix" or not isinstance(directory, int)
             or not directory or not isinstance(nofollow, int)
             or not nofollow):
@@ -7654,8 +7767,7 @@ def _open_managed_directory(path, label):
 
 def _inspect_managed_file_at(directory_fd, name, label, missing_ok=True):
     try:
-        observed = os.stat(
-            name, dir_fd=directory_fd, follow_symlinks=False)
+        observed = _managed_stat_at(directory_fd, name)
     except FileNotFoundError:
         if missing_ok:
             return None
@@ -7666,8 +7778,7 @@ def _inspect_managed_file_at(directory_fd, name, label, missing_ok=True):
 def _managed_file_size_at(directory_fd, name, identity, label):
     if identity is None:
         return 0
-    observed = os.stat(
-        name, dir_fd=directory_fd, follow_symlinks=False)
+    observed = _managed_stat_at(directory_fd, name)
     if _validate_managed_file_stat(observed, label) != identity:
         raise OSError(f"{label} changed while inspecting its size")
     return observed.st_size
@@ -7679,7 +7790,7 @@ def _remove_managed_file_at(directory_fd, name, identity, label):
     if _inspect_managed_file_at(
             directory_fd, name, label, missing_ok=False) != identity:
         raise OSError(f"{label} changed before removal")
-    os.unlink(name, dir_fd=directory_fd)
+    _managed_unlink_at(directory_fd, name)
 
 
 def _ensure_managed_directory(path, parent, label):
@@ -7722,11 +7833,12 @@ def _atomic_write_private_bytes(path, value, label):
     try:
         _inspect_managed_file_at(directory_fd, name, label)
         temporary = ".%s.%s" % (name, secrets.token_hex(16))
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+        flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                 | getattr(os, "O_NOFOLLOW", 0))
         cloexec = getattr(os, "O_CLOEXEC", 0)
         if isinstance(cloexec, int):
             flags |= cloexec
-        fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        fd = _managed_open_at(directory_fd, temporary, flags, 0o600)
         if os.name == "posix":
             os.fchmod(fd, 0o600)
         offset = 0
@@ -7742,9 +7854,7 @@ def _atomic_write_private_bytes(path, value, label):
                 directory, f"{label} directory") != directory_identity:
             raise OSError(f"{label} directory changed while writing")
         _inspect_managed_file_at(directory_fd, name, label)
-        os.replace(
-            temporary, name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        _managed_replace_at(directory_fd, temporary, directory_fd, name)
         temporary = None
         identity = _inspect_managed_file_at(
             directory_fd, name, label, missing_ok=False)
@@ -7758,10 +7868,10 @@ def _atomic_write_private_bytes(path, value, label):
             os.close(fd)
         if temporary is not None:
             try:
-                os.unlink(temporary, dir_fd=directory_fd)
+                _managed_unlink_at(directory_fd, temporary)
             except OSError:
                 pass
-        os.close(directory_fd)
+        _close_managed_directory(directory_fd)
 
 
 def _launch_agent_value(cfg, pool, backend, mesh_executable, log_path):
@@ -7849,7 +7959,7 @@ def _prune_oversized_worker_log_backups(path, max_bytes, backups):
                 directory, "worker log directory") != directory_identity:
             raise OSError("worker log directory changed while pruning")
     finally:
-        os.close(directory_fd)
+        _close_managed_directory(directory_fd)
 
 
 def _rotate_worker_log(path, max_bytes=WORKER_LOG_MAX_BYTES,
@@ -7902,9 +8012,8 @@ def _rotate_worker_log(path, max_bytes=WORKER_LOG_MAX_BYTES,
                         missing_ok=False) != identities[source]:
                     raise OSError(
                         "worker log backup changed during rotation")
-                os.replace(
-                    source, target,
-                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                _managed_replace_at(
+                    directory_fd, source, directory_fd, target)
         if _managed_file_size_at(
                 directory_fd, base, current, "worker log") > max_bytes:
             _remove_managed_file_at(
@@ -7922,15 +8031,13 @@ def _rotate_worker_log(path, max_bytes=WORKER_LOG_MAX_BYTES,
         if _validate_managed_directory(
                 directory, "worker log directory") != directory_identity:
             raise OSError("worker log directory changed during rotation")
-        os.replace(
-            base, base + ".1",
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        _managed_replace_at(directory_fd, base, directory_fd, base + ".1")
         if _validate_managed_directory(
                 directory, "worker log directory") != directory_identity:
             raise OSError("worker log directory changed during rotation")
         return True
     finally:
-        os.close(directory_fd)
+        _close_managed_directory(directory_fd)
 
 
 def _open_worker_log(path):
@@ -7945,14 +8052,16 @@ def _open_worker_log(path):
             directory_fd, name, "worker log")
         flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if not isinstance(nofollow, int) or not nofollow:
+        if ((not isinstance(nofollow, int) or not nofollow)
+                and os.name != "nt"):
             raise WorkerEvidenceUnsupported(
                 "reliable no-follow worker log open is unavailable")
-        flags |= nofollow
+        if isinstance(nofollow, int):
+            flags |= nofollow
         cloexec = getattr(os, "O_CLOEXEC", 0)
         if isinstance(cloexec, int):
             flags |= cloexec
-        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        fd = _managed_open_at(directory_fd, name, flags, 0o600)
         if before is None and os.name == "posix":
             os.fchmod(fd, 0o600)
         identity = _validate_managed_file_stat(
@@ -7973,7 +8082,7 @@ def _open_worker_log(path):
     finally:
         if fd is not None:
             os.close(fd)
-        os.close(directory_fd)
+        _close_managed_directory(directory_fd)
 
 
 def _bounded_worker_log_bytes(text, max_bytes):
