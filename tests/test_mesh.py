@@ -2761,10 +2761,12 @@ class BufferWaitTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.pop("A2ACAST_NODE", None)
         self._old = os.getcwd()
-        self.addCleanup(os.chdir, self._old)
         self.addCleanup(self._restore_env)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        # LIFO: restore cwd BEFORE tmp cleanup -- Windows cannot rmtree
+        # the process's current directory.
+        self.addCleanup(os.chdir, self._old)
         self.cfg = make_cfg(tmp.name)
 
     def _restore_env(self):
@@ -8749,6 +8751,10 @@ class SupervisorOwnershipTests(unittest.TestCase):
         with open(self.lock_path, "r", encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["token"], lock.token)
 
+    @unittest.skipUnless(os.name == "posix",
+                         "Windows cannot replace a path whose owner holds "
+                         "the open locked handle (no FILE_SHARE_DELETE), so "
+                         "this attack cannot occur there")
     def test_release_never_unlinks_replacement_lock_path(self):
         lock = mesh._acquire_supervise_lock(self.cfg, self.node)
         self.assertIsNotNone(lock)
@@ -9790,7 +9796,8 @@ class PoolLifecycleTests(unittest.TestCase):
                 self.cfg, self.pool, "codex", "mesh", absolute_log)
         with self.assertRaisesRegex(ValueError, "absolute"):
             mesh._launch_agent_value(
-                self.cfg, self.pool, "codex", "/usr/bin/mesh", "worker.log")
+                self.cfg, self.pool, "codex", fixture_abs("/usr/bin/mesh"),
+                "worker.log")
 
     def test_write_launch_agents_is_private_and_rejects_symlink_plist(self):
         launch_dir = os.path.join(self.tmp.name, "LaunchAgents")
@@ -9804,7 +9811,7 @@ class PoolLifecycleTests(unittest.TestCase):
         with mock.patch.object(mesh, "_launch_agents_directory",
                                return_value=launch_dir), \
              mock.patch.object(mesh.shutil, "which",
-                               return_value="/bin/echo"):
+                               return_value=sys.executable):
             with self.assertRaisesRegex(OSError, "regular file"):
                 mesh._write_launch_agents(self.cfg, self.pool)
 
@@ -9820,7 +9827,7 @@ class PoolLifecycleTests(unittest.TestCase):
         with mock.patch.object(mesh, "_launch_agents_directory",
                                return_value=launch_dir), \
              mock.patch.object(mesh.shutil, "which",
-                               return_value="/bin/echo"):
+                               return_value=sys.executable):
             paths = mesh._write_launch_agents(self.cfg, self.pool)
         self.assertEqual(set(paths), set(self.pool["workers"]))
         for backend, path in paths.items():
@@ -10059,7 +10066,8 @@ class PoolLifecycleTests(unittest.TestCase):
             self.assertEqual(
                 mesh._supervisor_pid_status(self.cfg, "worker-copilot"),
                 (os.getpid(), True))
-        kill.assert_called_once_with(os.getpid(), 0)
+        if os.name == "posix":  # Windows probes via OpenProcess (#49)
+            kill.assert_called_once_with(os.getpid(), 0)
 
         mesh._release_supervise_lock(lock)
         with mock.patch.object(mesh.os, "kill") as kill:
@@ -10638,6 +10646,10 @@ class WorkerSuperviseTests(unittest.TestCase):
         self.assertFalse(os.path.exists(
             mesh._supervise_pid_file(self.cfg, "worker-copilot")))
 
+    @unittest.skipUnless(os.name == "posix",
+                         "Windows cannot replace a path whose owner holds "
+                         "the open locked handle (no FILE_SHARE_DELETE), so "
+                         "this attack cannot occur there")
     def test_blocked_receiver_retains_singleton_and_preserves_replacements(self):
         class StopLoop(Exception):
             pass

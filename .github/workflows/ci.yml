@@ -21,27 +21,12 @@ jobs:
           - { os: ubuntu-latest, python: "3.12" }
           - { os: ubuntu-latest, python: "3.13" }
           - { os: macos-latest, python: "3.13" }
+          # Windows joined the required matrix once the suite went green
+          # on real windows-latest runners (#48/#50).
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.13" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests
-
-  # Observational until proven green in real runs, then move into the
-  # required `test` matrix. The README claims Windows support; the suite
-  # has FakeMSVCRT coverage but has never run on a real Windows host.
-  test-windows:
-    name: test (windows, py${{ matrix.python }}) [observational]
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.9", "3.13"]
-    runs-on: windows-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

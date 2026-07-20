@@ -95,8 +95,11 @@ the protocol, it doesn't create the mesh. On Copilot you also run `mesh
 copilot-setup` once per project. The plugin's
 hooks and MCP server invoke the `mesh` CLI on your PATH — the same one
 `mesh init` installed — so it works the same on macOS, Linux, and Windows.
-Keep it current: `pipx upgrade a2acast` (or `uv tool upgrade a2acast`) when
-you update the plugin.)
+On Windows, private state relies on your account's ACLs rather than POSIX
+file modes, and evidence files are opened with verified-identity checks in
+place of kernel `O_NOFOLLOW`; the full test suite runs green on
+windows-latest in CI. Keep it current: `pipx upgrade a2acast` (or `uv tool
+upgrade a2acast`) when you update the plugin.)
 
 **Autonomous Codex nodes (opt-in).** Claude and Copilot wake an idle session
 in-process to handle a `MESH_TASK`; Codex has no such path, so a joined Codex
