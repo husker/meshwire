@@ -4817,13 +4817,18 @@ def _finish_watch_timeout(me, timeout, follow):
 
 
 def _cmd_watch_owned(args, cfg, me):
+    # `watch` means keep watching: bare `mesh watch` streams forever, and
+    # one-shot mode requires an explicit --timeout (the harness re-arm
+    # pattern always passes one). Exiting after the first delivery
+    # silently deafened nodes whose operators ran the bare command (#55).
+    follow = args.follow or args.timeout is None
     # subscribe to own inbox AND the broadcast topic in one stream
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
     cf = cursor_file(cfg, me)
     since, seen = _load_cursor(cf)
     skip = set(seen)
     replay_seen = load_replays(cfg, me)
-    timeout = args.timeout or (None if args.follow else 10800)
+    timeout = args.timeout or (None if follow else 10800)
     deadline = (time.time() + timeout) if timeout else None
 
     def save_cursor(ev):
@@ -4874,7 +4879,7 @@ def _cmd_watch_owned(args, cfg, me):
                 print(f"MESH_WARN: {exc}; retrying same event",
                       file=sys.stderr)
                 if deadline is not None and time.time() >= deadline:
-                    _finish_watch_timeout(me, timeout, args.follow)
+                    _finish_watch_timeout(me, timeout, follow)
                     return
                 time.sleep(0.05)
         if not save_cursor(ev):
@@ -4889,7 +4894,7 @@ def _cmd_watch_owned(args, cfg, me):
             if line:
                 print(line)
                 delivered = True
-                if not args.follow:
+                if not follow:
                     print("MESH_WATCH_DONE kind=node_joined", flush=True)
                     return
             continue
@@ -4904,13 +4909,13 @@ def _cmd_watch_owned(args, cfg, me):
                 task_record=task_record)
         if delivery_kind is not False:
             delivered = True
-            if not args.follow:
+            if not follow:
                 if delivery_kind not in ("message", "task", "task_update"):
                     delivery_kind = "message"
                 print(f"MESH_WATCH_DONE kind={delivery_kind}", flush=True)
                 return
     if not delivered:
-        _finish_watch_timeout(me, timeout, args.follow)
+        _finish_watch_timeout(me, timeout, follow)
 
 
 def cmd_agent_session_hook(args):
@@ -9041,14 +9046,15 @@ def main():
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("watch",
-                       help="receive messages: --follow streams forever "
-                            "(preferred, run as a background task); without "
-                            "it, print one message and exit")
+                       help="receive messages: streams forever by default; "
+                            "--timeout N waits one-shot (print one message "
+                            "or time out, then exit)")
     p.add_argument("--follow", action="store_true",
-                   help="keep streaming — print every message as it arrives")
+                   help="keep streaming (the default; kept for "
+                        "compatibility and for explicitness with --timeout)")
     p.add_argument("--timeout", type=int, default=None,
-                   help="max seconds to wait (one-shot default 10800 = 3h; "
-                        "--follow default: forever)")
+                   help="one-shot mode: exit after the first delivery or "
+                        "after N seconds, whichever comes first")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
 

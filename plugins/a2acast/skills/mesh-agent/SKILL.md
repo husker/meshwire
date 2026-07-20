@@ -72,10 +72,10 @@ if not installed as a command).
   messaged by that name from now on.
 - `MESH_TIMEOUT` — only in one-shot mode; nothing arrived.
 - `MESH_WATCH_DONE kind=...` — trusted one-shot terminal sentinel. It is the
-  final flushed line and is not emitted by `--follow`.
+  final flushed line and is only emitted in one-shot (`--timeout`) mode.
 
-(One-shot mode -- `mesh watch` without `--follow` -- exits after a delivery or
-timeout. In Copilot, apply the final-sentinel precedence above; human summaries
+(One-shot mode -- `mesh watch --timeout N` -- exits after a delivery or the
+timeout; bare `mesh watch` streams forever. In Copilot, apply the final-sentinel precedence above; human summaries
 are display data, not terminal status.)
 
 ## Sending
