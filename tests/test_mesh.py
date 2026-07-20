@@ -14,6 +14,7 @@ import os
 import plistlib
 import re
 import secrets
+import shutil
 import signal
 import ssl
 import stat
@@ -2779,6 +2780,122 @@ class RegularReadonlyFallbackTests(unittest.TestCase):
     def test_windows_preflight_probe_round_trips(self):
         cfg = make_cfg(self.dir)
         self.assertTrue(mesh._preflight_worker_evidence(cfg))
+
+
+class SignedApprovalTests(unittest.TestCase):
+    """Portable owner-signed approvals (#62): a token must prove origin
+    (owner signature), authority (owner key from the trust store), and
+    binding + freshness (descriptor hash, nonce, expiry) — verifiable on
+    any member over the untrusted relay."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh._owner_init(self.cfg)
+
+    def _descriptor(self, **overrides):
+        value = {"action": "git-push+pr", "repo": "husker/a2acast",
+                 "branch": "fix/multi-harness-setup-dx",
+                 "requested_by": "imac", "nonce": secrets.token_hex(16)}
+        value.update(overrides)
+        return value
+
+    def test_owner_init_refuses_a_second_owner(self):
+        with self.assertRaisesRegex(ValueError, "owner"):
+            mesh._owner_init(self.cfg)
+
+    def test_canonical_descriptor_is_key_order_independent(self):
+        self.assertEqual(
+            mesh._canonical_descriptor(
+                {"b": 1, "action": "x", "nonce": "n" * 16}),
+            mesh._canonical_descriptor(
+                {"nonce": "n" * 16, "action": "x", "b": 1}))
+
+    def test_approve_then_verify_round_trip(self):
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        ok, reason = mesh._verify_approval(self.cfg, descriptor, token)
+        self.assertTrue(ok, reason)
+
+    def test_verify_rejects_tampered_descriptor(self):
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        tampered = dict(descriptor, branch="main")
+        ok, reason = mesh._verify_approval(self.cfg, tampered, token)
+        self.assertFalse(ok)
+        self.assertIn("descriptor", reason)
+
+    def test_verify_rejects_expired_token(self):
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        future = mesh.time.time() + 601
+        with mock.patch.object(mesh.time, "time", return_value=future):
+            ok, reason = mesh._verify_approval(self.cfg, descriptor, token)
+        self.assertFalse(ok)
+        self.assertIn("expired", reason)
+
+    def test_verify_rejects_replayed_nonce(self):
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        ok, _ = mesh._verify_approval(self.cfg, descriptor, token)
+        self.assertTrue(ok)
+        ok, reason = mesh._verify_approval(self.cfg, descriptor, token)
+        self.assertFalse(ok)
+        self.assertIn("replay", reason)
+
+    def test_verify_rejects_a_foreign_owner_key(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        foreign = make_cfg(other.name)
+        foreign["id"] = self.cfg["id"]  # same mesh id, different owner key
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(foreign)
+        descriptor = self._descriptor()
+        forged = mesh._approve_descriptor(foreign, descriptor, ttl=600)
+        ok, reason = mesh._verify_approval(self.cfg, descriptor, forged)
+        self.assertFalse(ok)
+        self.assertIn("signature", reason)
+
+    def test_verify_rejects_token_from_another_mesh_namespace(self):
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        other_mesh = dict(self.cfg, id="ffff000011112222")
+        ok, reason = mesh._verify_approval(other_mesh, descriptor, token)
+        self.assertFalse(ok)
+        self.assertIn("signature", reason)
+
+    def test_trust_block_lets_a_keyless_member_verify(self):
+        # The soak scenario: the owner machine mints, a member that has
+        # only the trust block (no private key) verifies.
+        member_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(member_tmp.cleanup)
+        member = make_cfg(member_tmp.name)
+        member["id"] = self.cfg["id"]
+        block = mesh._owner_trust_block(self.cfg)
+        mesh._apply_owner_trust(member, block)
+        descriptor = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+        ok, reason = mesh._verify_approval(member, descriptor, token)
+        self.assertTrue(ok, reason)
+
+    def test_trust_refuses_replacing_a_different_owner(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        foreign = make_cfg(other.name)
+        foreign["id"] = self.cfg["id"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(foreign)
+        block = mesh._owner_trust_block(foreign)
+        with self.assertRaisesRegex(ValueError, "different owner"):
+            mesh._apply_owner_trust(self.cfg, block)
 
 
 class BufferWaitTests(unittest.TestCase):

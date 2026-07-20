@@ -993,6 +993,260 @@ def save_replays(cfg, node, values):
     _write_json_secure(replay_file(cfg, node), sorted(values))
 
 
+# -- signed approvals (#62) ----------------------------------------------
+# A mesh message proves possession of the shared key, not who sent it. An
+# authorization that must cross the mesh therefore carries an Ed25519
+# signature from the mesh OWNER key (via `ssh-keygen -Y`, shipped with
+# macOS, Linux, and stock Windows 10+), bound to one canonical action
+# descriptor, single-use, and expiring. Any member holding the owner
+# trust block verifies offline; the relay never needs to be trusted.
+
+OWNER_KEY_NAME = ".meshwire.owner"
+OWNER_TRUST_NAME = ".meshwire.trust.json"
+APPROVAL_LEDGER_NAME = ".meshwire.approvals.json"
+APPROVAL_TTL_DEFAULT = 3600
+APPROVAL_TOKEN_MAX = 16384
+
+
+def _ssh_keygen_binary():
+    binary = shutil.which("ssh-keygen")
+    if not binary:
+        raise ValueError(
+            "ssh-keygen is required for signed approvals and was not found "
+            "on PATH (OpenSSH ships with macOS, Linux, and Windows 10+)")
+    return binary
+
+
+def _approval_namespace(cfg):
+    return f"a2acast-approval@{cfg['id']}"
+
+
+def owner_key_file(cfg):
+    return os.path.join(cfg["_dir"], OWNER_KEY_NAME)
+
+
+def owner_trust_file(cfg):
+    return os.path.join(cfg["_dir"], OWNER_TRUST_NAME)
+
+
+def _approval_ledger_file(cfg):
+    return os.path.join(cfg["_dir"], APPROVAL_LEDGER_NAME)
+
+
+def _canonical_descriptor(value):
+    """Stable bytes for hashing/signing: sorted keys, no whitespace."""
+    if (not isinstance(value, dict) or not value
+            or not isinstance(value.get("action"), str)
+            or not value["action"]):
+        raise ValueError(
+            "approval descriptor must be an object with an 'action' string")
+    try:
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("approval descriptor must be plain JSON") from exc
+    return rendered.encode("utf-8")
+
+
+def _load_owner_trust(cfg):
+    try:
+        with open(owner_trust_file(cfg), "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(
+            "no mesh owner is trusted here yet — run `mesh owner-init` on "
+            "the owner machine and paste its printed block here with "
+            "`mesh owner-trust <block>`") from None
+    except (OSError, ValueError) as exc:
+        raise ValueError("owner trust store is unreadable") from exc
+    pub = value.get("owner_pub") if isinstance(value, dict) else None
+    if not isinstance(pub, str) or not pub.strip():
+        raise ValueError("owner trust store is invalid")
+    return pub.strip()
+
+
+def _owner_init(cfg):
+    """Create the mesh owner keypair here and trust it locally."""
+    key_path = owner_key_file(cfg)
+    if os.path.exists(key_path) or os.path.exists(owner_trust_file(cfg)):
+        raise ValueError("a mesh owner key or trust store already exists "
+                         "here; refusing to replace it")
+    binary = _ssh_keygen_binary()
+    completed = subprocess.run(
+        [binary, "-q", "-t", "ed25519", "-N", "", "-C",
+         f"a2acast-owner-{cfg['mesh']}", "-f", key_path],
+        capture_output=True, text=True, timeout=60)
+    if completed.returncode != 0:
+        raise ValueError("ssh-keygen could not create the owner key: "
+                         + completed.stderr.strip())
+    with open(key_path + ".pub", "r", encoding="utf-8") as f:
+        pub = f.read().strip()
+    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
+    print("mesh owner key created — never leaves this machine. Distribute")
+    print("trust by running this on every member (share like an invite):")
+    print(f"  mesh owner-trust {_owner_trust_block(cfg)}")
+    return pub
+
+
+def _owner_trust_block(cfg):
+    pub = _load_owner_trust(cfg)
+    body = json.dumps({"mesh": cfg["mesh"], "id": cfg["id"],
+                       "owner_pub": pub},
+                      sort_keys=True, separators=(",", ":"))
+    return "mwtrust1-" + base64.urlsafe_b64encode(
+        body.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _apply_owner_trust(cfg, block):
+    if not isinstance(block, str) or not block.startswith("mwtrust1-"):
+        raise ValueError("not an owner trust block")
+    raw = block[len("mwtrust1-"):]
+    try:
+        value = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("owner trust block is malformed") from exc
+    if not isinstance(value, dict) or value.get("id") != cfg["id"]:
+        raise ValueError("owner trust block is for a different mesh")
+    pub = value.get("owner_pub")
+    if not isinstance(pub, str) or not pub.strip():
+        raise ValueError("owner trust block is missing the owner key")
+    try:
+        existing = _load_owner_trust(cfg)
+    except ValueError:
+        existing = None
+    if existing is not None and existing != pub.strip():
+        raise ValueError("a different owner is already trusted here; "
+                         "refusing to replace it")
+    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub.strip()})
+    return pub.strip()
+
+
+def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
+    """Mint an owner-signed, single-use, expiring approval token."""
+    if not isinstance(ttl, int) or isinstance(ttl, bool) \
+            or not 0 < ttl <= 86400:
+        raise ValueError("approval ttl must be 1..86400 seconds")
+    canonical = _canonical_descriptor(descriptor)
+    nonce = descriptor.get("nonce")
+    if not isinstance(nonce, str) or len(nonce) < 16:
+        raise ValueError("approval descriptor needs a nonce of >=16 chars")
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        raise ValueError("this machine does not hold the mesh owner key "
+                         "(run `mesh owner-init` where the owner works)")
+    issued = int(time.time())
+    body = {"v": 1, "alg": "ssh-ed25519",
+            "h": hashlib.sha256(canonical).hexdigest(),
+            "nonce": nonce, "iat": issued, "exp": issued + ttl}
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    binary = _ssh_keygen_binary()
+    workdir = tempfile.mkdtemp(prefix=".mw-approve-", dir=cfg["_dir"])
+    payload_path = os.path.join(workdir, "payload")
+    try:
+        with open(payload_path, "wb") as f:
+            f.write(payload)
+        completed = subprocess.run(
+            [binary, "-Y", "sign", "-f", key_path,
+             "-n", _approval_namespace(cfg), payload_path],
+            capture_output=True, text=True, timeout=60)
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign the approval: "
+                             + completed.stderr.strip())
+        with open(payload_path + ".sig", "r", encoding="utf-8") as f:
+            signature = f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    token = json.dumps({"body": body, "sig": signature},
+                       sort_keys=True, separators=(",", ":"))
+    return "mwapproval1-" + base64.urlsafe_b64encode(
+        token.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _verify_approval(cfg, descriptor, token):
+    """Return (ok, reason); records the nonce on success (single use)."""
+    try:
+        canonical = _canonical_descriptor(descriptor)
+    except ValueError as exc:
+        return False, f"descriptor invalid: {exc}"
+    if (not isinstance(token, str)
+            or not token.startswith("mwapproval1-")
+            or len(token) > APPROVAL_TOKEN_MAX):
+        return False, "token malformed"
+    raw = token[len("mwapproval1-"):]
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+        body, signature = parsed["body"], parsed["sig"]
+    except (ValueError, TypeError, KeyError):
+        return False, "token malformed"
+    if not isinstance(body, dict) or not isinstance(signature, str):
+        return False, "token malformed"
+    if body.get("v") != 1:
+        return False, "token version unsupported"
+    if body.get("h") != hashlib.sha256(canonical).hexdigest():
+        return False, "descriptor does not match the approved action"
+    nonce = descriptor.get("nonce")
+    if (not isinstance(nonce, str) or len(nonce) < 16
+            or body.get("nonce") != nonce):
+        return False, "descriptor does not match the approved nonce"
+    now = time.time()
+    exp, iat = body.get("exp"), body.get("iat")
+    if (not isinstance(exp, int) or isinstance(exp, bool)
+            or not isinstance(iat, int) or isinstance(iat, bool)
+            or iat > now + 300 or exp - iat > 86400 + 300):
+        return False, "token timestamps invalid"
+    if now >= exp:
+        return False, "token expired"
+    try:
+        ledger = _load_json_regular(
+            _approval_ledger_file(cfg), require_private=False,
+            max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+    except FileNotFoundError:
+        ledger = {}
+    except (OSError, ValueError):
+        return False, "approval ledger is unreadable"
+    if not isinstance(ledger, dict):
+        ledger = {}
+    if nonce in ledger:
+        return False, "replayed approval (nonce already used)"
+    try:
+        owner_pub = _load_owner_trust(cfg)
+    except ValueError as exc:
+        return False, str(exc)
+    try:
+        binary = _ssh_keygen_binary()
+    except ValueError as exc:
+        return False, str(exc)
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    principal = f"owner@{cfg['id']}"
+    workdir = tempfile.mkdtemp(prefix=".mw-verify-", dir=cfg["_dir"])
+    try:
+        sig_path = os.path.join(workdir, "payload.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(signature)
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{principal} "
+                    f"namespaces=\"{_approval_namespace(cfg)}\" "
+                    f"{owner_pub}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+             "-n", _approval_namespace(cfg), "-s", sig_path],
+            input=payload, capture_output=True, timeout=60)
+        if completed.returncode != 0:
+            return False, "signature verification failed"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    pruned = {value: seen for value, seen in ledger.items()
+              if isinstance(seen, int) and seen > now - 86400}
+    pruned[nonce] = int(exp)
+    _write_json_secure(_approval_ledger_file(cfg), pruned)
+    return True, "ok"
+
+
 def status_file(cfg, node):
     return os.path.join(cfg["_dir"], STATUS_NAME.format(node))
 
@@ -4013,6 +4267,46 @@ def _print_invite(cfg):
 
 def cmd_invite(args):
     _print_invite(load_config())
+
+
+def cmd_owner_init(args):
+    try:
+        _owner_init(load_config())
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+
+
+def cmd_owner_trust(args):
+    try:
+        _apply_owner_trust(load_config(), args.block)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    print("mesh owner trusted — approvals from this owner verify here now")
+
+
+def cmd_approve(args):
+    cfg = load_config()
+    try:
+        descriptor = json.loads(args.descriptor)
+    except ValueError as exc:
+        sys.exit(f"error: descriptor is not valid JSON: {exc}")
+    try:
+        token = _approve_descriptor(cfg, descriptor, ttl=args.ttl)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    print(token)
+
+
+def cmd_verify_approval(args):
+    cfg = load_config()
+    try:
+        descriptor = json.loads(args.descriptor)
+    except ValueError as exc:
+        sys.exit(f"error: descriptor is not valid JSON: {exc}")
+    ok, reason = _verify_approval(cfg, descriptor, args.token)
+    if not ok:
+        sys.exit(f"rejected: {reason}")
+    print("approved: " + reason)
 
 
 def cmd_rotate_key(args):
@@ -9021,6 +9315,35 @@ def main():
     p.add_argument("code", nargs="?", default=None,
                    help="rotation code printed by another node")
     p.set_defaults(fn=cmd_rotate_key)
+
+    p = sub.add_parser("owner-init",
+                       help="create the mesh owner key on this machine and "
+                            "print the trust block for the other members")
+    p.set_defaults(fn=cmd_owner_init)
+
+    p = sub.add_parser("owner-trust",
+                       help="trust the mesh owner here from its mwtrust1- "
+                            "block (share it privately, like an invite)")
+    p.add_argument("block")
+    p.set_defaults(fn=cmd_owner_trust)
+
+    p = sub.add_parser("approve",
+                       help="owner machine only: mint a single-use, "
+                            "expiring, owner-signed approval token for one "
+                            "action descriptor (canonical JSON)")
+    p.add_argument("descriptor", help="action descriptor JSON — must "
+                                      "include 'action' and a 'nonce'")
+    p.add_argument("--ttl", type=int, default=APPROVAL_TTL_DEFAULT,
+                   help="seconds until the token expires (default 3600)")
+    p.set_defaults(fn=cmd_approve)
+
+    p = sub.add_parser("verify-approval",
+                       help="verify an owner approval token against a "
+                            "descriptor; exits 0 only if the signature, "
+                            "binding, freshness, and single-use all hold")
+    p.add_argument("descriptor")
+    p.add_argument("token")
+    p.set_defaults(fn=cmd_verify_approval)
 
     p = sub.add_parser("iam", help="set this machine's node identity")
     p.add_argument("node")
