@@ -454,6 +454,92 @@ class JoinHarnessTests(unittest.TestCase):
         self.assertTrue(os.path.exists(".meshwire.node"))
 
 
+class JoinAlreadyJoinedTests(unittest.TestCase):
+    """Adding a second harness to an already-joined project is legitimate and
+    does not need `join` at all. The refusal must say so, or the operator (or
+    the agent driving them) concludes setup is blocked and stops."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        self.cfg = make_cfg(self._tmp.name)
+        # distinctive name: make_cfg's default "t" is a substring of almost
+        # any message, so asserting on it would prove nothing
+        self.cfg["mesh"] = "alphamesh"
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in self.cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _code_for(self, cfg):
+        return mesh.join_code({k: v for k, v in cfg.items()
+                               if not k.startswith("_")})
+
+    def test_rejoining_same_mesh_names_the_supported_flow(self):
+        with self.assertRaises(SystemExit) as ctx:
+            mesh.cmd_join(argparse.Namespace(
+                code=self._code_for(self.cfg), as_node=None))
+        msg = str(ctx.exception)
+        # names the mesh it is already in, so the operator can tell this is
+        # not a conflict with some other mesh
+        self.assertIn("alphamesh", msg)
+        self.assertIn("already", msg)
+        # points at the two commands that actually accomplish the intent
+        self.assertIn("-setup", msg)
+        self.assertIn("mesh iam", msg)
+        # and does not imply data loss, which is what derailed the diagnosis
+        self.assertNotIn("overwrit", msg.lower())
+
+    def test_joining_a_different_mesh_still_refuses_and_says_why(self):
+        other = make_cfg(self._tmp.name)
+        other["mesh"] = "othermesh"
+        other["id"] = "def456"
+        with self.assertRaises(SystemExit) as ctx:
+            mesh.cmd_join(argparse.Namespace(
+                code=self._code_for(other), as_node=None))
+        msg = str(ctx.exception)
+        # both mesh names appear so the collision is legible
+        self.assertIn("othermesh", msg)
+        self.assertIn("alphamesh", msg)
+        # the config must be left untouched
+        with open(mesh.CONFIG_NAME) as f:
+            self.assertEqual(json.load(f)["mesh"], "alphamesh")
+
+    def test_iam_warns_that_owned_cli_registration_is_stale(self):
+        """Renaming under Codex writes the pin but cannot reach the baked-in
+        --as in its MCP registration. The rename must not look like it took."""
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_detect_harness", return_value="codex"), \
+             mock.patch.object(mesh, "_mutate_config"):
+            with contextlib.redirect_stdout(out):
+                mesh.cmd_iam(argparse.Namespace(node="renamed"))
+        text = out.getvalue()
+        self.assertIn("renamed", text)
+        self.assertIn("mesh codex-setup", text)
+        with open(".meshwire.node.codex") as f:
+            self.assertEqual(f.read().strip(), "renamed")
+
+    def test_iam_stays_quiet_for_workspace_mcp_harnesses(self):
+        """Claude resolves identity at runtime, so there is nothing stale to
+        warn about and the noise would be wrong."""
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_detect_harness",
+                               return_value="claude"), \
+             mock.patch.object(mesh, "_mutate_config"):
+            with contextlib.redirect_stdout(out):
+                mesh.cmd_iam(argparse.Namespace(node="renamed"))
+        self.assertNotIn("baked", out.getvalue())
+
+    def test_init_in_joined_project_names_the_supported_flow(self):
+        with self.assertRaises(SystemExit) as ctx:
+            mesh.cmd_init(argparse.Namespace(nodes="", as_node=None))
+        msg = str(ctx.exception)
+        self.assertIn("-setup", msg)
+        self.assertIn("mesh iam", msg)
+
+
 class InitHarnessTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.pop("A2ACAST_NODE", None)
@@ -5348,6 +5434,40 @@ class CodexSetupTests(unittest.TestCase):
                                expected_cfg, "--as",
                                mesh._default_node_name("codex")])
         popen.assert_not_called()
+
+    def test_derived_identity_is_persisted_to_the_pin_file(self):
+        """codex-setup bakes --as into the MCP registration, and --as is top
+        precedence in my_node. If the derived name is not also written to the
+        pin file, nothing can ever change it: a later `mesh iam` writes a pin
+        the MCP server will never consult."""
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run", return_value=ok):
+            with mock.patch.object(mesh.subprocess, "Popen"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
+        pin = ".meshwire.node.codex"
+        self.assertTrue(os.path.exists(pin),
+                        "codex-setup must persist the identity it pinned")
+        with open(pin) as f:
+            self.assertEqual(f.read().strip(),
+                             mesh._default_node_name("codex"))
+
+    def test_existing_pin_is_not_clobbered_by_setup(self):
+        with open(".meshwire.node.codex", "w") as f:
+            f.write("chosen-name\n")
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(mesh.subprocess, "run",
+                               return_value=ok) as run:
+            with mock.patch.object(mesh.subprocess, "Popen"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mesh.cmd_codex_setup(argparse.Namespace(
+                        dir=None, supervise=False,
+                        supervise_sandbox="read-only"))
+        self.assertEqual(run.call_args[0][0][-2:], ["--as", "chosen-name"])
+        with open(".meshwire.node.codex") as f:
+            self.assertEqual(f.read().strip(), "chosen-name")
 
     def test_migrated_identity_is_used_as_node_name(self):
         with open(mesh.NODE_NAME, "w") as f:

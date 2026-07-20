@@ -3894,9 +3894,51 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
 
 # ---------------------------------------------------------------- commands
 
+def _harness_setup_hint():
+    """The setup command for the harness running this process, or every
+    harness's command when we cannot tell which one this is."""
+    harness = _detect_harness()
+    if harness in HARNESS_SPECS:
+        return HARNESS_SPECS[harness].setup_command
+    return " | ".join(sorted(spec.setup_command
+                             for spec in HARNESS_SPECS.values()))
+
+
+def _already_configured_error(existing, incoming=None):
+    """Explain a refused init/join.
+
+    One project shares one mesh config across every harness in it; only the
+    node identity differs. So an existing config is usually the operator
+    wiring up a SECOND harness here, which needs `<harness>-setup`, not
+    another join. Saying only "already exists" reads as a hard block and
+    sends people looking for a way to replace the file.
+    """
+    try:
+        with open(existing, "r", encoding="utf-8") as f:
+            current = json.load(f)
+    except (OSError, ValueError):
+        current = {}
+    name = current.get("mesh")
+    head = (f"error: this project already belongs to mesh '{name}' "
+            f"({existing})" if name else
+            f"error: {CONFIG_NAME} already exists at {existing}")
+    if (incoming and current.get("id")
+            and incoming.get("id") != current.get("id")):
+        return (f"{head}\n"
+                f"  refusing to swap it for mesh "
+                f"'{incoming.get('mesh')}'. Move or delete that file first "
+                f"if you really do mean to switch meshes.")
+    return (f"{head}\n"
+            f"  You do not need to join again. Every harness in a project "
+            f"shares one mesh config;\n"
+            f"  only the node identity differs.\n"
+            f"  Wire another agent harness here: {_harness_setup_hint()}\n"
+            f"  Name this session's node:        mesh iam <name>")
+
+
 def cmd_init(args):
     if find_config():
-        sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
+        sys.exit(_already_configured_error(find_config()))
     nodes = [n.strip() for n in (args.nodes or "").split(",") if n.strip()]
     if BROADCAST in nodes:
         sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
@@ -3962,7 +4004,14 @@ def _write_config_here(cfg):
 
 def cmd_join(args):
     if find_config():
-        sys.exit(f"error: {CONFIG_NAME} already exists at {find_config()}")
+        # parse first so the refusal can tell "same mesh, wrong command" from
+        # "different mesh, real collision"; a corrupt code is not worth
+        # failing on here, the existing config is the story either way
+        try:
+            incoming = parse_join_code(args.code)
+        except SystemExit:
+            incoming = None
+        sys.exit(_already_configured_error(find_config(), incoming))
     cfg = parse_join_code(args.code)
     for field in ("mesh", "id", "server"):
         if not cfg.get(field):
@@ -4058,9 +4107,19 @@ def cmd_iam(args):
             if args.node not in latest["nodes"]:
                 latest["nodes"].append(args.node)
         _mutate_config(cfg, _add_node)
-    with open(node_file(cfg, _detect_harness()), "w", encoding="utf-8") as f:
+    harness = _detect_harness()
+    with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
+    spec = HARNESS_SPECS.get(harness)
+    if spec and spec.settings_kind == "owned-cli":
+        # owned-cli harnesses bake --as into their MCP registration, and --as
+        # outranks the pin we just wrote. Without this line the rename looks
+        # like it worked and silently does nothing.
+        print(f"  note: {spec.display_name} has the previous name baked into "
+              f"its MCP registration.\n"
+              f"  Re-run `{spec.setup_command}` for this to take effect "
+              f"there.")
 
 
 def cmd_presence(args):
@@ -7411,6 +7470,11 @@ def cmd_codex_setup(args):
             me = None
     me = me or _default_node_name(spec.name)
     if me:
+        # persist it: --as is top precedence in my_node, so the baked-in name
+        # wins over the pin file forever. Without this the pin never exists,
+        # and a later `mesh iam` writes one the MCP server never consults —
+        # leaving the node permanently unrenameable.
+        _pin_node_name({"_dir": project_dir}, me, spec.name)
         cmd += ["--as", me]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
