@@ -2417,18 +2417,32 @@ def _validate_private_worker_stat(observed):
 
 
 def _open_regular_readonly(path, require_private=True):
-    """Open private worker state with stable no-follow identity checks."""
+    """Open private worker state without following a final symlink.
+
+    Kernel O_NOFOLLOW enforces that atomically where it exists. Windows
+    has no O_NOFOLLOW, so it takes the verified-identity path instead
+    (the _open_mesh_config_readonly / _open_supervisor_state pattern):
+    the leading lstat rejects a symlink/non-regular final component,
+    and the same device/inode must be observed during and after
+    opening. Any other platform without O_NOFOLLOW keeps failing
+    closed.
+    """
     before = os.lstat(path)
     identity = _validate_regular_stat(before, require_private)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not isinstance(nofollow, int) or not nofollow:
+    kernel_nofollow = isinstance(nofollow, int) and bool(nofollow)
+    if not kernel_nofollow and os.name != "nt":
         raise WorkerEvidenceUnsupported(
             "reliable no-follow open is unavailable")
-    fd = os.open(path, os.O_RDONLY | nofollow)
+    fd = os.open(path, os.O_RDONLY | (nofollow if kernel_nofollow else 0))
     try:
         after = os.fstat(fd)
         if _validate_regular_stat(after, require_private) != identity:
             raise OSError("worker state changed while opening")
+        if (not kernel_nofollow
+                and _validate_regular_stat(
+                    os.lstat(path), require_private) != identity):
+            raise OSError("worker state path changed while opening")
         return fd
     except BaseException:
         os.close(fd)
@@ -2495,7 +2509,8 @@ def _load_json_regular(path, require_private=True, max_bytes=None):
 def _preflight_worker_evidence(cfg):
     """Prove no-follow/stable identity, distinguishing transient failure."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not isinstance(nofollow, int) or not nofollow:
+    if ((not isinstance(nofollow, int) or not nofollow)
+            and os.name != "nt"):
         raise WorkerEvidenceUnsupported(
             "reliable no-follow open is unavailable")
     probe = os.path.join(
