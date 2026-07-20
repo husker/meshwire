@@ -2628,6 +2628,56 @@ class PresenceLockTests(unittest.TestCase):
                             mesh.presence_lock_file(self.cfg, "beta"))
 
 
+class PidLivenessTests(unittest.TestCase):
+    """The lock/pidfile liveness probe must never signal the probed pid.
+
+    os.kill(pid, 0) is only a probe on POSIX. On Windows signal 0 is
+    CTRL_C_EVENT, so os.kill(pid, 0) fires a real console Ctrl+C at the
+    process group; the stray interrupt then surfaces as KeyboardInterrupt
+    at the next blocking Thread.start() in the main thread (issue #48).
+    """
+
+    def test_own_process_is_live(self):
+        self.assertTrue(mesh._pid_is_live(os.getpid()))
+
+    def test_dead_pid_is_not_live(self):
+        self.assertFalse(mesh._pid_is_live(99999999))
+
+    def test_nonpositive_pids_are_not_live(self):
+        # 0 / negative pids only come from corrupt lock files, and
+        # kill(0, 0) signals our own process group (the whole console on
+        # Windows) -- the probe must refuse them outright.
+        self.assertFalse(mesh._pid_is_live(0))
+        self.assertFalse(mesh._pid_is_live(-1))
+
+    def test_huge_pid_is_not_live(self):
+        # Supervisor metadata may carry garbage; matches the historical
+        # OverflowError-means-dead behaviour of the os.kill probe.
+        self.assertFalse(mesh._pid_is_live(10 ** 100))
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only regression (#48)")
+    def test_windows_probe_never_calls_os_kill(self):
+        bomb = mock.patch.object(
+            mesh.os, "kill",
+            side_effect=AssertionError("os.kill(pid, 0) sends CTRL_C_EVENT"))
+        with bomb:
+            self.assertTrue(mesh._pid_is_live(os.getpid()))
+            self.assertFalse(mesh._pid_is_live(99999999))
+
+    def test_hook_lock_liveness_routes_through_safe_probe(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        lock = os.path.join(tmp.name, "lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid()}, f)
+        probed = []
+        with mock.patch.object(mesh, "_pid_is_live",
+                               side_effect=lambda pid:
+                               probed.append(pid) or True):
+            self.assertTrue(mesh._hook_lock_is_live(lock))
+        self.assertEqual(probed, [os.getpid()])
+
+
 class BufferWaitTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.pop("A2ACAST_NODE", None)
