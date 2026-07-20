@@ -29,6 +29,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import mesh
 
 
+def fixture_abs(posix_path):
+    """Platform-absolute fixture path. POSIX forms like fixture_abs("/tmp/repo") stop
+    being absolute on Windows under py3.13+ ntpath.isabs(), so root them
+    on a drive there; POSIX runs keep the literal unchanged."""
+    if os.name != "nt":
+        return posix_path
+    return "C:" + posix_path.replace("/", "\\")
+
+
 def make_cfg(tmpdir=None, key=True):
     """A minimal in-memory mesh config; pass tmpdir to give it a home on disk."""
     cfg = {"mesh": "t", "id": "abc123", "server": "https://ntfy.example",
@@ -3275,7 +3284,7 @@ class WorkerRoutingTests(unittest.TestCase):
 
     def job(self, task_class="normal", kind="implementation"):
         return {
-            "repo": "/tmp/repo", "base": "a" * 40,
+            "repo": fixture_abs("/tmp/repo"), "base": "a" * 40,
             "task": "add a regression test", "verification": [],
             "class": task_class, "kind": kind,
         }
@@ -3325,7 +3334,7 @@ class WorkerRoutingTests(unittest.TestCase):
                                create=True), \
              mock.patch.object(sys, "argv", [
                  "mesh", "delegate", "auto", "add", "a", "test",
-                 "--repo", "/tmp/repo", "--class", "normal",
+                 "--repo", fixture_abs("/tmp/repo"), "--class", "normal",
                  "--kind", "implementation", "--wait", "30"]):
             mesh.main()
         self.assertEqual(called[0].backend, "auto")
@@ -3351,7 +3360,7 @@ class WorkerDispatchTests(unittest.TestCase):
             },
         }
         self.job = {
-            "repo": "/tmp/repo", "base": "a" * 40,
+            "repo": fixture_abs("/tmp/repo"), "base": "a" * 40,
             "task": "add a regression test", "verification": [],
             "class": "normal", "kind": "implementation",
         }
@@ -3572,7 +3581,7 @@ class WorkerDispatchTests(unittest.TestCase):
     def args(self, **overrides):
         values = {
             "backend": "auto", "task": ["do", "it"],
-            "repo": "/tmp/repo", "base": None,
+            "repo": fixture_abs("/tmp/repo"), "base": None,
             "kind": "implementation", "task_class": "normal",
             "verify": [], "wait": 0, "as_node": None,
         }
@@ -4816,7 +4825,7 @@ class WorkerDelegateMCPTests(unittest.TestCase):
              mock.patch.object(
                  mesh, "_build_delegate_job",
                  return_value={
-                     "repo": "/tmp/repo", "base": "a" * 40,
+                     "repo": fixture_abs("/tmp/repo"), "base": "a" * 40,
                      "task": "review it", "verification": [],
                      "kind": "analysis", "class": "normal",
                  }), \
@@ -4825,7 +4834,7 @@ class WorkerDelegateMCPTests(unittest.TestCase):
                  return_value=("task-1", "worker-goose")) as dispatch, \
              mock.patch.object(mesh, "_await_result") as wait:
             result = self.server._tool_delegate({
-                "repo": "/tmp/repo", "text": "review it",
+                "repo": fixture_abs("/tmp/repo"), "text": "review it",
                 "kind": "analysis",
             })
         value = json.loads(result)
@@ -4838,7 +4847,7 @@ class WorkerDelegateMCPTests(unittest.TestCase):
         with mock.patch.object(mesh, "load_pool_config") as load:
             with self.assertRaisesRegex(ValueError, "arguments"):
                 self.server._tool_delegate({
-                    "repo": "/tmp/repo", "text": "review it",
+                    "repo": fixture_abs("/tmp/repo"), "text": "review it",
                     "wait": 30,
                 })
         load.assert_not_called()
@@ -4846,11 +4855,11 @@ class WorkerDelegateMCPTests(unittest.TestCase):
     def test_mesh_delegate_rejects_invalid_fields_before_loading_pool(self):
         cases = [
             {"repo": "relative", "text": "review it"},
-            {"repo": "/tmp/repo", "text": ""},
-            {"repo": "/tmp/repo", "text": "review it", "backend": True},
-            {"repo": "/tmp/repo", "text": "review it", "kind": []},
-            {"repo": "/tmp/repo", "text": "review it", "class": "urgent"},
-            {"repo": "/tmp/repo", "text": "review it",
+            {"repo": fixture_abs("/tmp/repo"), "text": ""},
+            {"repo": fixture_abs("/tmp/repo"), "text": "review it", "backend": True},
+            {"repo": fixture_abs("/tmp/repo"), "text": "review it", "kind": []},
+            {"repo": fixture_abs("/tmp/repo"), "text": "review it", "class": "urgent"},
+            {"repo": fixture_abs("/tmp/repo"), "text": "review it",
              "verification": ("tests",)},
         ]
         for args in cases:
@@ -4866,7 +4875,7 @@ class WorkerDelegateMCPTests(unittest.TestCase):
              mock.patch.object(
                  mesh, "_build_delegate_job",
                  return_value={
-                     "repo": "/tmp/repo", "base": "a" * 40,
+                     "repo": fixture_abs("/tmp/repo"), "base": "a" * 40,
                      "task": "review it", "verification": [],
                      "kind": "analysis", "class": "normal",
                  }), \
@@ -4875,7 +4884,7 @@ class WorkerDelegateMCPTests(unittest.TestCase):
              mock.patch.object(mesh, "_dispatch_worker_job") as dispatch:
             with self.assertRaisesRegex(ValueError, "no worker backend"):
                 self.server._tool_delegate({
-                    "repo": "/tmp/repo", "text": "review it",
+                    "repo": fixture_abs("/tmp/repo"), "text": "review it",
                     "kind": "analysis",
                 })
         dispatch.assert_not_called()
@@ -5871,7 +5880,7 @@ class RecipientScopedTaskTests(unittest.TestCase):
 class WorkerProtocolTests(unittest.TestCase):
     def valid_job(self):
         return {
-            "repo": "/Users/james/Projects/example",
+            "repo": fixture_abs("/Users/james/Projects/example"),
             "base": "a" * 40,
             "task": "Add one regression test",
             "verification": ["Run the focused unittest"],
@@ -7108,7 +7117,7 @@ class WorkerRunTests(unittest.TestCase):
         task_id = "task-no-nofollow"
         path = mesh._write_worker_output(
             self.cfg, "worker-copilot", task_id, "private output")
-        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
              mock.patch.object(mesh.os, "open") as opened:
             self.assertFalse(mesh._worker_regular_file(path))
         opened.assert_not_called()
@@ -7116,7 +7125,7 @@ class WorkerRunTests(unittest.TestCase):
         journal = self.bound_journal(task_id, "running")
         mesh._write_worker_journal(
             self.cfg, "worker-copilot", task_id, journal)
-        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
              mock.patch.object(mesh.os, "open") as opened:
             self.assertEqual(mesh._load_worker_journal(
                 self.cfg, "worker-copilot", task_id), {})
@@ -7125,7 +7134,7 @@ class WorkerRunTests(unittest.TestCase):
     def test_unsupported_nofollow_rejects_without_marker_or_execution(self):
         task_id = "task-unsupported-nofollow"
         mesh.save_task(self.cfg, task_id, **self.task)
-        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
              mock.patch.object(mesh, "_execute_worker_backend") as backend:
             self.assertFalse(mesh._run_worker_task(
                 self.cfg, self.pool, "worker-copilot", "copilot",
@@ -8151,7 +8160,7 @@ class WorkerRunTests(unittest.TestCase):
         working = dict(self.task, state="working")
         mesh.save_task(self.cfg, task_id, **working)
 
-        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0), \
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True), \
              mock.patch.object(mesh, "_queue_worker_result") as queue, \
              mock.patch.object(mesh, "_execute_worker_backend") as execute:
             mesh._recover_worker_tasks(
@@ -9452,12 +9461,12 @@ class PoolLifecycleTests(unittest.TestCase):
         log_path = os.path.join(self.tmp.name, "copilot.log")
         value = mesh._launch_agent_value(
             self.cfg, self.pool, "copilot",
-            mesh_executable="/usr/local/bin/mesh", log_path=log_path)
+            mesh_executable=fixture_abs("/usr/local/bin/mesh"), log_path=log_path)
 
         self.assertEqual(value["Label"],
                          "com.a2acast.worker.copilot")
         self.assertEqual(value["ProgramArguments"], [
-            "/usr/local/bin/mesh", "worker-supervise",
+            fixture_abs("/usr/local/bin/mesh"), "worker-supervise",
             "--backend", "copilot", "--as", "worker-copilot",
             "--log-path", log_path,
         ])
@@ -9535,12 +9544,14 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh, "_write_launch_agents",
                                return_value=plists), \
              mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.os, "getuid", create=True,
+                               return_value=501), \
              mock.patch.object(mesh.subprocess, "run",
                                return_value=completed) as run, \
              contextlib.redirect_stdout(io.StringIO()):
             mesh.cmd_pool_start(argparse.Namespace())
 
-        domain = f"gui/{os.getuid()}"
+        domain = "gui/501"
         expected = []
         for backend, path in plists.items():
             expected.extend([
@@ -9568,6 +9579,8 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh, "_write_launch_agents",
                                return_value=plists), \
              mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.os, "getuid", create=True,
+                               return_value=501), \
              mock.patch.object(mesh.subprocess, "run",
                                return_value=failed) as run:
             with self.assertRaisesRegex(SystemExit, "permission denied"):
@@ -9586,6 +9599,8 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh, "load_pool_config",
                                return_value=self.pool), \
              mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.os, "getuid", create=True,
+                               return_value=501), \
              mock.patch.object(mesh.subprocess, "run",
                                side_effect=results) as run, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -9593,7 +9608,7 @@ class PoolLifecycleTests(unittest.TestCase):
                 mesh.cmd_pool_stop(argparse.Namespace())
         self.assertIn("codex denied", str(caught.exception))
         self.assertIn("copilot denied", str(caught.exception))
-        domain = f"gui/{os.getuid()}"
+        domain = "gui/501"
         self.assertEqual(run.call_args_list, [
             mock.call(
                 ["launchctl", "bootout",
@@ -9905,6 +9920,8 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh, "_write_launch_agents",
                                return_value=paths), \
              mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.os, "getuid", create=True,
+                               return_value=501), \
              mock.patch.object(mesh.subprocess, "run",
                                side_effect=results) as run, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -9919,6 +9936,8 @@ class PoolLifecycleTests(unittest.TestCase):
              mock.patch.object(mesh, "load_pool_config",
                                return_value=self.pool), \
              mock.patch.object(mesh.sys, "platform", "darwin"), \
+             mock.patch.object(mesh.os, "getuid", create=True,
+                               return_value=501), \
              mock.patch.object(mesh.subprocess, "run",
                                return_value=missing) as run, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -10102,17 +10121,17 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_cleanup_candidate_requires_matching_global_claim_and_result(self):
         task_id = "task-claim"
         job = mesh._encode_worker_job({
-            "repo": "/repo", "base": "b" * 40, "task": "cleanup",
+            "repo": fixture_abs("/repo"), "base": "b" * 40, "task": "cleanup",
             "verification": [], "kind": "implementation",
             "class": "normal",
         })
         digest = hashlib.sha256(job.encode("utf-8")).hexdigest()
         encoded = mesh._encode_worker_result(
             mesh._empty_worker_result(
-                "copilot", "completed", "done", "/work/task"))
+                "copilot", "completed", "done", fixture_abs("/work/task")))
         info = {
-            "repo": "/repo", "base": "b" * 40, "branch": "worker",
-            "path": "/work/task", "root": "/work",
+            "repo": fixture_abs("/repo"), "base": "b" * 40, "branch": "worker",
+            "path": fixture_abs("/work/task"), "root": fixture_abs("/work"),
         }
         record = {
             "worker_backend": "copilot", "peer": "worker-copilot",
@@ -10133,7 +10152,7 @@ class PoolLifecycleTests(unittest.TestCase):
             "version": 1, "node": "worker-copilot", "task_id": task_id,
             "backend": "copilot", "origin_peer": "coordinator",
             "local_node": "worker-copilot", "job_digest": digest,
-            "attempt": 1, "phase": "replied", "worktree": "/work/task",
+            "attempt": 1, "phase": "replied", "worktree": fixture_abs("/work/task"),
             "result": encoded, "terminal_state": "completed",
             "reply_error": None,
         }
@@ -10150,7 +10169,7 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_cleanup_candidate_rejects_mismatched_job_and_result_branch(self):
         task_id = "task-binding"
         job = mesh._encode_worker_job({
-            "repo": "/repo", "base": "b" * 40, "task": "cleanup",
+            "repo": fixture_abs("/repo"), "base": "b" * 40, "task": "cleanup",
             "verification": [], "kind": "implementation",
             "class": "normal",
         })
@@ -10159,12 +10178,12 @@ class PoolLifecycleTests(unittest.TestCase):
             "backend": "copilot", "outcome": "no_change",
             "branch": "wrong-branch", "commit": "", "changed_files": [],
             "summary": "done", "verification": "not run",
-            "runtime_seconds": 0, "worktree": "/work/task",
+            "runtime_seconds": 0, "worktree": fixture_abs("/work/task"),
         })
         info = {
-            "repo": "/repo", "base": "b" * 40,
-            "branch": "expected-branch", "path": "/work/task",
-            "root": "/work",
+            "repo": fixture_abs("/repo"), "base": "b" * 40,
+            "branch": "expected-branch", "path": fixture_abs("/work/task"),
+            "root": fixture_abs("/work"),
         }
         record = {
             "worker_backend": "copilot", "peer": "worker-copilot",
@@ -10185,7 +10204,7 @@ class PoolLifecycleTests(unittest.TestCase):
             "version": 1, "node": "worker-copilot", "task_id": task_id,
             "backend": "copilot", "origin_peer": "coordinator",
             "local_node": "worker-copilot", "job_digest": digest,
-            "attempt": 1, "phase": "replied", "worktree": "/work/task",
+            "attempt": 1, "phase": "replied", "worktree": fixture_abs("/work/task"),
             "result": encoded, "terminal_state": "completed",
             "reply_error": None,
         }
