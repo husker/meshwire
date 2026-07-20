@@ -5770,16 +5770,53 @@ def hook_lock_file(cfg, node):
     return os.path.join(tempfile.gettempdir(), HOOK_LOCK_PREFIX + suffix)
 
 
+def _pid_is_live(pid):
+    """True when `pid` names a running process, without signalling it.
+
+    kill(pid, 0) is only a probe on POSIX. On Windows signal 0 is
+    CTRL_C_EVENT, so os.kill(pid, 0) fires a real console Ctrl+C at the
+    process group; the stray interrupt surfaces as KeyboardInterrupt at
+    the next blocking lock wait in the main thread (issue #48). Query the
+    process handle there instead.
+    """
+    if not isinstance(pid, int):
+        raise TypeError("pid must be an integer")
+    if pid <= 0:
+        return False  # corrupt pidfile; kill(0/-n, 0) signals whole groups
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, owned by someone else
+        except (OverflowError, OSError):
+            return False
+    if pid > 0xFFFFFFFF:
+        return False  # beyond DWORD range: no such Windows pid
+    import ctypes
+    query_limited, synchronize = 0x1000, 0x00100000
+    error_access_denied, wait_timeout = 5, 0x102
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(query_limited | synchronize, False, pid)
+    if not handle:
+        # Access denied means the process exists but is not ours -- the
+        # POSIX PermissionError branch. Anything else: no such process.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        # Not-yet-signalled process handle == still running. This avoids
+        # the GetExitCodeProcess STILL_ACTIVE(259) exit-code ambiguity.
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _hook_lock_is_live(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             pid = int(json.load(f)["pid"])
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        return _pid_is_live(pid)
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
@@ -8180,12 +8217,8 @@ def _supervisor_pid_status(cfg, node):
                 or _read_supervisor_metadata_fd(pid_fd) != pid_metadata):
             raise ValueError("supervisor ownership metadata changed")
         pid = pid_metadata["pid"]
-        try:
-            os.kill(pid, 0)
-        except PermissionError:
-            pass
-        except (OSError, OverflowError) as exc:
-            raise ValueError("supervisor PID is not live") from exc
+        if not _pid_is_live(pid):
+            raise ValueError("supervisor PID is not live")
         return pid, True
     except (OSError, TypeError, ValueError, UnicodeError,
             WorkerEvidenceUnsupported):
