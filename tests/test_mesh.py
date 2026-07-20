@@ -1381,6 +1381,30 @@ class WatchTests(MembershipCmdTests):
                 timeout=60, as_node=None, follow=False))
         self.assertFalse(os.path.exists(lock))
 
+    def test_bare_watch_keeps_streaming_after_a_delivery(self):
+        # `mesh watch` with no --timeout must behave like --follow: the
+        # watcher IS the delivery mechanism, and exiting after the first
+        # message silently deafens the node (#55). One-shot now requires
+        # an explicit --timeout (the harness re-arm pattern).
+        cfg = self._setup_mesh()
+        evs = [self._msg_event(cfg, "beta", "first delivery", "e1", 201),
+               self._msg_event(cfg, "beta", "second delivery", "e2", 202)]
+
+        def stream(*args, **kwargs):
+            yield from evs
+            raise KeyboardInterrupt  # end the otherwise-endless stream
+
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_stream_events", stream), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out):
+            with self.assertRaises(KeyboardInterrupt):
+                mesh.cmd_watch(argparse.Namespace(
+                    timeout=None, as_node=None, follow=False))
+        self.assertIn("first delivery", out.getvalue())
+        self.assertIn("second delivery", out.getvalue())
+        self.assertNotIn("MESH_WATCH_DONE", out.getvalue())
+
     def _msg_event(self, cfg, frm, body, eid, t, ctl=None):
         payload = {"f": frm, "t": "alpha", "b": body}
         if ctl:
