@@ -2687,6 +2687,76 @@ class PidLivenessTests(unittest.TestCase):
         self.assertEqual(probed, [os.getpid()])
 
 
+class RegularReadonlyFallbackTests(unittest.TestCase):
+    """Worker-evidence opens without kernel O_NOFOLLOW (#50 Phase B).
+
+    Windows has no O_NOFOLLOW, so _open_regular_readonly must use the
+    verified-identity pattern there (lstat rejects symlinks up front;
+    device/inode must match during and after opening) instead of
+    refusing every evidence read. Non-Windows platforms without
+    O_NOFOLLOW keep failing closed.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.path = os.path.join(tmp.name, "evidence.json")
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('{"ok": true}\n')
+        os.chmod(self.path, 0o600)
+
+    @unittest.skipUnless(os.name == "nt", "Windows fallback path")
+    def test_windows_opens_regular_file_without_nofollow(self):
+        fd = mesh._open_regular_readonly(self.path)
+        try:
+            self.assertIn(b"ok", os.read(fd, 64))
+        finally:
+            os.close(fd)
+
+    @unittest.skipUnless(os.name == "nt", "Windows fallback path")
+    def test_windows_loads_bounded_json_without_nofollow(self):
+        self.assertEqual(mesh._load_json_regular(self.path, max_bytes=64),
+                         {"ok": True})
+
+    @unittest.skipUnless(os.name == "nt", "Windows fallback path")
+    def test_windows_rejects_identity_change_while_opening(self):
+        real_fstat = os.fstat
+
+        def swapped(fd):
+            observed = real_fstat(fd)
+            forged = list(observed)
+            forged[1] = observed.st_ino + 1  # different file identity
+            return os.stat_result(forged)
+
+        with mock.patch.object(mesh.os, "fstat", side_effect=swapped):
+            with self.assertRaisesRegex(OSError, "changed while opening"):
+                mesh._open_regular_readonly(self.path)
+
+    def test_symlink_final_component_is_rejected(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        link = os.path.join(self.dir, "evidence.lnk")
+        try:
+            os.symlink(self.path, link)
+        except OSError:  # Windows without symlink privilege
+            self.skipTest("no symlink privilege")
+        with self.assertRaises(OSError):
+            mesh._open_regular_readonly(link)
+
+    def test_non_windows_without_nofollow_still_fails_closed(self):
+        if os.name == "nt":
+            self.skipTest("Windows uses the fallback by design")
+        with mock.patch.object(mesh.os, "O_NOFOLLOW", 0, create=True):
+            with self.assertRaises(mesh.WorkerEvidenceUnsupported):
+                mesh._open_regular_readonly(self.path)
+
+    @unittest.skipUnless(os.name == "nt", "Windows fallback path")
+    def test_windows_preflight_probe_round_trips(self):
+        cfg = make_cfg(self.dir)
+        self.assertTrue(mesh._preflight_worker_evidence(cfg))
+
+
 class BufferWaitTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.pop("A2ACAST_NODE", None)
@@ -6987,7 +7057,8 @@ class WorkerRunTests(unittest.TestCase):
             name = os.path.basename(path)
             self.assertNotIn(node, name)
             self.assertNotIn(task_id, name)
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         with open(journal_path, encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["phase"], "running")
         with open(output_path, encoding="utf-8") as handle:
@@ -7113,6 +7184,9 @@ class WorkerRunTests(unittest.TestCase):
                 return_value=os.stat_result(wrong_owner)):
             self.assertFalse(mesh._worker_regular_file(path))
 
+    @unittest.skipUnless(os.name == "posix",
+                         "POSIX strict no-follow contract; Windows uses "
+                         "the verified-identity fallback (#50 Phase B)")
     def test_regular_reader_never_opens_without_nofollow(self):
         task_id = "task-no-nofollow"
         path = mesh._write_worker_output(
@@ -7131,6 +7205,9 @@ class WorkerRunTests(unittest.TestCase):
                 self.cfg, "worker-copilot", task_id), {})
         opened.assert_not_called()
 
+    @unittest.skipUnless(os.name == "posix",
+                         "POSIX strict no-follow contract; Windows uses "
+                         "the verified-identity fallback (#50 Phase B)")
     def test_unsupported_nofollow_rejects_without_marker_or_execution(self):
         task_id = "task-unsupported-nofollow"
         mesh.save_task(self.cfg, task_id, **self.task)
@@ -7245,7 +7322,8 @@ class WorkerRunTests(unittest.TestCase):
         self.assertIn("Full output:", result["summary"])
         output_path = result["summary"].split(
             "Full output:", 1)[1].strip()
-        self.assertEqual(os.stat(output_path).st_mode & 0o777, 0o600)
+        if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+            self.assertEqual(os.stat(output_path).st_mode & 0o777, 0o600)
 
         with mock.patch.object(mesh, "_send_reply"), \
              mock.patch.object(mesh, "_worker_command") as rerun, \
@@ -7641,7 +7719,8 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         marker_path = self.execution_marker_path(task_id)
         self.assertTrue(os.path.isfile(marker_path))
-        self.assertEqual(os.stat(marker_path).st_mode & 0o777, 0o600)
+        if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+            self.assertEqual(os.stat(marker_path).st_mode & 0o777, 0o600)
         with open(marker_path, encoding="utf-8") as handle:
             self.assertEqual(
                 json.load(handle), self.execution_marker(task_id))
@@ -7652,7 +7731,9 @@ class WorkerRunTests(unittest.TestCase):
 
         def execute(*_args):
             self.assertTrue(os.path.isfile(marker_path))
-            self.assertEqual(os.stat(marker_path).st_mode & 0o777, 0o600)
+            if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+                self.assertEqual(
+                    os.stat(marker_path).st_mode & 0o777, 0o600)
             with open(marker_path, encoding="utf-8") as handle:
                 self.assertEqual(
                     json.load(handle), self.execution_marker(task_id))
@@ -8155,6 +8236,9 @@ class WorkerRunTests(unittest.TestCase):
         self.assertIn(journal.get("phase"), {"committed", "reply_pending"})
         self.assertIsInstance(journal.get("result"), str)
 
+    @unittest.skipUnless(os.name == "posix",
+                         "POSIX strict no-follow contract; Windows uses "
+                         "the verified-identity fallback (#50 Phase B)")
     def test_unsupported_missing_claim_recovery_fails_locally(self):
         task_id = "task-recovery-unsupported-evidence"
         working = dict(self.task, state="working")
@@ -8862,8 +8946,9 @@ class PoolConfigTests(unittest.TestCase):
         self.assertEqual(disk["nodes"].count("machine-worker-codex"), 1)
         self.assertEqual(disk["nodes"].count("machine-worker-copilot"), 1)
         self.assertEqual(disk["nodes"].count("machine-worker-ollama"), 1)
-        self.assertEqual(stat.S_IMODE(os.stat(
-            mesh.pool_config_file(self.cfg)).st_mode), 0o600)
+        if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+            self.assertEqual(stat.S_IMODE(os.stat(
+                mesh.pool_config_file(self.cfg)).st_mode), 0o600)
 
     def test_pool_setup_preserves_latest_unrelated_config_and_orders_writes(self):
         latest = dict(self.cfg)
@@ -9194,7 +9279,8 @@ class PoolConfigTests(unittest.TestCase):
         self.assertNotIn(self.cfg["key"], json.dumps(loaded))
         path = mesh._worker_health_file(
             self.cfg, "machine-worker-ollama")
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_worker_health_rejects_invalid_writes_and_contents(self):
         invalid_writes = [
@@ -9492,7 +9578,8 @@ class PoolLifecycleTests(unittest.TestCase):
             self.assertEqual(handle.read(), "é")
         with open(path + ".1", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "éé")
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        if os.name == "posix":  # Windows privacy is ACLs, not mode bits
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_worker_log_restores_streams_when_supervisor_raises(self):
         path = os.path.join(self.tmp.name, "worker.log")
@@ -9738,7 +9825,9 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(set(paths), set(self.pool["workers"]))
         for backend, path in paths.items():
             with self.subTest(backend=backend):
-                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                if os.name == "posix":  # Windows privacy: ACLs, not modes
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(path).st_mode), 0o600)
                 with open(path, "rb") as handle:
                     value = plistlib.load(handle)
                 self.assertEqual(value["Label"],
