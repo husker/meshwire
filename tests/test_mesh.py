@@ -3165,6 +3165,137 @@ class SignedApprovalTests(unittest.TestCase):
             mesh._apply_owner_trust(self.cfg, block)
 
 
+class NodeSigningTests(unittest.TestCase):
+    """Per-node message signing (#62 phase 2 part 2). The signature binds
+    identity to the frame's content, route and time; trust is a local TOFU
+    pin, and the key a message carries is only a first-contact hint."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        self.pub = mesh._ensure_node_key(self.cfg, "laptop", "claude")
+        self.topic = mesh.topic(self.cfg, "all")
+        self.ts = 1_700_000_000
+        self.payload = {"f": "laptop", "t": "all", "b": "hello"}
+
+    def _sign(self, **over):
+        p = dict(self.payload, **over)
+        return mesh._sign_as_node(self.cfg, "claude", self.topic, self.ts, p)
+
+    def _verify(self, sig, node="laptop", pub=None, relay_topic=None,
+                ts=None, payload=None):
+        return mesh._verify_node_sig(
+            self.cfg, node, self.pub if pub is None else pub,
+            self.topic if relay_topic is None else relay_topic,
+            self.ts if ts is None else ts,
+            self.payload if payload is None else payload, sig)
+
+    def test_round_trip(self):
+        self.assertTrue(self._verify(self._sign()))
+
+    def test_rejects_tampered_body(self):
+        sig = self._sign()
+        self.assertFalse(self._verify(sig, payload=dict(self.payload,
+                                                        b="goodbye")))
+
+    def test_rejects_lifted_to_another_topic(self):
+        # A member re-routing a signed frame to a different inbox: the relay
+        # topic is in the AAD the signature covers, so it fails.
+        sig = self._sign()
+        other = mesh.topic(self.cfg, "imac")
+        self.assertFalse(self._verify(sig, relay_topic=other))
+
+    def test_rejects_replayed_at_another_time(self):
+        # A member re-timing a captured frame: timestamp is in the AAD.
+        sig = self._sign()
+        self.assertFalse(self._verify(sig, ts=self.ts + 1))
+
+    def test_rejects_a_foreign_key(self):
+        # The signature verifies only against the SIGNER's key. A different
+        # node's key must not validate it, which is the whole identity claim.
+        other_cfg = make_cfg(tempfile.mkdtemp())
+        other_cfg["id"] = self.cfg["id"]
+        other_pub = mesh._ensure_node_key(other_cfg, "imac", "claude")
+        self.assertNotEqual(other_pub, self.pub)
+        self.assertFalse(self._verify(self._sign(), pub=other_pub))
+
+    def test_rejects_across_mesh_namespaces(self):
+        sig = self._sign()
+        foreign = dict(self.cfg, id="ff00ff00ff00ff00")
+        self.assertFalse(mesh._verify_node_sig(
+            foreign, "laptop", self.pub, self.topic, self.ts,
+            self.payload, sig))
+
+    def test_signature_is_not_the_carried_key_check(self):
+        # Guard against the shape imac warned about: verifying against a key
+        # the "message" supplies proves only internal consistency. Here a
+        # forger signs with their OWN key and presents their OWN pub; against
+        # the real pin (self.pub) it must fail.
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        forger_pub = mesh._ensure_node_key(forger, "laptop", "claude")
+        forged = mesh._sign_as_node(forger, "claude", self.topic, self.ts,
+                                    self.payload)
+        self.assertTrue(  # self-consistent: forger's sig under forger's key
+            self._verify(forged, pub=forger_pub))
+        self.assertFalse(  # but not under laptop's actual pin
+            self._verify(forged, pub=self.pub))
+
+
+class PeerPinTests(unittest.TestCase):
+    """Trust-on-first-use pinning of peer node keys."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        self.pub = mesh._ensure_node_key(self.cfg, "peer", "claude")
+
+    def test_first_sight_pins_and_returns_the_key(self):
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
+        bound = mesh._bind_peer(self.cfg, "peer", self.pub)
+        self.assertEqual(bound, self.pub)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.pub)
+
+    def test_same_key_is_idempotent(self):
+        mesh._bind_peer(self.cfg, "peer", self.pub)
+        self.assertEqual(mesh._bind_peer(self.cfg, "peer", self.pub),
+                         self.pub)
+
+    def test_different_key_is_a_hard_reject(self):
+        mesh._bind_peer(self.cfg, "peer", self.pub)
+        other = mesh._ensure_node_key(make_cfg(tempfile.mkdtemp()),
+                                      "peer", "claude")
+        with self.assertRaisesRegex(ValueError, "different key"):
+            mesh._bind_peer(self.cfg, "peer", other)
+        # the original pin survives the rejected rebind
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.pub)
+
+    def test_unparseable_key_is_refused_before_pinning(self):
+        with self.assertRaises(ValueError):
+            mesh._bind_peer(self.cfg, "peer", "not-a-key")
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
+
+    def test_pin_file_is_not_world_readable(self):
+        if os.name != "posix":
+            self.skipTest("POSIX permission semantics")
+        mesh._bind_peer(self.cfg, "peer", self.pub)
+        mode = stat.S_IMODE(os.stat(mesh.pins_file(self.cfg)).st_mode)
+        self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
+                         f"pin store is {oct(mode)}")
+
+
 class NodeIdentityTests(unittest.TestCase):
     """Per-node ed25519 keypairs (#62 phase 2). A message authenticated
     under the shared mesh key proves membership, not authorship, so each

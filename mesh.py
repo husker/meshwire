@@ -1279,6 +1279,144 @@ def _ensure_node_key(cfg, node, harness):
         return f.read().strip()
 
 
+# -- per-node message signing (#62 phase 2, part 2) -----------------------
+# Each node signs its messages with its own key (see _ensure_node_key). The
+# signature binds identity to content AND to the frame's routing and time,
+# so a member holding the shared key cannot lift another node's signed
+# message to a new topic or replay it later: relay topic and timestamp live
+# in the wire AAD, which the MAC authenticates, and the signature covers the
+# same AAD, so re-timing or re-routing breaks one or the other.
+#
+# Trust is a LOCAL pin, TOFU. The public key a message carries is a lookup
+# hint used only to pin an unseen peer on first contact; once pinned, a
+# different key for that name is a hard reject, not a silent replace.
+# Verifying a signature against the key that arrived WITH it would prove
+# only internal consistency, which is the shared-key problem rebuilt one
+# level up.
+
+PIN_NAME = ".meshwire.pins.json"
+
+
+def pins_file(cfg):
+    return os.path.join(cfg["_dir"], PIN_NAME)
+
+
+def _load_pins(cfg):
+    try:
+        with open(pins_file(cfg), "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _pinned_peer_key(cfg, node):
+    pub = _load_pins(cfg).get(node)
+    return pub.strip() if isinstance(pub, str) and pub.strip() else None
+
+
+def _bind_peer(cfg, node, pub):
+    """Trust-on-first-use pin of node -> public key; returns the bound key.
+
+    Raises ValueError when `node` is already pinned to a different key. Never
+    a silent replace: the pin is the identity, so a changed key is either a
+    rotation nobody authorised or an impersonation, and both must surface
+    rather than be adopted. Same shape as _apply_owner_trust's refusal."""
+    if not isinstance(pub, str) or not pub.strip():
+        raise ValueError("peer key is empty")
+    pub = pub.strip()
+    _key_fingerprint(pub)  # reject an unparseable key before pinning
+    pins = _load_pins(cfg)
+    existing = pins.get(node)
+    if isinstance(existing, str) and existing.strip():
+        if existing.strip() != pub:
+            raise ValueError(
+                f"peer '{node}' is already pinned to a different key; "
+                f"refusing to replace it")
+        return existing.strip()
+    pins[node] = pub
+    _write_json_secure(pins_file(cfg), pins)
+    return pub
+
+
+def _node_sig_message(cfg, relay_topic, timestamp, payload):
+    """The exact bytes a node signature covers: the wire AAD (mesh id, relay
+    topic, timestamp) then the canonical payload. AAD first is the whole
+    point -- it is what binds the signature to this frame's route and time,
+    both of which the MAC already authenticates."""
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        raise ValueError("signature timestamp must be an int")
+    aad = _wire_aad(cfg, relay_topic or "", timestamp)
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return aad + b"\x00a2acast-nodesig\x00" + canon
+
+
+def _sign_as_node(cfg, harness, relay_topic, timestamp, payload):
+    """Sign a frame's AAD+payload with this node's private key.
+
+    tempdir goes to the system temp, not cfg["_dir"]: this runs per outbound
+    message, and a create+remove inside the managed mesh directory on every
+    send is the file-churn the approval path was criticised for."""
+    key_path = node_key_file(cfg, harness)
+    if not os.path.isfile(key_path):
+        raise ValueError("this node has no private key to sign with")
+    binary = _ssh_keygen_binary()
+    message = _node_sig_message(cfg, relay_topic, timestamp, payload)
+    workdir = tempfile.mkdtemp(prefix="mw-nodesign-")
+    try:
+        message_path = os.path.join(workdir, "m")
+        with open(message_path, "wb") as f:
+            f.write(message)
+        completed = subprocess.run(
+            [binary, "-Y", "sign", "-f", key_path,
+             "-n", _node_key_namespace(cfg), message_path],
+            capture_output=True, text=True, timeout=60)
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign as node: "
+                             + completed.stderr.strip())
+        with open(message_path + ".sig", "r", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _verify_node_sig(cfg, node, pinned_pub, relay_topic, timestamp,
+                     payload, signature):
+    """True iff `signature` is `pinned_pub`'s over this frame's AAD+payload.
+
+    `pinned_pub` MUST be the LOCAL pin for `node`, never a key the message
+    carried. The caller is responsible for that; passing a carried key here
+    reduces the check to self-consistency and defeats the point."""
+    if not isinstance(signature, str) or not signature.strip():
+        return False
+    if not isinstance(pinned_pub, str) or not pinned_pub.strip():
+        return False
+    try:
+        binary = _ssh_keygen_binary()
+        message = _node_sig_message(cfg, relay_topic, timestamp, payload)
+    except ValueError:
+        return False
+    principal = f"{node}@{cfg['id']}"
+    workdir = tempfile.mkdtemp(prefix="mw-nodeverify-")
+    try:
+        sig_path = os.path.join(workdir, "m.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(signature)
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{principal} "
+                    f"namespaces=\"{_node_key_namespace(cfg)}\" "
+                    f"{pinned_pub.strip()}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+             "-n", _node_key_namespace(cfg), "-s", sig_path],
+            input=message, capture_output=True, timeout=60)
+        return completed.returncode == 0
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
     """Mint an owner-signed, single-use, expiring approval token."""
     if not isinstance(ttl, int) or isinstance(ttl, bool) \
