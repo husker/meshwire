@@ -1,17 +1,41 @@
 # Testing notes: verifying the instrument
 
 These are lessons from #62 phase 2, written down because every one of them
-produced a *confident wrong answer* rather than an obvious error, and each
-was caught by someone checking the instrument rather than the result.
+produced a *confident wrong answer* rather than an obvious error.
 
-The single rule underneath all of it:
+Two rules, because there are two distinct failures here and one of them is
+not about instruments at all:
 
-> **Verify the instrument before trusting its output, and check hardest when
-> the output is what you hoped for.**
+> **1. Verify the instrument before trusting its output, and check hardest
+> when the output is what you hoped for.**
+>
+> **2. A report of an execution is not evidence of an execution. Ask where a
+> result came from, not whether it is right.**
 
 Confirming results are the ones that do not get checked. A sweep reporting
 "all mutations survived" to someone who just claimed a gap, or "all tests
 pass" to someone who just wrote them, is the exact shape that ships.
+
+## Provenance
+
+Rule 1 assumes a run occurred. One failure in this series had no instrument
+to verify: a mutation sweep was reported as run, with a specific list of
+mutations attached, and had not been run at all. It was the most reassuring
+paragraph in the message containing it.
+
+Every harness requirement below — assert the mutant is present, disable
+bytecode caching, use a worktree — presupposes execution. None of them
+reaches a result that was never produced.
+
+- **Results a reader cannot reproduce are claims, not evidence.** Mark which
+  they are. "804 tests pass" from an author is a claim; a CI run on a pushed
+  sha is evidence, because nobody in the conversation authored its output.
+- **The question that works is "where did this come from".** Correctness-
+  flavoured challenges — "are you sure?", "re-run it" — can all be answered
+  by the same process that produced the original, so they cannot detect
+  this. Provenance can.
+- The catch here came from a reviewer noticing that a load-bearing sentence
+  had no stated origin — not from doubting whether the claim was true.
 
 ## Tests can pass without testing anything
 
@@ -36,12 +60,16 @@ defended them on reading:
    file. A one-line `os.chmod(key_path, 0o644)` on the re-entry path
    world-readable'd the private key on every call and passed all 803 tests.
 
-A related pattern, worth its own line: **the branch added late to satisfy a
-reviewer is the branch the existing tests were not written for.** The same
-defect recurred in three locations — generation, re-entry, and recovery —
-and the recovery branch, added last and most likely to execute in practice,
-was uncovered longest. When adding a branch, extend the test that covers its
-siblings rather than the one that covers its shape.
+A related pattern, offered as a **hypothesis from a single case**, not an
+established rule: *the branch added late to satisfy a reviewer may be the
+branch the existing tests were not written for.* The one case: the same
+defect recurred in three locations — generation, re-entry, recovery — and
+the recovery branch, added last in response to review and the most likely of
+the three to execute in practice, stayed uncovered longest. n=1. Weigh it
+accordingly; it is recorded so a second instance can be recognised, not so
+it can be cited. The practical form, which costs nothing either way: when
+adding a branch, extend the test covering its siblings rather than writing a
+new one for its shape.
 
 ## Mutation-testing harness requirements
 
@@ -49,9 +77,14 @@ If a harness cannot distinguish "the mutant survived" from "the code was
 never mutated", its output is noise that reads like a finding.
 
 - **Assert the mutant is present before running.** Not that the edit applied
-  cleanly — that the string is verifiably in the file, in the right
-  function. A harness that silently failed to inject reported five clean
-  survivals from an unmodified file.
+  cleanly — that the string is verifiably in the file. A harness that
+  silently failed to inject reported five clean survivals from an unmodified
+  file.
+- **Assert the anchor is unique, and that the injection landed in the
+  intended function.** The neighbouring failure to not injecting at all is
+  injecting in the wrong place, when the anchor string occurs more than once.
+  A mutation applied to a function the tests never exercise reads exactly
+  like a survival.
 - **Disable bytecode caching.** Set `PYTHONDONTWRITEBYTECODE=1` and remove
   `__pycache__` between mutants. Same-length mutations (`0o644`, `0o640`,
   `0o700`) rewritten within mtime granularity let Python reuse the previous
@@ -102,9 +135,9 @@ None of these substitutes for the others:
 
 Observed within one hour: CI caught a Windows failure review would not have,
 review caught a hollow test CI was green on, and mutation testing caught
-what neither did. A report of an execution is not evidence of an execution —
-which is why the CI half cannot be satisfied by an author's account of
-having run the suite.
+what neither did. By rule 2, the CI row cannot be satisfied by an author's
+account of having run the suite — that is a claim, and the point of CI here
+is that its output has no author in the conversation.
 
 Note that CI is only independent if the workflow is. `.github/workflows` is
 a file in the branch under review, and for a same-repo PR the workflow is
