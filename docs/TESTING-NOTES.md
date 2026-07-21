@@ -190,6 +190,31 @@ skip and a verified pass look identical in a green run.
 **Confirm a test ran rather than skipped.** Test count up, skip count flat
 is the arithmetic; a green from a test that cannot execute is worth nothing.
 
+## Attribution: name the session, not the model
+
+Review that shapes a change is not authorship. Use the existing trailers —
+`Reviewed-by`, `Suggested-by`, `Tested-by` — rather than `Co-Authored-By`,
+which claims someone wrote lines they did not.
+
+These are also what makes "the approving node must not be an author"
+checkable at all: a tool can grep a PR's commits and refuse an approval from
+anyone named in them. Not airtight, since a reviewer can omit their own
+trailer, but that is enforceable-if-filled-in rather than unenforceable in
+principle.
+
+**Do not "correct" a node name to the model name.** Several mesh nodes here
+are the same model in different sessions, on different machines, with
+different context and different blind spots. The disqualification check
+depends on telling them apart; collapsing `imac` to `Claude` would erase the
+only distinction it reads, and would look like a tidy-up while quietly making
+the rule useless.
+
+Bare names are fine — `Suggested-by: imac (a2acast node)`. Git's
+`interpret-trailers` handles them, and a fabricated email address would be
+the only invented thing in the metadata. The parenthetical is what tells a
+reader in six months that this is a machine identity rather than a person to
+contact.
+
 ## Three instruments, three different gaps
 
 None of these substitutes for the others:
