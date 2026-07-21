@@ -3167,7 +3167,13 @@ class NodeIdentityTests(unittest.TestCase):
         second = mesh._ensure_node_key(self.cfg, "alpha", "claude")
         self.assertEqual(first, second)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
     def test_private_key_is_not_world_readable(self):
+        # Windows reports 0o666 here regardless of the real ACL: st_mode is
+        # synthesised from the read-only attribute alone, so the assertion
+        # is meaningless rather than merely failing there. Key protection on
+        # Windows rests on the ACL ssh-keygen sets, which os.stat cannot
+        # see and nothing in this suite currently checks.
         mesh._ensure_node_key(self.cfg, "alpha", "claude")
         path = mesh.node_key_file(self.cfg, "claude")
         mode = stat.S_IMODE(os.stat(path).st_mode)
