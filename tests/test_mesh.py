@@ -3232,6 +3232,26 @@ class NodeSigningTests(unittest.TestCase):
             foreign, "laptop", self.pub, self.topic, self.ts,
             self.payload, sig))
 
+    def test_principal_label_is_not_the_security_boundary(self):
+        # Empirically, ssh-keygen -Y verify binds the signature to KEY and
+        # NAMESPACE, not to the principal string — the same key under a
+        # different principal still verifies. So authentication rests
+        # entirely on `pinned_pub` being the right key, and slice 3 must
+        # resolve the pin by the CLAIMED sender. This test exists so that
+        # fact is guarded: if a future change made the principal load-bearing
+        # (e.g. an embedded-principal signature format), this flips and the
+        # assumption is caught rather than silently relied upon.
+        sig = self._sign()  # signed as principal "laptop@id" with laptop key
+        # verify claiming a different node name but with laptop's actual key:
+        # the label differs, the key matches, so it still verifies.
+        self.assertTrue(self._verify(sig, node="someone-else"))
+        # and the wrong KEY under the right name does not — the key is what
+        # matters (covered fully by test_rejects_a_foreign_key; asserted here
+        # too so the pair reads as one statement).
+        other = mesh._ensure_node_key(make_cfg(tempfile.mkdtemp()),
+                                      "x", "claude")
+        self.assertFalse(self._verify(sig, node="laptop", pub=other))
+
     def test_signature_is_not_the_carried_key_check(self):
         # Guard against the shape imac warned about: verifying against a key
         # the "message" supplies proves only internal consistency. Here a

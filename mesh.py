@@ -1387,7 +1387,15 @@ def _verify_node_sig(cfg, node, pinned_pub, relay_topic, timestamp,
 
     `pinned_pub` MUST be the LOCAL pin for `node`, never a key the message
     carried. The caller is responsible for that; passing a carried key here
-    reduces the check to self-consistency and defeats the point."""
+    reduces the check to self-consistency and defeats the point.
+
+    The principal (`node@id`) is a LABEL, not a security boundary: ssh-keygen
+    binds the signature to the key and namespace, not to the principal
+    string, so the same key under a different principal still verifies
+    (confirmed empirically). The only thing that authenticates a sender is
+    that `pinned_pub` is the key pinned for the claimed name — so the caller
+    must resolve the pin by the sender the frame CLAIMS, and a lookup bug
+    there is not caught by the principal."""
     if not isinstance(signature, str) or not signature.strip():
         return False
     if not isinstance(pinned_pub, str) or not pinned_pub.strip():
