@@ -3178,6 +3178,34 @@ class NodeIdentityTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), before_mode,
                          "private key mode changed on re-entry")
 
+    @unittest.skipUnless(os.name == "nt", "Windows ACL semantics")
+    def test_private_key_acl_excludes_broad_principals_on_windows(self):
+        # os.stat cannot answer this: Windows synthesises st_mode from the
+        # read-only attribute and reports 0o666 whatever the ACL says. That
+        # left ONE ambiguous observation with two readings — st_mode is
+        # blind, or the key really is unprotected — and skipping the POSIX
+        # assertion made the ambiguity permanent instead of resolving it.
+        # icacls sees the mechanism that actually protects the file, so ask
+        # it. Both the generate and re-enter paths, as on POSIX.
+        icacls = shutil.which("icacls")
+        if not icacls:
+            self.skipTest("icacls unavailable")
+        path = mesh.node_key_file(self.cfg, "claude")
+        for call in ("generate", "re-enter"):
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+            out = subprocess.run([icacls, path], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            # English-runner principals; CI is English. A localised Windows
+            # would silently pass, which is a limit of this check, not a
+            # reason to skip it on the platform we actually ship CI for.
+            for principal in ("Everyone", "BUILTIN\\Users",
+                              "Authenticated Users"):
+                self.assertNotIn(
+                    principal, out.stdout,
+                    f"node private key ACL grants {principal} after {call}:"
+                    f"\n{out.stdout}")
+
     @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
     def test_private_key_is_not_world_readable(self):
         # Windows reports 0o666 here regardless of the real ACL: st_mode is
