@@ -60,6 +60,30 @@ defended them on reading:
    file. A one-line `os.chmod(key_path, 0o644)` on the re-entry path
    world-readable'd the private key on every call and passed all 803 tests.
 
+### Assertions carried by a third party
+
+Worth hunting for deliberately rather than tripping over: a property that
+appears tested but is actually enforced by a tool you shell out to. Three
+instances in one area, which is why it gets its own heading.
+
+It shows up with both signs:
+
+- **As an accidental pass** (shape 1 above). The half-present test asserted
+  a refusal that `ssh-keygen` produces on its own.
+- **As accidental coverage.** The owner private key had no permission
+  assertion anywhere, yet mutating `_owner_init` to `chmod 0644` failed
+  seven approval tests — `ssh-keygen` refuses to sign with a world-readable
+  key. The property was enforced; nothing *stated* it.
+
+"Nothing asserts X" and "X is unprotected" are different claims, and a grep
+of the test suite establishes only the first. Check which one you have.
+
+The tell for both is platform- or tool-dependence. `ssh-keygen` applies no
+POSIX permission check on Windows, so the same code was incidentally covered
+on Linux and macOS and entirely unchecked on the one platform where the
+owner key actually lives. Coverage that comes from a third party inherits
+that party's platform behaviour, silently.
+
 A related pattern, offered as a **hypothesis from a single case**, not an
 established rule: *the branch added late to satisfy a reviewer may be the
 branch the existing tests were not written for.* The one case: the same
