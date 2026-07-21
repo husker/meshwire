@@ -37,6 +37,29 @@ reaches a result that was never produced.
 - The catch here came from a reviewer noticing that a load-bearing sentence
   had no stated origin — not from doubting whether the claim was true.
 
+### The summary is where motivation re-enters
+
+A result you ran and read is still a claim once you summarise it.
+
+One failure in this series had a working instrument and correct output. The
+terminal showed `FAILED (failures=1, errors=7)`; the commit message said the
+new test fails legibly "instead of" seven unrelated errors. It is *alongside*
+them — eight failures, one of which is legible. The data was on screen and
+had been read.
+
+Nothing above catches this. The harness was sound, so no instrument check
+applies. The run happened, so no provenance question surfaces it. It was
+found by a reviewer re-reading the raw output against the prose — and
+incidentally, because they wanted to see the failure mode themselves, not
+because they doubted the description.
+
+The two failures with no mechanical remedy are the two where a person, not a
+tool, is the last step: reporting a run that did not happen, and describing a
+run that did. For both, the only defence is someone else comparing the claim
+to the artefact. Quote the actual output in the commit message or PR body
+rather than characterising it, so the comparison is possible without
+re-running anything.
+
 ## Tests can pass without testing anything
 
 Three of the six tests originally written for `_ensure_node_key` were
