@@ -1048,6 +1048,29 @@ def _canonical_descriptor(value):
     return rendered.encode("utf-8")
 
 
+def _key_fingerprint(pub):
+    """SHA256 fingerprint of an OpenSSH public key, `ssh-keygen -lf` format.
+
+    Nothing inside the mesh can authenticate the owner's ROOT pubkey: the
+    trust block arrives over a channel that proves shared-key custody, not
+    who sent it. The fingerprint is what a human compares out of band, so
+    a key injected ahead of the real owner is caught here instead of being
+    silently pinned by TOFU (see _apply_owner_trust)."""
+    if not isinstance(pub, str):
+        raise ValueError("public key is not a string")
+    parts = pub.split()
+    if len(parts) < 2:
+        raise ValueError("public key is malformed")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("public key is malformed") from exc
+    if not blob:
+        raise ValueError("public key is malformed")
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def _load_owner_trust(cfg):
     try:
         with open(owner_trust_file(cfg), "r", encoding="utf-8") as f:
@@ -1085,6 +1108,11 @@ def _owner_init(cfg):
     print("mesh owner key created — never leaves this machine. Distribute")
     print("trust by running this on every member (share like an invite):")
     print(f"  mesh owner-trust {_owner_trust_block(cfg)}")
+    print()
+    print(f"  owner fingerprint: {_key_fingerprint(pub)}")
+    print("  Read that aloud to whoever runs `mesh owner-trust`. The block")
+    print("  travels over a channel that cannot prove who sent it; the")
+    print("  fingerprint, compared out of band, is what proves it.")
     return pub
 
 
@@ -1097,7 +1125,31 @@ def _owner_trust_block(cfg):
         body.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _apply_owner_trust(cfg, block):
+OWNER_TRUST_UNATTENDED_ENV = "A2ACAST_OWNER_TRUST_UNATTENDED"
+
+
+def _read_from_terminal(prompt):
+    """Prompt on the CONTROLLING TERMINAL, not stdin. Returns None if there
+    is no terminal to ask.
+
+    stdin is what an agent drives, so reading it would let the caller answer
+    its own question. Trusting an owner key is one of the acts that must
+    carry human intent, so it asks the tty or it does not ask at all."""
+    device = "CONIN$" if os.name == "nt" else "/dev/tty"
+    try:
+        with open(device, "r+", encoding="utf-8", errors="replace") as tty:
+            tty.write(prompt)
+            tty.flush()
+            line = tty.readline()
+    except (OSError, ValueError):
+        return None
+    return "" if not line else line.strip()
+
+
+def _parse_owner_trust_block(cfg, block):
+    """Validate a trust block and return its owner pubkey — no writes.
+
+    Split out so the fingerprint can be shown BEFORE anything is pinned."""
     if not isinstance(block, str) or not block.startswith("mwtrust1-"):
         raise ValueError("not an owner trust block")
     raw = block[len("mwtrust1-"):]
@@ -1111,15 +1163,21 @@ def _apply_owner_trust(cfg, block):
     pub = value.get("owner_pub")
     if not isinstance(pub, str) or not pub.strip():
         raise ValueError("owner trust block is missing the owner key")
+    _key_fingerprint(pub.strip())  # reject unparseable keys before pinning
+    return pub.strip()
+
+
+def _apply_owner_trust(cfg, block):
+    pub = _parse_owner_trust_block(cfg, block)
     try:
         existing = _load_owner_trust(cfg)
     except ValueError:
         existing = None
-    if existing is not None and existing != pub.strip():
+    if existing is not None and existing != pub:
         raise ValueError("a different owner is already trusted here; "
                          "refusing to replace it")
-    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub.strip()})
-    return pub.strip()
+    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
+    return pub
 
 
 def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
@@ -4326,8 +4384,46 @@ def cmd_owner_init(args):
 
 
 def cmd_owner_trust(args):
+    if args.unattended and os.environ.get(OWNER_TRUST_UNATTENDED_ENV) != "1":
+        sys.exit(f"error: --unattended also requires "
+                 f"{OWNER_TRUST_UNATTENDED_ENV}=1 in the environment. Two "
+                 f"deliberate steps, so a flag alone — from a script, a "
+                 f"harness, or an agent — cannot skip the human check.")
+    cfg = load_config()
     try:
-        _apply_owner_trust(load_config(), args.block)
+        pub = _parse_owner_trust_block(cfg, args.block)
+        fingerprint = _key_fingerprint(pub)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    try:
+        already = _load_owner_trust(cfg)
+    except ValueError:
+        already = None
+    if already == pub:
+        print(f"mesh owner already trusted here ({fingerprint}) — no change")
+        return
+    print(f"owner fingerprint: {fingerprint}")
+    print("This block arrived over a channel that proves shared-key custody,")
+    print("NOT who sent it. Any member could have injected it. Confirm the")
+    print("fingerprint against the owner machine (`mesh owner-init` printed")
+    print("it there) before trusting it — this is the act that makes every")
+    print("later owner approval verify.")
+    if not args.unattended:
+        want = fingerprint.split(":", 1)[1][:6]
+        answer = _read_from_terminal(
+            f"Type the first 6 characters of the fingerprint ({want[:1]}…) "
+            "to confirm, or anything else to abort: ")
+        if answer is None:
+            sys.exit(
+                "error: no terminal available to confirm the fingerprint. "
+                "Trusting an owner key needs a human; re-run where you have "
+                f"a terminal, or set {OWNER_TRUST_UNATTENDED_ENV}=1 and pass "
+                "--unattended if you have verified the fingerprint by other "
+                "means.")
+        if answer != want:
+            sys.exit("error: fingerprint not confirmed — nothing was trusted")
+    try:
+        _apply_owner_trust(cfg, args.block)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
     print("mesh owner trusted — approvals from this owner verify here now")
@@ -9389,6 +9485,9 @@ def main():
                        help="trust the mesh owner here from its mwtrust1- "
                             "block (share it privately, like an invite)")
     p.add_argument("block")
+    p.add_argument("--unattended", action="store_true",
+                   help="skip the terminal fingerprint check; also requires "
+                        f"{OWNER_TRUST_UNATTENDED_ENV}=1")
     p.set_defaults(fn=cmd_owner_trust)
 
     p = sub.add_parser("approve",

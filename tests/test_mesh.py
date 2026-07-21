@@ -2972,6 +2972,138 @@ class SignedApprovalTests(unittest.TestCase):
         ok, reason = mesh._verify_approval(member, descriptor, token)
         self.assertTrue(ok, reason)
 
+    def test_fingerprint_matches_ssh_keygen(self):
+        pub = mesh._load_owner_trust(self.cfg)
+        pub_path = mesh.owner_key_file(self.cfg) + ".pub"
+        out = subprocess.run(
+            [shutil.which("ssh-keygen"), "-lf", pub_path],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        expected = out.stdout.split()[1]
+        self.assertEqual(mesh._key_fingerprint(pub), expected)
+
+    def test_fingerprint_rejects_a_malformed_key(self):
+        for bad in ("", "ssh-ed25519", "ssh-ed25519 not!base64!"):
+            with self.assertRaises(ValueError):
+                mesh._key_fingerprint(bad)
+
+    def test_owner_init_prints_the_fingerprint(self):
+        # The root pubkey cannot be authenticated in band, so the owner
+        # machine must surface the value a human reads out of band.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pub = mesh._owner_init(fresh)
+        self.assertIn(mesh._key_fingerprint(pub), out.getvalue())
+
+    def test_parse_block_does_not_pin_anything(self):
+        member_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(member_tmp.cleanup)
+        member = make_cfg(member_tmp.name)
+        member["id"] = self.cfg["id"]
+        block = mesh._owner_trust_block(self.cfg)
+        pub = mesh._parse_owner_trust_block(member, block)
+        self.assertEqual(pub, mesh._load_owner_trust(self.cfg))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def _trust_args(self, block, unattended=False):
+        return argparse.Namespace(block=block, unattended=unattended)
+
+    def _member(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        member = make_cfg(tmp.name)
+        member["id"] = self.cfg["id"]
+        return member
+
+    @contextlib.contextmanager
+    def _as_member(self, member):
+        with mock.patch.object(mesh, "load_config", return_value=member):
+            yield
+
+    def test_trust_shows_fingerprint_and_pins_on_confirmation(self):
+        # imac's ask, both halves: TOFU pins the first key, AND the
+        # fingerprint is prominent enough that pinning the wrong one
+        # requires ignoring it.
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        fingerprint = mesh._key_fingerprint(mesh._load_owner_trust(self.cfg))
+        typed = fingerprint.split(":", 1)[1][:6]
+        out = io.StringIO()
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=typed) as prompt, \
+                contextlib.redirect_stdout(out):
+            mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertIn(fingerprint, out.getvalue())
+        self.assertTrue(prompt.called)
+        self.assertEqual(mesh._load_owner_trust(member),
+                         mesh._load_owner_trust(self.cfg))
+
+    def test_trust_aborts_and_pins_nothing_on_a_wrong_answer(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value="nope"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_trust_refuses_when_no_terminal_is_available(self):
+        # An agent drives stdin, not the tty. No tty means no human.
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertIn("terminal", str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_unattended_flag_alone_does_not_bypass_the_check(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with mock.patch.dict(os.environ,
+                             {mesh.OWNER_TRUST_UNATTENDED_ENV: ""},
+                             clear=False):
+            with self._as_member(member), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    mesh.cmd_owner_trust(
+                        self._trust_args(block, unattended=True))
+        self.assertIn(mesh.OWNER_TRUST_UNATTENDED_ENV, str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_unattended_with_env_pins_without_a_terminal(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with mock.patch.dict(os.environ,
+                             {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"},
+                             clear=False):
+            with self._as_member(member), \
+                    mock.patch.object(mesh, "_read_from_terminal") as prompt, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_owner_trust(self._trust_args(block, unattended=True))
+        self.assertFalse(prompt.called)
+        self.assertEqual(mesh._load_owner_trust(member),
+                         mesh._load_owner_trust(self.cfg))
+
+    def test_trust_is_idempotent_without_prompting(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        mesh._apply_owner_trust(member, block)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal") as prompt, \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertFalse(prompt.called)
+
     def test_trust_refuses_replacing_a_different_owner(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
