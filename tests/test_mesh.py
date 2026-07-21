@@ -3214,10 +3214,17 @@ class NodeIdentityTests(unittest.TestCase):
         # Windows rests on the ACL ssh-keygen sets, which os.stat cannot
         # see and nothing in this suite currently checks.
         path = mesh.node_key_file(self.cfg, "claude")
-        # Twice: calling once exercises only the GENERATION path and leaves
-        # the both-present early return with no assertion on the private
-        # key at all.
-        for call in ("generate", "re-enter"):
+        # All THREE entry paths, not just generation. The defect family here
+        # is "a branch that touches the key without an assertion on it", and
+        # it has recurred once per branch: generation, the both-present
+        # early return, and recovery. Recovery is the most-travelled of the
+        # three — a .pub is world-readable and gets clobbered by tooling,
+        # which is why it derives rather than erroring.
+        for call, setup in (("generate", None),
+                            ("re-enter", None),
+                            ("recover", lambda: os.remove(path + ".pub"))):
+            if setup:
+                setup()
             mesh._ensure_node_key(self.cfg, "alpha", "claude")
             mode = stat.S_IMODE(os.stat(path).st_mode)
             self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
@@ -3232,10 +3239,21 @@ class NodeIdentityTests(unittest.TestCase):
         first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
         pub_path = mesh.node_key_file(self.cfg, "claude") + ".pub"
         os.remove(pub_path)
+        key_path = mesh.node_key_file(self.cfg, "claude")
+        before = open(key_path, "rb").read()
+        before_mode = stat.S_IMODE(os.stat(key_path).st_mode)
         recovered = mesh._ensure_node_key(self.cfg, "alpha", "claude")
         self.assertEqual(recovered, first)
         with open(pub_path, encoding="utf-8") as f:
             self.assertEqual(f.read().strip(), first)
+        # Recovery reads the private half and must not touch it at all —
+        # bytes or mode. Mode matters separately from the world-readable
+        # check, which only looks at group/other bits: a recovery that
+        # rewrote the owner bits would slip past that one.
+        self.assertEqual(open(key_path, "rb").read(), before,
+                         "private key was modified during recovery")
+        self.assertEqual(stat.S_IMODE(os.stat(key_path).st_mode), before_mode,
+                         "private key mode changed during recovery")
 
     def test_lost_private_half_refuses_rather_than_rotating_silently(self):
         # THE DANGEROUS DIRECTION, and the reason the guard exists. Without
