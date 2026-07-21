@@ -3174,24 +3174,30 @@ class NodeIdentityTests(unittest.TestCase):
         self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
                          f"node private key is {oct(mode)}")
 
-    def test_half_present_keypair_refuses_when_public_half_is_missing(self):
-        mesh._ensure_node_key(self.cfg, "alpha", "claude")
-        os.remove(mesh.node_key_file(self.cfg, "claude") + ".pub")
-        with self.assertRaisesRegex(ValueError, "half-present"):
-            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+    def test_lost_public_half_is_recovered_without_changing_identity(self):
+        # The halves are not symmetric. `ssh-keygen -y` derives the public
+        # half — blob and comment — from the private one, so this loss is
+        # lossless. Erroring instead would turn the MORE likely of the two
+        # losses into an outage: a .pub is world-readable and gets copied
+        # around and clobbered by tooling.
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        pub_path = mesh.node_key_file(self.cfg, "claude") + ".pub"
+        os.remove(pub_path)
+        recovered = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        self.assertEqual(recovered, first)
+        with open(pub_path, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), first)
 
-    def test_half_present_keypair_refuses_when_private_half_is_missing(self):
-        # THE DANGEROUS DIRECTION, and the reason the guard exists at all.
-        # With the public half missing, ssh-keygen refuses to clobber the
-        # private key on its own, so that case is safe with or without us.
-        # With the PRIVATE half missing it happily generates a fresh pair
-        # over the surviving .pub, and this node's identity changes silently
-        # for every peer that already bound the old key. Verified by
-        # deleting the guard: that mutation makes this test regenerate a
-        # different key and pass nothing.
+    def test_lost_private_half_refuses_rather_than_rotating_silently(self):
+        # THE DANGEROUS DIRECTION, and the reason the guard exists. Without
+        # it ssh-keygen generates a fresh pair over the surviving .pub and
+        # this node's identity changes silently for every peer that already
+        # bound the old key — and under the ratchet a silently-rotated node
+        # goes dark rather than degrading. Verified by deleting the guard:
+        # the mutation regenerates a different key and this test fails.
         first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
         os.remove(mesh.node_key_file(self.cfg, "claude"))
-        with self.assertRaisesRegex(ValueError, "half-present"):
+        with self.assertRaisesRegex(ValueError, "cannot be recovered"):
             mesh._ensure_node_key(self.cfg, "alpha", "claude")
         with open(mesh.node_key_file(self.cfg, "claude") + ".pub",
                   encoding="utf-8") as f:

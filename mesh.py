@@ -1212,6 +1212,25 @@ def _node_key_namespace(cfg):
     return f"a2acast-node@{cfg['id']}"
 
 
+def _derive_node_pubkey(key_path, pub_path):
+    """Rewrite a lost `.pub` from its private half. Identity-preserving."""
+    binary = _ssh_keygen_binary()
+    completed = subprocess.run(
+        [binary, "-y", "-f", key_path],
+        capture_output=True, text=True, timeout=60)
+    if completed.returncode != 0:
+        raise ValueError(
+            f"node public key {pub_path} is missing and could not be "
+            f"derived from {key_path}: {completed.stderr.strip()}")
+    pub = completed.stdout.strip()
+    if not pub:
+        raise ValueError(f"deriving the public half of {key_path} produced "
+                         f"nothing")
+    with open(pub_path, "w", encoding="utf-8") as f:
+        f.write(pub + "\n")
+    return pub
+
+
 def _ensure_node_key(cfg, node, harness):
     """Create this node's keypair if absent; return its public key.
 
@@ -1228,10 +1247,26 @@ def _ensure_node_key(cfg, node, harness):
     if os.path.isfile(key_path) and os.path.isfile(pub_path):
         with open(pub_path, "r", encoding="utf-8") as f:
             return f.read().strip()
-    if os.path.isfile(key_path) or os.path.isfile(pub_path):
+    # The halves are not symmetric, so they do not share a branch.
+    if os.path.isfile(key_path):
+        # Public half lost: losslessly recoverable, since `ssh-keygen -y`
+        # derives it — blob and comment — from the private half. Identity is
+        # preserved, so recover and carry on. Erroring here would turn the
+        # more likely of the two losses (a .pub is world-readable, gets
+        # copied around, gets clobbered by tooling) into an outage.
+        return _derive_node_pubkey(key_path, pub_path)
+    if os.path.isfile(pub_path):
+        # Private half lost: not recoverable, by construction. Generating a
+        # fresh pair over the surviving .pub would silently change this
+        # node's identity for every peer that already bound the old key —
+        # and under the ratchet a silently-rotated node goes dark rather
+        # than degrading. Refuse; recovery is out of band, by re-enrolling
+        # at the owner machine.
         raise ValueError(
-            f"node keypair at {key_path} is half-present (one of the private "
-            f"or public halves is missing); move both aside to regenerate")
+            f"node private key {key_path} is missing but its public half "
+            f"remains: this identity cannot be recovered here. Re-enroll "
+            f"this node with the mesh owner rather than regenerating, which "
+            f"would silently change the identity peers have already bound")
     binary = _ssh_keygen_binary()
     completed = subprocess.run(
         [binary, "-q", "-t", "ed25519", "-N", "", "-C",
