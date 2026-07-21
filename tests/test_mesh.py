@@ -6,6 +6,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fnmatch
 import hashlib
 import http.client
 import io
@@ -607,8 +608,14 @@ class PeerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
             mesh.note_peer(cfg, "gamma", "message")
+            # assert the effect, not the literal rule: the rules are a glob
+            # so that adding a new .meshwire.* secret cannot outrun them
             with open(os.path.join(d, ".gitignore")) as f:
-                self.assertIn(".meshwire.peers.json", f.read())
+                rules = [r for r in f.read().splitlines() if r.strip()]
+            self.assertTrue(
+                any(fnmatch.fnmatch(".meshwire.peers.json", r)
+                    for r in rules),
+                f"peers file not covered by {rules}")
 
     def test_note_peer_does_not_clobber_concurrent_exec_allow(self):
         # Security regression test for #30: a long-running process (e.g. a
@@ -737,7 +744,10 @@ class MembershipCmdTests(unittest.TestCase):
         with open(".meshwire.node") as f:
             self.assertEqual(f.read().strip(), "laptop")
         with open(".gitignore") as f:
-            self.assertIn(".meshwire.peers.json", f.read())
+            rules = [r for r in f.read().splitlines() if r.strip()]
+        self.assertTrue(
+            any(fnmatch.fnmatch(".meshwire.peers.json", r) for r in rules),
+            f"peers file not covered by {rules}")
 
     def test_init_unusable_hostname_requires_as(self):
         ns = argparse.Namespace(name="home", nodes=None,
@@ -2972,6 +2982,138 @@ class SignedApprovalTests(unittest.TestCase):
         ok, reason = mesh._verify_approval(member, descriptor, token)
         self.assertTrue(ok, reason)
 
+    def test_fingerprint_matches_ssh_keygen(self):
+        pub = mesh._load_owner_trust(self.cfg)
+        pub_path = mesh.owner_key_file(self.cfg) + ".pub"
+        out = subprocess.run(
+            [shutil.which("ssh-keygen"), "-lf", pub_path],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        expected = out.stdout.split()[1]
+        self.assertEqual(mesh._key_fingerprint(pub), expected)
+
+    def test_fingerprint_rejects_a_malformed_key(self):
+        for bad in ("", "ssh-ed25519", "ssh-ed25519 not!base64!"):
+            with self.assertRaises(ValueError):
+                mesh._key_fingerprint(bad)
+
+    def test_owner_init_prints_the_fingerprint(self):
+        # The root pubkey cannot be authenticated in band, so the owner
+        # machine must surface the value a human reads out of band.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pub = mesh._owner_init(fresh)
+        self.assertIn(mesh._key_fingerprint(pub), out.getvalue())
+
+    def test_parse_block_does_not_pin_anything(self):
+        member_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(member_tmp.cleanup)
+        member = make_cfg(member_tmp.name)
+        member["id"] = self.cfg["id"]
+        block = mesh._owner_trust_block(self.cfg)
+        pub = mesh._parse_owner_trust_block(member, block)
+        self.assertEqual(pub, mesh._load_owner_trust(self.cfg))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def _trust_args(self, block, unattended=False):
+        return argparse.Namespace(block=block, unattended=unattended)
+
+    def _member(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        member = make_cfg(tmp.name)
+        member["id"] = self.cfg["id"]
+        return member
+
+    @contextlib.contextmanager
+    def _as_member(self, member):
+        with mock.patch.object(mesh, "load_config", return_value=member):
+            yield
+
+    def test_trust_shows_fingerprint_and_pins_on_confirmation(self):
+        # imac's ask, both halves: TOFU pins the first key, AND the
+        # fingerprint is prominent enough that pinning the wrong one
+        # requires ignoring it.
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        fingerprint = mesh._key_fingerprint(mesh._load_owner_trust(self.cfg))
+        typed = fingerprint.split(":", 1)[1][:6]
+        out = io.StringIO()
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=typed) as prompt, \
+                contextlib.redirect_stdout(out):
+            mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertIn(fingerprint, out.getvalue())
+        self.assertTrue(prompt.called)
+        self.assertEqual(mesh._load_owner_trust(member),
+                         mesh._load_owner_trust(self.cfg))
+
+    def test_trust_aborts_and_pins_nothing_on_a_wrong_answer(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value="nope"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_trust_refuses_when_no_terminal_is_available(self):
+        # An agent drives stdin, not the tty. No tty means no human.
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertIn("terminal", str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_unattended_flag_alone_does_not_bypass_the_check(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with mock.patch.dict(os.environ,
+                             {mesh.OWNER_TRUST_UNATTENDED_ENV: ""},
+                             clear=False):
+            with self._as_member(member), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    mesh.cmd_owner_trust(
+                        self._trust_args(block, unattended=True))
+        self.assertIn(mesh.OWNER_TRUST_UNATTENDED_ENV, str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
+
+    def test_unattended_with_env_pins_without_a_terminal(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        with mock.patch.dict(os.environ,
+                             {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"},
+                             clear=False):
+            with self._as_member(member), \
+                    mock.patch.object(mesh, "_read_from_terminal") as prompt, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_owner_trust(self._trust_args(block, unattended=True))
+        self.assertFalse(prompt.called)
+        self.assertEqual(mesh._load_owner_trust(member),
+                         mesh._load_owner_trust(self.cfg))
+
+    def test_trust_is_idempotent_without_prompting(self):
+        member = self._member()
+        block = mesh._owner_trust_block(self.cfg)
+        mesh._apply_owner_trust(member, block)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal") as prompt, \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_owner_trust(self._trust_args(block))
+        self.assertFalse(prompt.called)
+
     def test_trust_refuses_replacing_a_different_owner(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
@@ -2982,6 +3124,217 @@ class SignedApprovalTests(unittest.TestCase):
         block = mesh._owner_trust_block(foreign)
         with self.assertRaisesRegex(ValueError, "different owner"):
             mesh._apply_owner_trust(self.cfg, block)
+
+
+class NodeIdentityTests(unittest.TestCase):
+    """Per-node ed25519 keypairs (#62 phase 2). A message authenticated
+    under the shared mesh key proves membership, not authorship, so each
+    node holds its own key — per HARNESS, since two agents can share a
+    directory and still be distinct nodes."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_key_path_is_per_harness(self):
+        claude = mesh.node_key_file(self.cfg, "claude")
+        codex = mesh.node_key_file(self.cfg, "codex")
+        self.assertNotEqual(claude, codex)
+        self.assertTrue(claude.endswith(".meshwire.key.claude"))
+        # pairs 1:1 with the identity file that names the node
+        self.assertEqual(
+            os.path.basename(claude).replace(mesh.NODE_KEY_NAME, ""),
+            os.path.basename(mesh.node_file(self.cfg, "claude"))
+            .replace(mesh.NODE_NAME, ""))
+
+    def test_two_harnesses_in_one_directory_get_distinct_keys(self):
+        # The live counterexample to a per-directory key: imac and
+        # jamess-imac-codex are two nodes sharing one directory.
+        first = mesh._ensure_node_key(self.cfg, "imac", "claude")
+        second = mesh._ensure_node_key(self.cfg, "imac-codex", "codex")
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(mesh._key_fingerprint(first),
+                            mesh._key_fingerprint(second))
+
+    def test_key_generation_is_idempotent(self):
+        # Comparing only the returned strings is too narrow: re-entry could
+        # rewrite, weaken or replace the private key and still return the
+        # same public half. Assert the FILE is untouched — bytes and, where
+        # meaningful, mode.
+        path = mesh.node_key_file(self.cfg, "claude")
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        before = open(path, "rb").read()
+        before_mode = stat.S_IMODE(os.stat(path).st_mode)
+        second = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        self.assertEqual(first, second)
+        self.assertEqual(open(path, "rb").read(), before,
+                         "private key was rewritten on re-entry")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), before_mode,
+                         "private key mode changed on re-entry")
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL semantics")
+    def test_private_key_acl_excludes_broad_principals_on_windows(self):
+        # os.stat cannot answer this: Windows synthesises st_mode from the
+        # read-only attribute and reports 0o666 whatever the ACL says. That
+        # left ONE ambiguous observation with two readings — st_mode is
+        # blind, or the key really is unprotected — and skipping the POSIX
+        # assertion made the ambiguity permanent instead of resolving it.
+        # icacls sees the mechanism that actually protects the file, so ask
+        # it. All three entry paths, as on POSIX: this test was modelled on
+        # the POSIX one while that still had a two-path loop, so the gap
+        # propagated to the platform which previously asserted nothing at
+        # all. _derive_node_pubkey only rewrites the .pub and should leave
+        # the private key's ACL untouched — "should" being the word this
+        # work has repeatedly punished, hence the third iteration.
+        icacls = shutil.which("icacls")
+        if not icacls:
+            self.skipTest("icacls unavailable")
+        path = mesh.node_key_file(self.cfg, "claude")
+        for call, setup in (("generate", None),
+                            ("re-enter", None),
+                            ("recover", lambda: os.remove(path + ".pub"))):
+            if setup:
+                setup()
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+            out = subprocess.run([icacls, path], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            # English-runner principals; CI is English. A localised Windows
+            # would silently pass, which is a limit of this check, not a
+            # reason to skip it on the platform we actually ship CI for.
+            for principal in ("Everyone", "BUILTIN\\Users",
+                              "Authenticated Users"):
+                self.assertNotIn(
+                    principal, out.stdout,
+                    f"node private key ACL grants {principal} after {call}:"
+                    f"\n{out.stdout}")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_private_key_is_not_world_readable(self):
+        # Windows reports 0o666 here regardless of the real ACL: st_mode is
+        # synthesised from the read-only attribute alone, so the assertion
+        # is meaningless rather than merely failing there. Key protection on
+        # Windows rests on the ACL ssh-keygen sets, which os.stat cannot
+        # see and nothing in this suite currently checks.
+        path = mesh.node_key_file(self.cfg, "claude")
+        # All THREE entry paths, not just generation. The defect family here
+        # is "a branch that touches the key without an assertion on it", and
+        # it has recurred once per branch: generation, the both-present
+        # early return, and recovery. Recovery is the most-travelled of the
+        # three — a .pub is world-readable and gets clobbered by tooling,
+        # which is why it derives rather than erroring.
+        for call, setup in (("generate", None),
+                            ("re-enter", None),
+                            ("recover", lambda: os.remove(path + ".pub"))):
+            if setup:
+                setup()
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
+                             f"node private key is {oct(mode)} after {call}")
+
+    def test_lost_public_half_is_recovered_without_changing_identity(self):
+        # The halves are not symmetric. `ssh-keygen -y` derives the public
+        # half — blob and comment — from the private one, so this loss is
+        # lossless. Erroring instead would turn the MORE likely of the two
+        # losses into an outage: a .pub is world-readable and gets copied
+        # around and clobbered by tooling.
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        pub_path = mesh.node_key_file(self.cfg, "claude") + ".pub"
+        os.remove(pub_path)
+        key_path = mesh.node_key_file(self.cfg, "claude")
+        before = open(key_path, "rb").read()
+        before_mode = stat.S_IMODE(os.stat(key_path).st_mode)
+        recovered = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        self.assertEqual(recovered, first)
+        with open(pub_path, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), first)
+        # Recovery reads the private half and must not touch it at all —
+        # bytes or mode. Mode matters separately from the world-readable
+        # check, which only looks at group/other bits: a recovery that
+        # rewrote the owner bits would slip past that one.
+        self.assertEqual(open(key_path, "rb").read(), before,
+                         "private key was modified during recovery")
+        self.assertEqual(stat.S_IMODE(os.stat(key_path).st_mode), before_mode,
+                         "private key mode changed during recovery")
+
+    def test_lost_private_half_refuses_rather_than_rotating_silently(self):
+        # THE DANGEROUS DIRECTION, and the reason the guard exists. Without
+        # it ssh-keygen generates a fresh pair over the surviving .pub and
+        # this node's identity changes silently for every peer that already
+        # bound the old key — and under the ratchet a silently-rotated node
+        # goes dark rather than degrading. Verified by deleting the guard:
+        # the mutation regenerates a different key and this test fails.
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        os.remove(mesh.node_key_file(self.cfg, "claude"))
+        with self.assertRaisesRegex(ValueError, "cannot be recovered"):
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        with open(mesh.node_key_file(self.cfg, "claude") + ".pub",
+                  encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), first,
+                             "surviving public half was overwritten")
+
+    def test_no_harness_uses_the_generic_pair(self):
+        # Assert the LITERAL path. Asking node_key_file where the key
+        # should be and then checking it is there compares the function to
+        # itself: a mutation that renames every path consistently passes.
+        pub = mesh._ensure_node_key(self.cfg, "alpha", None)
+        expected = os.path.join(self.cfg["_dir"], ".meshwire.key")
+        self.assertTrue(os.path.isfile(expected),
+                        f"generic key not at {expected}: "
+                        f"{sorted(os.listdir(self.cfg['_dir']))}")
+        self.assertTrue(os.path.isfile(expected + ".pub"))
+        self.assertTrue(pub.startswith("ssh-ed25519 "))
+
+
+class GitignoreCoverageTests(unittest.TestCase):
+    """The generated rules must cover every secret in the directory.
+
+    Regression: the old list enumerated files individually and predated
+    #62, so `.meshwire.owner` — the owner PRIVATE key — was not ignored and
+    `git add -A` staged it. `.meshwire.key.*` is listed here before that
+    file exists, so the per-node private key lands into a directory whose
+    rules already cover it."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git unavailable")
+
+    def _ignored(self, tmpdir, name):
+        return subprocess.run(
+            [shutil.which("git"), "check-ignore", "-q", name],
+            cwd=tmpdir, capture_output=True, timeout=60).returncode == 0
+
+    def test_generated_rules_cover_every_meshwire_secret(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        subprocess.run([shutil.which("git"), "init", "-q", "."],
+                       cwd=tmp.name, capture_output=True, timeout=60)
+        mesh._ensure_gitignore(tmp.name)
+        for name in (".meshwire.owner", ".meshwire.owner.pub",
+                     ".meshwire.trust.json", ".meshwire.approvals.json",
+                     ".meshwire.key.claude", ".meshwire.key.claude.pub",
+                     ".meshwire.node.claude", ".meshwire.json",
+                     ".meshwire.cursor-alpha", ".meshwire.replay-alpha.json"):
+            with self.subTest(name=name):
+                self.assertTrue(self._ignored(tmp.name, name),
+                                f"{name} would be committed")
+
+    def test_rules_are_idempotent(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mesh._ensure_gitignore(tmp.name)
+        mesh._ensure_gitignore(tmp.name)
+        with open(os.path.join(tmp.name, ".gitignore"), encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        self.assertEqual(len(lines), len(set(lines)))
 
 
 class BufferWaitTests(unittest.TestCase):
@@ -3712,7 +4065,11 @@ class WorkerDispatchTests(unittest.TestCase):
             self.cfg, "coordinator")[task_id]["state"], "submitted")
         self.assertEqual(mesh.load_tasks(self.cfg), {})
         with open(os.path.join(self.cfg["_dir"], ".gitignore")) as handle:
-            self.assertIn(".meshwire.delegate-tasks.*.json", handle.read())
+            rules = [r for r in handle.read().splitlines() if r.strip()]
+        self.assertTrue(
+            any(fnmatch.fnmatch(".meshwire.delegate-tasks.coordinator.json",
+                                r) for r in rules),
+            f"delegate ledger not covered by {rules}")
 
     def test_coordinator_ledger_does_not_collide_with_worker_inbox(self):
         captured = {}

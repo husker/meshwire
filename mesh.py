@@ -52,6 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
+NODE_KEY_NAME = ".meshwire.key"
 ACTIVITY_FILE = ".meshwire.activity"
 SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
 SUPERVISE_MAX_ATTEMPTS = 3
@@ -660,6 +661,17 @@ def node_file(cfg, harness=None):
     return f"{base}.{harness}" if harness else base
 
 
+def node_key_file(cfg, harness=None):
+    """Private key path for one node identity — per HARNESS, not per
+    directory. Two agents can share a directory and still be distinct nodes
+    (imac and jamess-imac-codex do exactly that), so a single key beside the
+    config would either collapse them into one identity or hand whichever
+    harness generated first a key the other silently reuses. Mirrors
+    node_file()'s naming so the pair is inspectable side by side."""
+    base = os.path.join(cfg["_dir"], NODE_KEY_NAME)
+    return f"{base}.{harness}" if harness else base
+
+
 def _detect_harness():
     """Best-effort: which agent harness runs this process, or None.
 
@@ -1048,6 +1060,29 @@ def _canonical_descriptor(value):
     return rendered.encode("utf-8")
 
 
+def _key_fingerprint(pub):
+    """SHA256 fingerprint of an OpenSSH public key, `ssh-keygen -lf` format.
+
+    Nothing inside the mesh can authenticate the owner's ROOT pubkey: the
+    trust block arrives over a channel that proves shared-key custody, not
+    who sent it. The fingerprint is what a human compares out of band, so
+    a key injected ahead of the real owner is caught here instead of being
+    silently pinned by TOFU (see _apply_owner_trust)."""
+    if not isinstance(pub, str):
+        raise ValueError("public key is not a string")
+    parts = pub.split()
+    if len(parts) < 2:
+        raise ValueError("public key is malformed")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("public key is malformed") from exc
+    if not blob:
+        raise ValueError("public key is malformed")
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def _load_owner_trust(cfg):
     try:
         with open(owner_trust_file(cfg), "r", encoding="utf-8") as f:
@@ -1085,6 +1120,11 @@ def _owner_init(cfg):
     print("mesh owner key created — never leaves this machine. Distribute")
     print("trust by running this on every member (share like an invite):")
     print(f"  mesh owner-trust {_owner_trust_block(cfg)}")
+    print()
+    print(f"  owner fingerprint: {_key_fingerprint(pub)}")
+    print("  Read that aloud to whoever runs `mesh owner-trust`. The block")
+    print("  travels over a channel that cannot prove who sent it; the")
+    print("  fingerprint, compared out of band, is what proves it.")
     return pub
 
 
@@ -1097,7 +1137,31 @@ def _owner_trust_block(cfg):
         body.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _apply_owner_trust(cfg, block):
+OWNER_TRUST_UNATTENDED_ENV = "A2ACAST_OWNER_TRUST_UNATTENDED"
+
+
+def _read_from_terminal(prompt):
+    """Prompt on the CONTROLLING TERMINAL, not stdin. Returns None if there
+    is no terminal to ask.
+
+    stdin is what an agent drives, so reading it would let the caller answer
+    its own question. Trusting an owner key is one of the acts that must
+    carry human intent, so it asks the tty or it does not ask at all."""
+    device = "CONIN$" if os.name == "nt" else "/dev/tty"
+    try:
+        with open(device, "r+", encoding="utf-8", errors="replace") as tty:
+            tty.write(prompt)
+            tty.flush()
+            line = tty.readline()
+    except (OSError, ValueError):
+        return None
+    return "" if not line else line.strip()
+
+
+def _parse_owner_trust_block(cfg, block):
+    """Validate a trust block and return its owner pubkey — no writes.
+
+    Split out so the fingerprint can be shown BEFORE anything is pinned."""
     if not isinstance(block, str) or not block.startswith("mwtrust1-"):
         raise ValueError("not an owner trust block")
     raw = block[len("mwtrust1-"):]
@@ -1111,15 +1175,108 @@ def _apply_owner_trust(cfg, block):
     pub = value.get("owner_pub")
     if not isinstance(pub, str) or not pub.strip():
         raise ValueError("owner trust block is missing the owner key")
+    _key_fingerprint(pub.strip())  # reject unparseable keys before pinning
+    return pub.strip()
+
+
+def _apply_owner_trust(cfg, block):
+    pub = _parse_owner_trust_block(cfg, block)
     try:
         existing = _load_owner_trust(cfg)
     except ValueError:
         existing = None
-    if existing is not None and existing != pub.strip():
+    if existing is not None and existing != pub:
         raise ValueError("a different owner is already trusted here; "
                          "refusing to replace it")
-    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub.strip()})
-    return pub.strip()
+    _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
+    return pub
+
+
+# -- per-node identity (#62 phase 2) --------------------------------------
+# The mesh key is shared by every member, so a message authenticated under
+# it proves membership, not authorship: any member can emit a frame that
+# reads as any node. Each node therefore holds its OWN ed25519 keypair. The
+# mesh key keeps transport confidentiality and replay defence — jobs it can
+# actually do — and stops being asked to carry an identity claim it never
+# carried.
+#
+# Signing uses ssh-keygen, as approvals do. A hand-rolled ed25519 was
+# considered and rejected: the risk is not timing but VERIFICATION
+# DIVERGENCE (non-canonical S, small-order points, cofactor clearing),
+# which is silent, and in an authentication layer means one node accepts
+# what another rejects — a split-brain trust graph presenting as an
+# intermittent mesh bug. RFC 8032 vectors do not cover those cases.
+
+
+def _node_key_namespace(cfg):
+    return f"a2acast-node@{cfg['id']}"
+
+
+def _derive_node_pubkey(key_path, pub_path):
+    """Rewrite a lost `.pub` from its private half. Identity-preserving."""
+    binary = _ssh_keygen_binary()
+    completed = subprocess.run(
+        [binary, "-y", "-f", key_path],
+        capture_output=True, text=True, timeout=60)
+    if completed.returncode != 0:
+        raise ValueError(
+            f"node public key {pub_path} is missing and could not be "
+            f"derived from {key_path}: {completed.stderr.strip()}")
+    pub = completed.stdout.strip()
+    if not pub:
+        raise ValueError(f"deriving the public half of {key_path} produced "
+                         f"nothing")
+    with open(pub_path, "w", encoding="utf-8") as f:
+        f.write(pub + "\n")
+    return pub
+
+
+def _ensure_node_key(cfg, node, harness):
+    """Create this node's keypair if absent; return its public key.
+
+    Idempotent — an existing private key is never replaced, since doing so
+    would silently change this node's identity for every peer that has
+    already bound it.
+
+    `harness` is passed through to node_key_file exactly as node_file takes
+    it, so the key path always corresponds 1:1 with the identity file that
+    names the node. A harness of None resolves to the generic pair, which is
+    correct: one identity, one key."""
+    key_path = node_key_file(cfg, harness)
+    pub_path = key_path + ".pub"
+    if os.path.isfile(key_path) and os.path.isfile(pub_path):
+        with open(pub_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    # The halves are not symmetric, so they do not share a branch.
+    if os.path.isfile(key_path):
+        # Public half lost: losslessly recoverable, since `ssh-keygen -y`
+        # derives it — blob and comment — from the private half. Identity is
+        # preserved, so recover and carry on. Erroring here would turn the
+        # more likely of the two losses (a .pub is world-readable, gets
+        # copied around, gets clobbered by tooling) into an outage.
+        return _derive_node_pubkey(key_path, pub_path)
+    if os.path.isfile(pub_path):
+        # Private half lost: not recoverable, by construction. Generating a
+        # fresh pair over the surviving .pub would silently change this
+        # node's identity for every peer that already bound the old key —
+        # and under the ratchet a silently-rotated node goes dark rather
+        # than degrading. Refuse; recovery is out of band, by re-enrolling
+        # at the owner machine.
+        raise ValueError(
+            f"node private key {key_path} is missing but its public half "
+            f"remains: this identity cannot be recovered here. Re-enroll "
+            f"this node with the mesh owner rather than regenerating, which "
+            f"would silently change the identity peers have already bound")
+    binary = _ssh_keygen_binary()
+    completed = subprocess.run(
+        [binary, "-q", "-t", "ed25519", "-N", "", "-C",
+         f"a2acast-node-{node}@{cfg['mesh']}", "-f", key_path],
+        capture_output=True, text=True, timeout=60)
+    if completed.returncode != 0:
+        raise ValueError("ssh-keygen could not create the node key: "
+                         + completed.stderr.strip())
+    with open(pub_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
 
 
 def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
@@ -4244,11 +4401,18 @@ def _gitignore_add(dirpath, lines):
 
 
 def _ensure_gitignore(dirpath):
-    # keep secrets and per-machine files out of version control
-    _gitignore_add(dirpath, [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
-                             ".meshwire.replay-*", ".meshwire.status-*",
-                             ".meshwire.delegate-tasks.*.json",
-                             TASKS_NAME, PEERS_NAME])
+    """Keep secrets and per-machine files out of version control.
+
+    One glob, not an enumeration. The old list named each file individually
+    and predated #62, which added `.meshwire.owner` (the owner PRIVATE
+    key), `.meshwire.trust.json` and `.meshwire.approvals.json` — none of
+    which it covered, so `git add -A` in a repo relying on these rules
+    staged the owner key. It protected one file out of seven. Verify with:
+        git check-ignore -q .meshwire.owner
+    Every `.meshwire.*` file is per-machine state or a secret by design, so
+    a prefix glob cannot rot the way the list did when the next one lands —
+    and the next one is a per-node private key."""
+    _gitignore_add(dirpath, [".meshwire.*"])
 
 
 def _write_config_here(cfg):
@@ -4285,6 +4449,16 @@ def cmd_join(args):
         f.write(me + "\n")
     print(f"joined mesh '{cfg['mesh']}' as '{me}' "
           f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
+    # Best-effort: a node with no keypair still joins and still talks. It is
+    # simply unattributable, which is the state every node is in today, so
+    # failing the join over it would be a regression rather than a defence.
+    try:
+        _ensure_node_key(cfg, me, harness)
+        print(f"  node key: {node_key_file(cfg, harness)} "
+              f"(private, never leaves this machine)")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"  warning: no node keypair ({exc}); this node cannot be "
+              f"cryptographically attributed yet", file=sys.stderr)
     if cfg.get("key"):
         try:
             send_raw(cfg, me, BROADCAST, f"{me} joined the mesh",
@@ -4319,15 +4493,59 @@ def cmd_invite(args):
 
 
 def cmd_owner_init(args):
+    cfg = load_config()
+    # Refresh first: this command is about to write a private key into the
+    # directory, and the rules may predate that file existing. cmd_init and
+    # cmd_join already refresh via _write_config_here; this was the third
+    # entry point where a directory gains a secret, and it did not.
+    _ensure_gitignore(cfg["_dir"])
     try:
-        _owner_init(load_config())
+        _owner_init(cfg)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
 
 
 def cmd_owner_trust(args):
+    if args.unattended and os.environ.get(OWNER_TRUST_UNATTENDED_ENV) != "1":
+        sys.exit(f"error: --unattended also requires "
+                 f"{OWNER_TRUST_UNATTENDED_ENV}=1 in the environment. Two "
+                 f"deliberate steps, so a flag alone — from a script, a "
+                 f"harness, or an agent — cannot skip the human check.")
+    cfg = load_config()
     try:
-        _apply_owner_trust(load_config(), args.block)
+        pub = _parse_owner_trust_block(cfg, args.block)
+        fingerprint = _key_fingerprint(pub)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    try:
+        already = _load_owner_trust(cfg)
+    except ValueError:
+        already = None
+    if already == pub:
+        print(f"mesh owner already trusted here ({fingerprint}) — no change")
+        return
+    print(f"owner fingerprint: {fingerprint}")
+    print("This block arrived over a channel that proves shared-key custody,")
+    print("NOT who sent it. Any member could have injected it. Confirm the")
+    print("fingerprint against the owner machine (`mesh owner-init` printed")
+    print("it there) before trusting it — this is the act that makes every")
+    print("later owner approval verify.")
+    if not args.unattended:
+        want = fingerprint.split(":", 1)[1][:6]
+        answer = _read_from_terminal(
+            f"Type the first 6 characters of the fingerprint ({want[:1]}…) "
+            "to confirm, or anything else to abort: ")
+        if answer is None:
+            sys.exit(
+                "error: no terminal available to confirm the fingerprint. "
+                "Trusting an owner key needs a human; re-run where you have "
+                f"a terminal, or set {OWNER_TRUST_UNATTENDED_ENV}=1 and pass "
+                "--unattended if you have verified the fingerprint by other "
+                "means.")
+        if answer != want:
+            sys.exit("error: fingerprint not confirmed — nothing was trusted")
+    try:
+        _apply_owner_trust(cfg, args.block)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
     print("mesh owner trusted — approvals from this owner verify here now")
@@ -9389,6 +9607,9 @@ def main():
                        help="trust the mesh owner here from its mwtrust1- "
                             "block (share it privately, like an invite)")
     p.add_argument("block")
+    p.add_argument("--unattended", action="store_true",
+                   help="skip the terminal fingerprint check; also requires "
+                        f"{OWNER_TRUST_UNATTENDED_ENV}=1")
     p.set_defaults(fn=cmd_owner_trust)
 
     p = sub.add_parser("approve",
