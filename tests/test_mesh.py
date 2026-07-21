@@ -3186,12 +3186,21 @@ class NodeIdentityTests(unittest.TestCase):
         # blind, or the key really is unprotected — and skipping the POSIX
         # assertion made the ambiguity permanent instead of resolving it.
         # icacls sees the mechanism that actually protects the file, so ask
-        # it. Both the generate and re-enter paths, as on POSIX.
+        # it. All three entry paths, as on POSIX: this test was modelled on
+        # the POSIX one while that still had a two-path loop, so the gap
+        # propagated to the platform which previously asserted nothing at
+        # all. _derive_node_pubkey only rewrites the .pub and should leave
+        # the private key's ACL untouched — "should" being the word this
+        # work has repeatedly punished, hence the third iteration.
         icacls = shutil.which("icacls")
         if not icacls:
             self.skipTest("icacls unavailable")
         path = mesh.node_key_file(self.cfg, "claude")
-        for call in ("generate", "re-enter"):
+        for call, setup in (("generate", None),
+                            ("re-enter", None),
+                            ("recover", lambda: os.remove(path + ".pub"))):
+            if setup:
+                setup()
             mesh._ensure_node_key(self.cfg, "alpha", "claude")
             out = subprocess.run([icacls, path], capture_output=True,
                                  text=True, timeout=60)
