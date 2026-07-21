@@ -52,6 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_NAME = ".meshwire.json"
 NODE_NAME = ".meshwire.node"
+NODE_KEY_NAME = ".meshwire.key"
 ACTIVITY_FILE = ".meshwire.activity"
 SUPERVISE_HANDLED_NAME = ".meshwire.supervise-handled"
 SUPERVISE_MAX_ATTEMPTS = 3
@@ -660,6 +661,17 @@ def node_file(cfg, harness=None):
     return f"{base}.{harness}" if harness else base
 
 
+def node_key_file(cfg, harness=None):
+    """Private key path for one node identity — per HARNESS, not per
+    directory. Two agents can share a directory and still be distinct nodes
+    (imac and jamess-imac-codex do exactly that), so a single key beside the
+    config would either collapse them into one identity or hand whichever
+    harness generated first a key the other silently reuses. Mirrors
+    node_file()'s naming so the pair is inspectable side by side."""
+    base = os.path.join(cfg["_dir"], NODE_KEY_NAME)
+    return f"{base}.{harness}" if harness else base
+
+
 def _detect_harness():
     """Best-effort: which agent harness runs this process, or None.
 
@@ -1178,6 +1190,58 @@ def _apply_owner_trust(cfg, block):
                          "refusing to replace it")
     _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
     return pub
+
+
+# -- per-node identity (#62 phase 2) --------------------------------------
+# The mesh key is shared by every member, so a message authenticated under
+# it proves membership, not authorship: any member can emit a frame that
+# reads as any node. Each node therefore holds its OWN ed25519 keypair. The
+# mesh key keeps transport confidentiality and replay defence — jobs it can
+# actually do — and stops being asked to carry an identity claim it never
+# carried.
+#
+# Signing uses ssh-keygen, as approvals do. A hand-rolled ed25519 was
+# considered and rejected: the risk is not timing but VERIFICATION
+# DIVERGENCE (non-canonical S, small-order points, cofactor clearing),
+# which is silent, and in an authentication layer means one node accepts
+# what another rejects — a split-brain trust graph presenting as an
+# intermittent mesh bug. RFC 8032 vectors do not cover those cases.
+
+
+def _node_key_namespace(cfg):
+    return f"a2acast-node@{cfg['id']}"
+
+
+def _ensure_node_key(cfg, node, harness):
+    """Create this node's keypair if absent; return its public key.
+
+    Idempotent — an existing private key is never replaced, since doing so
+    would silently change this node's identity for every peer that has
+    already bound it.
+
+    `harness` is passed through to node_key_file exactly as node_file takes
+    it, so the key path always corresponds 1:1 with the identity file that
+    names the node. A harness of None resolves to the generic pair, which is
+    correct: one identity, one key."""
+    key_path = node_key_file(cfg, harness)
+    pub_path = key_path + ".pub"
+    if os.path.isfile(key_path) and os.path.isfile(pub_path):
+        with open(pub_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    if os.path.isfile(key_path) or os.path.isfile(pub_path):
+        raise ValueError(
+            f"node keypair at {key_path} is half-present (one of the private "
+            f"or public halves is missing); move both aside to regenerate")
+    binary = _ssh_keygen_binary()
+    completed = subprocess.run(
+        [binary, "-q", "-t", "ed25519", "-N", "", "-C",
+         f"a2acast-node-{node}@{cfg['mesh']}", "-f", key_path],
+        capture_output=True, text=True, timeout=60)
+    if completed.returncode != 0:
+        raise ValueError("ssh-keygen could not create the node key: "
+                         + completed.stderr.strip())
+    with open(pub_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
 
 
 def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
@@ -4350,6 +4414,16 @@ def cmd_join(args):
         f.write(me + "\n")
     print(f"joined mesh '{cfg['mesh']}' as '{me}' "
           f"({'end-to-end encrypted' if cfg.get('key') else 'PLAINTEXT'})")
+    # Best-effort: a node with no keypair still joins and still talks. It is
+    # simply unattributable, which is the state every node is in today, so
+    # failing the join over it would be a regression rather than a defence.
+    try:
+        _ensure_node_key(cfg, me, harness)
+        print(f"  node key: {node_key_file(cfg, harness)} "
+              f"(private, never leaves this machine)")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"  warning: no node keypair ({exc}); this node cannot be "
+              f"cryptographically attributed yet", file=sys.stderr)
     if cfg.get("key"):
         try:
             send_raw(cfg, me, BROADCAST, f"{me} joined the mesh",

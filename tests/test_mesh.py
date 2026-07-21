@@ -3126,6 +3126,68 @@ class SignedApprovalTests(unittest.TestCase):
             mesh._apply_owner_trust(self.cfg, block)
 
 
+class NodeIdentityTests(unittest.TestCase):
+    """Per-node ed25519 keypairs (#62 phase 2). A message authenticated
+    under the shared mesh key proves membership, not authorship, so each
+    node holds its own key — per HARNESS, since two agents can share a
+    directory and still be distinct nodes."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_key_path_is_per_harness(self):
+        claude = mesh.node_key_file(self.cfg, "claude")
+        codex = mesh.node_key_file(self.cfg, "codex")
+        self.assertNotEqual(claude, codex)
+        self.assertTrue(claude.endswith(".meshwire.key.claude"))
+        # pairs 1:1 with the identity file that names the node
+        self.assertEqual(
+            os.path.basename(claude).replace(mesh.NODE_KEY_NAME, ""),
+            os.path.basename(mesh.node_file(self.cfg, "claude"))
+            .replace(mesh.NODE_NAME, ""))
+
+    def test_two_harnesses_in_one_directory_get_distinct_keys(self):
+        # The live counterexample to a per-directory key: imac and
+        # jamess-imac-codex are two nodes sharing one directory.
+        first = mesh._ensure_node_key(self.cfg, "imac", "claude")
+        second = mesh._ensure_node_key(self.cfg, "imac-codex", "codex")
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(mesh._key_fingerprint(first),
+                            mesh._key_fingerprint(second))
+
+    def test_key_generation_is_idempotent(self):
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        second = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        self.assertEqual(first, second)
+
+    def test_private_key_is_not_world_readable(self):
+        mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        path = mesh.node_key_file(self.cfg, "claude")
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
+                         f"node private key is {oct(mode)}")
+
+    def test_half_present_keypair_refuses_rather_than_regenerating(self):
+        # Silently regenerating would change this node's identity for every
+        # peer that already bound it.
+        mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        os.remove(mesh.node_key_file(self.cfg, "claude") + ".pub")
+        with self.assertRaisesRegex(ValueError, "half-present"):
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+
+    def test_no_harness_uses_the_generic_pair(self):
+        pub = mesh._ensure_node_key(self.cfg, "alpha", None)
+        self.assertTrue(os.path.isfile(mesh.node_key_file(self.cfg)))
+        self.assertTrue(pub.startswith("ssh-ed25519 "))
+
+
 class GitignoreCoverageTests(unittest.TestCase):
     """The generated rules must cover every secret in the directory.
 
