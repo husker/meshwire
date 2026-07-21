@@ -4302,11 +4302,18 @@ def _gitignore_add(dirpath, lines):
 
 
 def _ensure_gitignore(dirpath):
-    # keep secrets and per-machine files out of version control
-    _gitignore_add(dirpath, [CONFIG_NAME, NODE_NAME, ".meshwire.cursor-*",
-                             ".meshwire.replay-*", ".meshwire.status-*",
-                             ".meshwire.delegate-tasks.*.json",
-                             TASKS_NAME, PEERS_NAME])
+    """Keep secrets and per-machine files out of version control.
+
+    One glob, not an enumeration. The old list named each file individually
+    and predated #62, which added `.meshwire.owner` (the owner PRIVATE
+    key), `.meshwire.trust.json` and `.meshwire.approvals.json` — none of
+    which it covered, so `git add -A` in a repo relying on these rules
+    staged the owner key. It protected one file out of seven. Verify with:
+        git check-ignore -q .meshwire.owner
+    Every `.meshwire.*` file is per-machine state or a secret by design, so
+    a prefix glob cannot rot the way the list did when the next one lands —
+    and the next one is a per-node private key."""
+    _gitignore_add(dirpath, [".meshwire.*"])
 
 
 def _write_config_here(cfg):
@@ -4377,8 +4384,14 @@ def cmd_invite(args):
 
 
 def cmd_owner_init(args):
+    cfg = load_config()
+    # Refresh first: this command is about to write a private key into the
+    # directory, and the rules may predate that file existing. cmd_init and
+    # cmd_join already refresh via _write_config_here; this was the third
+    # entry point where a directory gains a secret, and it did not.
+    _ensure_gitignore(cfg["_dir"])
     try:
-        _owner_init(load_config())
+        _owner_init(cfg)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
 

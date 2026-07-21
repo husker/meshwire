@@ -6,6 +6,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fnmatch
 import hashlib
 import http.client
 import io
@@ -607,8 +608,14 @@ class PeerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
             mesh.note_peer(cfg, "gamma", "message")
+            # assert the effect, not the literal rule: the rules are a glob
+            # so that adding a new .meshwire.* secret cannot outrun them
             with open(os.path.join(d, ".gitignore")) as f:
-                self.assertIn(".meshwire.peers.json", f.read())
+                rules = [r for r in f.read().splitlines() if r.strip()]
+            self.assertTrue(
+                any(fnmatch.fnmatch(".meshwire.peers.json", r)
+                    for r in rules),
+                f"peers file not covered by {rules}")
 
     def test_note_peer_does_not_clobber_concurrent_exec_allow(self):
         # Security regression test for #30: a long-running process (e.g. a
@@ -737,7 +744,10 @@ class MembershipCmdTests(unittest.TestCase):
         with open(".meshwire.node") as f:
             self.assertEqual(f.read().strip(), "laptop")
         with open(".gitignore") as f:
-            self.assertIn(".meshwire.peers.json", f.read())
+            rules = [r for r in f.read().splitlines() if r.strip()]
+        self.assertTrue(
+            any(fnmatch.fnmatch(".meshwire.peers.json", r) for r in rules),
+            f"peers file not covered by {rules}")
 
     def test_init_unusable_hostname_requires_as(self):
         ns = argparse.Namespace(name="home", nodes=None,
@@ -3116,6 +3126,50 @@ class SignedApprovalTests(unittest.TestCase):
             mesh._apply_owner_trust(self.cfg, block)
 
 
+class GitignoreCoverageTests(unittest.TestCase):
+    """The generated rules must cover every secret in the directory.
+
+    Regression: the old list enumerated files individually and predated
+    #62, so `.meshwire.owner` — the owner PRIVATE key — was not ignored and
+    `git add -A` staged it. `.meshwire.key.*` is listed here before that
+    file exists, so the per-node private key lands into a directory whose
+    rules already cover it."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git unavailable")
+
+    def _ignored(self, tmpdir, name):
+        return subprocess.run(
+            [shutil.which("git"), "check-ignore", "-q", name],
+            cwd=tmpdir, capture_output=True, timeout=60).returncode == 0
+
+    def test_generated_rules_cover_every_meshwire_secret(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        subprocess.run([shutil.which("git"), "init", "-q", "."],
+                       cwd=tmp.name, capture_output=True, timeout=60)
+        mesh._ensure_gitignore(tmp.name)
+        for name in (".meshwire.owner", ".meshwire.owner.pub",
+                     ".meshwire.trust.json", ".meshwire.approvals.json",
+                     ".meshwire.key.claude", ".meshwire.key.claude.pub",
+                     ".meshwire.node.claude", ".meshwire.json",
+                     ".meshwire.cursor-alpha", ".meshwire.replay-alpha.json"):
+            with self.subTest(name=name):
+                self.assertTrue(self._ignored(tmp.name, name),
+                                f"{name} would be committed")
+
+    def test_rules_are_idempotent(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mesh._ensure_gitignore(tmp.name)
+        mesh._ensure_gitignore(tmp.name)
+        with open(os.path.join(tmp.name, ".gitignore"), encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        self.assertEqual(len(lines), len(set(lines)))
+
+
 class BufferWaitTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.pop("A2ACAST_NODE", None)
@@ -3844,7 +3898,11 @@ class WorkerDispatchTests(unittest.TestCase):
             self.cfg, "coordinator")[task_id]["state"], "submitted")
         self.assertEqual(mesh.load_tasks(self.cfg), {})
         with open(os.path.join(self.cfg["_dir"], ".gitignore")) as handle:
-            self.assertIn(".meshwire.delegate-tasks.*.json", handle.read())
+            rules = [r for r in handle.read().splitlines() if r.strip()]
+        self.assertTrue(
+            any(fnmatch.fnmatch(".meshwire.delegate-tasks.coordinator.json",
+                                r) for r in rules),
+            f"delegate ledger not covered by {rules}")
 
     def test_coordinator_ledger_does_not_collide_with_worker_inbox(self):
         captured = {}
