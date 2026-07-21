@@ -3114,6 +3114,45 @@ class SignedApprovalTests(unittest.TestCase):
             mesh.cmd_owner_trust(self._trust_args(block))
         self.assertFalse(prompt.called)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_owner_private_key_is_not_world_readable(self):
+        # The owner key signs approvals for the ENTIRE mesh — it is the root
+        # of the trust model, and a compromise costs more than any single
+        # node's identity. Nothing asserted anything about its permissions.
+        #
+        # _owner_init generates it with an invocation identical in shape to
+        # the node key's, so the protection is almost certainly the same.
+        # "Almost certainly" is exactly where the uncovered branch lives.
+        #
+        # One iteration, not three: _owner_init refuses when a key already
+        # exists ("refusing to replace it"), so there is no re-entry or
+        # recovery path to cover.
+        path = mesh.owner_key_file(self.cfg)
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
+                         f"owner private key is {oct(mode)}")
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL semantics")
+    def test_owner_private_key_acl_excludes_broad_principals_on_windows(self):
+        # os.stat is blind on Windows: st_mode is synthesised from the
+        # read-only attribute and reports 0o666 whatever the ACL says. Ask
+        # the mechanism that actually protects the file.
+        icacls = shutil.which("icacls")
+        if not icacls:
+            self.skipTest("icacls unavailable")
+        path = mesh.owner_key_file(self.cfg)
+        out = subprocess.run([icacls, path], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # English-runner principals; CI is English. A localised Windows would
+        # pass silently — a limit of the check, not a reason to skip it on
+        # the platform our CI actually runs.
+        for principal in ("Everyone", "BUILTIN\\Users", "Authenticated Users"):
+            self.assertNotIn(
+                principal, out.stdout,
+                f"owner private key ACL grants {principal}:\n{out.stdout}")
+
+
     def test_trust_refuses_replacing_a_different_owner(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
