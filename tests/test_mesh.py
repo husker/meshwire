@@ -3163,9 +3163,20 @@ class NodeIdentityTests(unittest.TestCase):
                             mesh._key_fingerprint(second))
 
     def test_key_generation_is_idempotent(self):
+        # Comparing only the returned strings is too narrow: re-entry could
+        # rewrite, weaken or replace the private key and still return the
+        # same public half. Assert the FILE is untouched — bytes and, where
+        # meaningful, mode.
+        path = mesh.node_key_file(self.cfg, "claude")
         first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        before = open(path, "rb").read()
+        before_mode = stat.S_IMODE(os.stat(path).st_mode)
         second = mesh._ensure_node_key(self.cfg, "alpha", "claude")
         self.assertEqual(first, second)
+        self.assertEqual(open(path, "rb").read(), before,
+                         "private key was rewritten on re-entry")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), before_mode,
+                         "private key mode changed on re-entry")
 
     @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
     def test_private_key_is_not_world_readable(self):
@@ -3174,11 +3185,15 @@ class NodeIdentityTests(unittest.TestCase):
         # is meaningless rather than merely failing there. Key protection on
         # Windows rests on the ACL ssh-keygen sets, which os.stat cannot
         # see and nothing in this suite currently checks.
-        mesh._ensure_node_key(self.cfg, "alpha", "claude")
         path = mesh.node_key_file(self.cfg, "claude")
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
-                         f"node private key is {oct(mode)}")
+        # Twice: calling once exercises only the GENERATION path and leaves
+        # the both-present early return with no assertion on the private
+        # key at all.
+        for call in ("generate", "re-enter"):
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
+                             f"node private key is {oct(mode)} after {call}")
 
     def test_lost_public_half_is_recovered_without_changing_identity(self):
         # The halves are not symmetric. `ssh-keygen -y` derives the public
