@@ -3205,8 +3205,15 @@ class NodeIdentityTests(unittest.TestCase):
                              "surviving public half was overwritten")
 
     def test_no_harness_uses_the_generic_pair(self):
+        # Assert the LITERAL path. Asking node_key_file where the key
+        # should be and then checking it is there compares the function to
+        # itself: a mutation that renames every path consistently passes.
         pub = mesh._ensure_node_key(self.cfg, "alpha", None)
-        self.assertTrue(os.path.isfile(mesh.node_key_file(self.cfg)))
+        expected = os.path.join(self.cfg["_dir"], ".meshwire.key")
+        self.assertTrue(os.path.isfile(expected),
+                        f"generic key not at {expected}: "
+                        f"{sorted(os.listdir(self.cfg['_dir']))}")
+        self.assertTrue(os.path.isfile(expected + ".pub"))
         self.assertTrue(pub.startswith("ssh-ed25519 "))
 
 
