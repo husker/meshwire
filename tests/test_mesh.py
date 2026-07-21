@@ -3174,13 +3174,29 @@ class NodeIdentityTests(unittest.TestCase):
         self.assertEqual(mode & (stat.S_IRWXG | stat.S_IRWXO), 0,
                          f"node private key is {oct(mode)}")
 
-    def test_half_present_keypair_refuses_rather_than_regenerating(self):
-        # Silently regenerating would change this node's identity for every
-        # peer that already bound it.
+    def test_half_present_keypair_refuses_when_public_half_is_missing(self):
         mesh._ensure_node_key(self.cfg, "alpha", "claude")
         os.remove(mesh.node_key_file(self.cfg, "claude") + ".pub")
         with self.assertRaisesRegex(ValueError, "half-present"):
             mesh._ensure_node_key(self.cfg, "alpha", "claude")
+
+    def test_half_present_keypair_refuses_when_private_half_is_missing(self):
+        # THE DANGEROUS DIRECTION, and the reason the guard exists at all.
+        # With the public half missing, ssh-keygen refuses to clobber the
+        # private key on its own, so that case is safe with or without us.
+        # With the PRIVATE half missing it happily generates a fresh pair
+        # over the surviving .pub, and this node's identity changes silently
+        # for every peer that already bound the old key. Verified by
+        # deleting the guard: that mutation makes this test regenerate a
+        # different key and pass nothing.
+        first = mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        os.remove(mesh.node_key_file(self.cfg, "claude"))
+        with self.assertRaisesRegex(ValueError, "half-present"):
+            mesh._ensure_node_key(self.cfg, "alpha", "claude")
+        with open(mesh.node_key_file(self.cfg, "claude") + ".pub",
+                  encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), first,
+                             "surviving public half was overwritten")
 
     def test_no_harness_uses_the_generic_pair(self):
         pub = mesh._ensure_node_key(self.cfg, "alpha", None)
