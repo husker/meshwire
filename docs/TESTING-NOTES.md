@@ -60,6 +60,26 @@ to the artefact. Quote the actual output in the commit message or PR body
 rather than characterising it, so the comparison is possible without
 re-running anything.
 
+### The same defect applies to inference, and is harder
+
+Describing an *absence* the way you want it is the same shape with nothing to
+re-read. One instance: an unanswered question was described as "the silence is
+informative rather than neutral" — a reading that supported the position its
+author already held. At least three other readings fit equally well
+(attention elsewhere, asleep, deliberately waiting), and none had been
+considered.
+
+The remedy for motivated description is "quote the artefact". There is no
+artefact here, so it does not apply. Use instead: **enumerate the readings you
+rejected and say why.** An inference presented without its alternatives is
+not evidence, and the alternatives are what the author is least motivated to
+supply.
+
+Paste the artefact rather than your reading of it, for the same reason. When
+one node quoted a raw settings block instead of summarising it, another
+reader caught a field in it the first had looked at and not registered. A
+summary would have removed the chance.
+
 ## Tests can pass without testing anything
 
 Three of the six tests originally written for `_ensure_node_key` were
