@@ -90,7 +90,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.15.1"
+VERSION = "0.16.0"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -5838,6 +5838,10 @@ def cmd_watch(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
     if args.follow or args.timeout is None:  # long-running watch
+        # Surface the running version so process-state is visible, not just
+        # install-state: enforcement (#74) gates on the live watcher (#75).
+        print(f"MESH_WATCH_START v{VERSION} node={_single_line(me)}",
+              file=sys.stderr)
         spec = _agent_session_without_wake()
         if spec is not None:
             print(
@@ -6705,8 +6709,12 @@ def _run_mcp_server(args, label, idle_hint):
     # overrides (legacy registrations); harness=None keeps env auto-detection.
     me = my_node(cfg, getattr(args, "as_node", None),
                  harness=getattr(args, "harness", None))
-    print(f"a2acast {label}: serving as node '{me}' ({cfg['_dir']}) "
-          f"via {how}", file=sys.stderr)
+    # Log the RUNNING version, not just the installed one: enforcement (#74)
+    # keys on the live receive process, so an operator needs to see which code
+    # this long-running server is actually on -- an install can be updated
+    # while a stale process keeps serving (#75).
+    print(f"a2acast {label} v{VERSION}: serving as node '{me}' "
+          f"({cfg['_dir']}) via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
     plock = _acquire_presence_lock(cfg, me)
     if plock:
