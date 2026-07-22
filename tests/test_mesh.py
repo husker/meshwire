@@ -3362,13 +3362,30 @@ class SignOnSendTests(unittest.TestCase):
         self.assertEqual(frm, "peer")
         self.assertEqual(body, "body-text")
 
-    def test_unsigned_when_no_node_key(self):
-        keyless = make_cfg(tempfile.mkdtemp())  # no _ensure_node_key
+    def test_keyless_node_generates_its_key_and_signs(self):
+        # A node upgraded from a pre-signing version has no key. First send
+        # must generate one and sign — otherwise deploy is inert.
+        upgraded = make_cfg(tempfile.mkdtemp())
+        self.assertIsNone(mesh._own_node_pubkey(upgraded, "claude"))
+        payload = {"f": "laptop", "t": "all", "b": "y"}
+        ts, out = mesh._sign_wrapper_payload(
+            upgraded, "all", dict(payload), harness="claude")
+        self.assertIn("s", out)
+        self.assertIn("k", out)
+        # the key now exists and is reused (idempotent) on the next send
+        self.assertIsNotNone(mesh._own_node_pubkey(upgraded, "claude"))
+        ts2, out2 = mesh._sign_wrapper_payload(
+            upgraded, "all", dict(payload), harness="claude")
+        self.assertEqual(out2["k"], out["k"])
+
+    def test_unsigned_when_no_dir(self):
+        # An in-memory cfg with no directory cannot hold a key -> unsigned,
+        # and must not raise.
+        keyless = {"mesh": "t", "id": "abc123", "key": secrets.token_hex(32)}
         payload = {"f": "x", "t": "all", "b": "y"}
         ts, out = mesh._sign_wrapper_payload(
             keyless, "all", payload, harness="claude")
         self.assertNotIn("s", out)
-        self.assertNotIn("k", out)
         self.assertEqual(out, payload)
 
 
