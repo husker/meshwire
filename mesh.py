@@ -1484,6 +1484,11 @@ def _verify_frame(cfg, frm, carried_pub, signature, relay_topic,
                 # a concurrent first-contact pinned a DIFFERENT key; this
                 # frame's key is not the established one -> not authentic
                 return FRAME_MISMATCH
+            except (RuntimeError, OSError):
+                # transient: the pin lock or store was unavailable. This runs
+                # on the receive hot path, so it must never crash the loop --
+                # leave the peer unpinned and try again on a later frame.
+                return FRAME_UNVERIFIED
         return FRAME_UNVERIFIED
     if not isinstance(signature, str) or not signature.strip():
         return FRAME_UNSIGNED

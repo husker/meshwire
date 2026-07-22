@@ -3422,6 +3422,21 @@ class VerifyFrameTests(unittest.TestCase):
             self.topic, ts2, mesh._base_payload(w2))
         self.assertEqual(status, mesh.FRAME_VERIFIED)
 
+    def test_pin_lock_unavailable_is_unverified_not_a_crash(self):
+        # _verify_frame runs on the receive hot path; a transient pin-lock
+        # failure must degrade to unverified, never propagate and crash the
+        # watcher.
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        mesh._ensure_node_key(forger, "laptop", "claude")
+        ts, wrapper = self._frame_from(forger)
+        with mock.patch.object(mesh, "_acquire_path_lock", return_value=None):
+            status = mesh._verify_frame(
+                self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+                self.topic, ts, mesh._base_payload(wrapper))
+        self.assertEqual(status, mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
     def test_forger_first_contact_is_never_verified(self):
         # THE property. An attacker first-contacts as "laptop" with their own
         # key and a valid self-signature. Verifying against the carried key
