@@ -80,6 +80,35 @@ def activity_file(cfg, node):
     return os.path.join(cfg["_dir"], f"{ACTIVITY_FILE}.{node}")
 
 
+def _activity_line(kind, frm, text, unsolicited=False):
+    """One-line activity record. Shared by every presence writer so the
+    defer-mode wake summary reads identically whichever process received
+    the frame (#86: a presence holder that never writes this file starves
+    every deferring wake hook)."""
+    frm = _single_line_preview(frm or "?", 40)
+    text = _single_line_preview(text or "", 90)
+    if kind == "task":
+        line = f"task from {frm}: {text}"
+    elif kind == "task_update":
+        label = "UNSOLICITED task update" if unsolicited else "task update"
+        line = f"{label} from {frm}"
+    elif kind == "node_joined":
+        line = f"node joined: {frm}"
+    else:
+        line = f"message from {frm}: {text}"
+    return line[:160]
+
+
+def _append_activity(cfg, node, kind, frm, text, unsolicited=False):
+    """Best-effort wake signal for a deferring lifecycle hook. Failure here
+    only delays a wake -- it must never block or fail a delivery."""
+    try:
+        with open(activity_file(cfg, node), "a", encoding="utf-8") as f:
+            f.write(_activity_line(kind, frm, text, unsolicited) + "\n")
+    except OSError:
+        pass
+
+
 TASKS_NAME = ".meshwire.tasks.json"
 DELEGATE_TASKS_NAME = ".meshwire.delegate-tasks.{}.json"
 PEERS_NAME = ".meshwire.peers.json"
@@ -91,7 +120,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
@@ -5934,7 +5963,10 @@ def cmd_watch(args):
                 f"{spec.display_name} session receives messages but does NOT "
                 f"wake the agent -- deliveries land in background output the "
                 f"model never reads. Use the lifecycle hook instead "
-                f"(`{spec.setup_command}`); see the a2acast mesh-agent skill.",
+                f"(`{spec.setup_command}`); where the hook cannot wake this "
+                f"harness yet (#86), run the one-shot re-arm loop instead: "
+                f"`mesh watch --timeout 5400` in the background, re-armed "
+                f"when it exits. See the a2acast mesh-agent skill.",
                 file=sys.stderr)
     plock = _acquire_presence_lock(cfg, me)
     if plock is None:
@@ -5989,6 +6021,7 @@ def _cmd_watch_owned(args, cfg, me):
         _write_json_secure(cf, {"since": t, "seen": seen[-50:]})
         return True
 
+    sink = getattr(args, "checkpoint_sink", None)
     delivered = False
     for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
         if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
@@ -6023,21 +6056,32 @@ def _cmd_watch_owned(args, cfg, me):
                     _finish_watch_timeout(me, timeout, follow)
                     return
                 time.sleep(0.05)
-        if not save_cursor(ev):
-            continue
-        if fingerprint:
-            _note_replay(replay_seen, fingerprint, _wts)
-            save_replays(cfg, me, replay_seen)
+
+        def checkpoint(ev=ev, fingerprint=fingerprint, _wts=_wts):
+            # Transport checkpoint: cursor forward + replay fingerprint.
+            # Runs only after the frame is handed off (or deliberately
+            # consumed) -- a death before handoff must leave the frame
+            # re-deliverable (#86). The replay ledger and task-ID collision
+            # handling absorb the resulting at-least-once re-deliveries.
+            if not save_cursor(ev):
+                return
+            if fingerprint:
+                _note_replay(replay_seen, fingerprint, _wts)
+                save_replays(cfg, me, replay_seen)
+
         if frm == me:
-            continue  # own echo (e.g. broadcast)
+            checkpoint()  # own echo (e.g. broadcast): consume quietly
+            continue
         # stage 3: classify sender authenticity. Non-enforcing -- the verdict
         # is surfaced and pins an unseen peer, but never drops a frame.
         _report_verdict(frm, ev, _frame_verdict(
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev))
         if ctl:
             line = _handle_control(cfg, me, frm, ctl)
+            checkpoint()  # control frames carry no undelivered payload
             if line:
                 print(line)
+                _append_activity(cfg, me, "node_joined", frm, "")
                 delivered = True
                 if not follow:
                     print("MESH_WATCH_DONE kind=node_joined", flush=True)
@@ -6052,15 +6096,51 @@ def _cmd_watch_owned(args, cfg, me):
             delivery_kind = _emit_message(
                 cfg, me, frm, body, ev, recipient=recipient,
                 task_record=task_record)
-        if delivery_kind is not False:
-            delivered = True
-            if not follow:
-                if delivery_kind not in ("message", "task", "task_update"):
-                    delivery_kind = "message"
-                print(f"MESH_WATCH_DONE kind={delivery_kind}", flush=True)
-                return
+        if delivery_kind is False:
+            # Undeliverable after decrypt (invalid or colliding envelope):
+            # consume it once -- rescanning forever helps nobody -- but leave
+            # a trace a wake hook can surface; captured stderr is invisible
+            # in hook mode and silence is the #86 failure mode.
+            _append_activity(cfg, me, "message", frm,
+                             "dropped an undeliverable frame (invalid or "
+                             "duplicate envelope; see MESH_WARN)")
+            checkpoint()
+            continue
+        _append_activity(cfg, me, delivery_kind, frm,
+                         _activity_preview(body, delivery_kind))
+        if sink is not None and not follow:
+            # Hook mode: the handoff is the hook's own output, which happens
+            # after this function returns. Defer the checkpoint to run after
+            # that handoff instead of before it.
+            sink.append(checkpoint)
+        else:
+            checkpoint()
+        delivered = True
+        if not follow:
+            if delivery_kind not in ("message", "task", "task_update"):
+                delivery_kind = "message"
+            print(f"MESH_WATCH_DONE kind={delivery_kind}", flush=True)
+            return
     if not delivered:
         _finish_watch_timeout(me, timeout, follow)
+
+
+def _activity_preview(body, kind):
+    """Preview text for an activity line: decoded envelope text whenever the
+    body parses as one, raw body otherwise. Tasks and messages both decode --
+    the MCP writer records decoded text, and the two writers must agree
+    (imac's PR-89 live seat, N3)."""
+    if kind in ("task", "task_update"):
+        env = _parse_envelope(_sanitize_delivery_text(body))
+        if env:
+            details = _envelope_details(env)
+            if details is not None:
+                return details[6]
+        return body
+    message = _message_details(body)
+    if message is not None:
+        return _sanitize_delivery_text(message["text"])
+    return body
 
 
 def cmd_agent_session_hook(args):
@@ -6483,26 +6563,8 @@ class MeshMCPServer:
         """Append a one-line record so the userPromptSubmitted hook can tell
         the user what was handled while they were away (Copilot fires no
         notification for the out-of-band sampling handler)."""
-        frm = _single_line_preview(d.get("from", "?"), 40)
-        text = _single_line_preview(d.get("text") or "", 90)
-        kind = d.get("kind")
-        if kind == "task":
-            line = f"task from {frm}: {text}"
-        elif kind == "task_update":
-            label = "UNSOLICITED task update" if d.get("unsolicited") \
-                else "task update"
-            line = f"{label} from {frm}"
-        elif kind == "node_joined":
-            line = f"node joined: {frm}"
-        else:
-            line = f"message from {frm}: {text}"
-        line = line[:160]
-        try:
-            with open(activity_file(self.cfg, self.me),
-                      "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
+        _append_activity(self.cfg, self.me, d.get("kind"), d.get("from", "?"),
+                         d.get("text"), bool(d.get("unsolicited")))
 
     def _maybe_sample(self):
         if not self._client_sampling:
@@ -7507,7 +7569,9 @@ def _wait_for_activity(cfg, me, timeout):
                 noun = "delivery" if n == 1 else "deliveries"
                 summary = (f"{n} a2acast {noun} arrived while the session "
                            f"was idle: {shown}. Read the full content now "
-                           f"with the mesh_pending MCP tool and handle it.")
+                           f"with the mesh_pending MCP tool (or `mesh peek` "
+                           f"and `mesh tasks` when this session has no MCP "
+                           f"tools) and handle it.")
                 if presence_exited:
                     summary += (" The presence server also exited; relay "
                                 "fallback will re-arm on the next turn.")
@@ -7525,6 +7589,9 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
 
     cfg = load_config()
     me = my_node(cfg, None, harness)
+    # A prior flow's stale deferred checkpoint must never advance the cursor
+    # past a frame THIS flow hasn't handed off (imac's PR-89 seat, N2).
+    del _HOOK_PENDING_CHECKPOINTS[:]
     lock = _acquire_hook_lock(cfg, me, hook_input, harness)
     if lock is None:
         return None
@@ -7546,11 +7613,12 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
                 pass
 
     captured, ignored_err = io.StringIO(), io.StringIO()
+    sink = []
     try:
         with contextlib.redirect_stdout(captured), \
              contextlib.redirect_stderr(ignored_err):
             cmd_watch(argparse.Namespace(follow=False, timeout=args.timeout,
-                                         as_node=None))
+                                         as_node=None, checkpoint_sink=sink))
     except SystemExit:
         return None
     finally:
@@ -7559,7 +7627,27 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
         except FileNotFoundError:
             pass
 
-    return _compact_hook_output(captured.getvalue())
+    visible = _compact_hook_output(captured.getvalue())
+    if visible is not None:
+        # The delivered frame's transport checkpoint waits until the hook has
+        # actually handed the content to its session (#86): the caller drains
+        # it after printing. A death before that leaves the frame
+        # re-deliverable instead of silently consumed.
+        _HOOK_PENDING_CHECKPOINTS.extend(sink)
+    return visible
+
+
+_HOOK_PENDING_CHECKPOINTS = []
+
+
+def _drain_hook_checkpoints():
+    """Run checkpoints deferred until after the hook's delivery handoff."""
+    while _HOOK_PENDING_CHECKPOINTS:
+        cb = _HOOK_PENDING_CHECKPOINTS.pop(0)
+        try:
+            cb()
+        except OSError:
+            pass  # next arm re-delivers; at-least-once is the contract
 
 
 def _continuation_hook_result(args, hook_input=None, harness=None):
@@ -7592,7 +7680,9 @@ def _emit_continuation_hook(args, harness):
     except (Exception, SystemExit) as e:
         print(f"a2acast {harness}-hook: {e}", file=sys.stderr)
         result = {"continue": True}
-    print(json.dumps(result))
+    print(json.dumps(result), flush=True)
+    # Handoff complete -- only now checkpoint the delivered frame (#86).
+    _drain_hook_checkpoints()
 
 
 def _run_harness_delivery_hook(args, harness):
@@ -7612,6 +7702,9 @@ def _run_harness_delivery_hook(args, harness):
         "rules.\n\n" + visible,
         file=sys.stderr,
     )
+    sys.stderr.flush()
+    # Handoff complete -- only now checkpoint the delivered frame (#86).
+    _drain_hook_checkpoints()
     raise SystemExit(2)
 
 

@@ -1,7 +1,7 @@
 {
   "name": "a2acast",
   "description": "Let this Claude Code session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "author": {
     "name": "James Gagan"
   },

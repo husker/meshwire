@@ -2499,6 +2499,223 @@ class WatchTests(MembershipCmdTests):
         self.assertFalse(os.path.exists(mesh.TASKS_NAME))
 
 
+class WakeHookCheckpointTests(MembershipCmdTests):
+    """#86: every presence writer must signal deferring wake hooks, and the
+    transport checkpoint must follow the delivery handoff, never precede it."""
+
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        with open(".meshwire.cursor-alpha", "w") as f:
+            json.dump({"since": 0, "seen": []}, f)
+        return cfg
+
+    def _msg_event(self, cfg, frm, body, eid, t):
+        payload = {"f": frm, "t": "alpha", "b": body}
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(payload))}
+
+    def _cursor(self):
+        with open(".meshwire.cursor-alpha") as f:
+            return json.load(f)
+
+    def _one_shot(self, ev, **extra_mocks):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
+        return out, err
+
+    def test_watch_delivery_appends_activity_line(self):
+        cfg = self._setup_mesh()
+        self._one_shot(self._msg_event(cfg, "beta", "hello there", "a1", 201))
+        with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
+            self.assertIn("message from beta: hello there", f.read())
+
+    def test_watch_task_delivery_appends_task_first_activity_line(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "build it", task_id="act-task",
+            context_id="act-task-context")
+        self._one_shot(self._msg_event(cfg, "beta", json.dumps(env),
+                                       "a2", 202))
+        with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
+            self.assertIn("task from beta: build it", f.read())
+
+    def test_envelope_message_activity_line_shows_decoded_text(self):
+        # imac's PR-89 live seat, N3: an envelope-wrapped plain message must
+        # produce a decoded activity preview, not raw mw-envelope JSON --
+        # the MCP writer records decoded text and the writers must agree.
+        cfg = self._setup_mesh()
+        body = json.dumps({"mw": "message", "id": "env-msg-1",
+                           "intent": "inform",
+                           "text": "decoded wake preview"})
+        self._one_shot(self._msg_event(cfg, "beta", body, "n3", 208))
+        with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
+            line = f.read()
+        self.assertIn("message from beta: decoded wake preview", line)
+        self.assertNotIn('"mw"', line)
+
+    def test_mcp_record_activity_uses_shared_line_format(self):
+        self._setup_mesh()
+        cfg = mesh.load_config()
+        fake = mock.Mock(cfg=cfg, me="alpha")
+        mesh.MeshMCPServer._record_activity(
+            fake, {"kind": "task", "from": "beta", "text": "do it"})
+        with open(mesh.activity_file(cfg, "alpha")) as f:
+            self.assertEqual(f.read().rstrip("\n"),
+                             mesh._activity_line("task", "beta", "do it"))
+
+    def test_emit_crash_leaves_message_redeliverable(self):
+        cfg = self._setup_mesh()
+        ev = self._msg_event(cfg, "beta", "fragile delivery", "c1", 203)
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch.object(mesh, "_emit_message",
+                               side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                mesh.cmd_watch(argparse.Namespace(
+                    timeout=60, as_node=None, follow=False))
+        # A death at the handoff must leave the transport checkpoint behind
+        # the frame -- the next arm re-delivers instead of silently eating it.
+        self.assertEqual(self._cursor(), {"since": 0, "seen": []})
+        self.assertFalse(os.path.exists(
+            mesh.replay_file(mesh.load_config(), "alpha")))
+        out, _ = self._one_shot(ev)
+        self.assertIn("fragile delivery", out.getvalue())
+        self.assertEqual(self._cursor()["since"], 203)
+
+    def test_emit_crash_still_has_task_durably_ingested(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "crashy", task_id="crash-task",
+            context_id="crash-task-context")
+        ev = self._msg_event(cfg, "beta", json.dumps(env), "c2", 204)
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             mock.patch.object(mesh, "_emit_message",
+                               side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                mesh.cmd_watch(argparse.Namespace(
+                    timeout=60, as_node=None, follow=False))
+        # Task ingest is the durable handoff and precedes the emit; the
+        # transport checkpoint still must not have moved.
+        self.assertIn("crash-task", mesh.load_tasks(mesh.load_config()))
+        self.assertEqual(self._cursor(), {"since": 0, "seen": []})
+
+    def test_undeliverable_frame_leaves_visible_activity_trace(self):
+        cfg = self._setup_mesh()
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "original", task_id="dup-task",
+            context_id="dup-task-context")
+        self._one_shot(self._msg_event(cfg, "beta", json.dumps(env),
+                                       "p1", 205))
+        self.assertEqual(self._cursor()["since"], 205)
+        # Same task ID again (fresh frame): collision -> undeliverable.
+        # It must be consumed once, with a trace a wake hook can surface.
+        self._one_shot(self._msg_event(cfg, "beta", json.dumps(env),
+                                       "p2", 206))
+        self.assertEqual(self._cursor()["since"], 206)
+        with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
+            self.assertIn("dropped an undeliverable frame", f.read())
+
+    def test_claude_hook_checkpoints_only_after_stderr_handoff(self):
+        cfg = self._setup_mesh()
+        ev = self._msg_event(cfg, "beta", "wake payload", "h1", 206)
+
+        class _BoomIO(io.StringIO):
+            def write(self, *_a, **_k):
+                raise RuntimeError("stderr gone")
+
+        def _run(stderr_obj):
+            lock = os.path.abspath("hook.lock")
+            with open(lock, "w") as f:
+                f.write("{}")
+            with mock.patch.object(mesh, "_acquire_hook_lock",
+                                   return_value=lock), \
+                 mock.patch.object(mesh, "_presence_is_live",
+                                   return_value=False), \
+                 mock.patch.object(mesh, "_read_hook_input",
+                                   return_value={}), \
+                 mock.patch.object(mesh, "_stream_events",
+                                   return_value=iter([ev])), \
+                 mock.patch.object(mesh, "_post",
+                                   lambda *a, **k: {"id": "x"}), \
+                 mock.patch.object(sys, "stderr", stderr_obj):
+                mesh.cmd_claude_hook(argparse.Namespace(timeout=5))
+
+        # Death DURING the handoff: checkpoint must not have run.
+        with self.assertRaises(RuntimeError):
+            _run(_BoomIO())
+        self.assertEqual(self._cursor(), {"since": 0, "seen": []})
+
+        # Successful handoff: exit 2 with the payload, THEN checkpointed.
+        good = io.StringIO()
+        with self.assertRaises(SystemExit) as cm:
+            _run(good)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("wake payload", good.getvalue())
+        self.assertIn("untrusted external input", good.getvalue())
+        self.assertEqual(self._cursor()["since"], 206)
+
+    def test_stale_pending_checkpoint_is_discarded_at_hook_entry(self):
+        # imac's PR-89 seat, N2: a stale deferred checkpoint from a prior
+        # flow must be dropped unrun at hook entry -- draining it later could
+        # advance the cursor past a frame this flow never handed off.
+        self._setup_mesh()
+        stale = mock.Mock()
+        mesh._HOOK_PENDING_CHECKPOINTS.append(stale)
+        self.addCleanup(mesh._HOOK_PENDING_CHECKPOINTS.clear)
+        lock = os.path.abspath("hook.lock")
+        with open(lock, "w") as f:
+            f.write("{}")
+        with mock.patch.object(mesh, "_acquire_hook_lock",
+                               return_value=lock), \
+             mock.patch.object(mesh, "_presence_is_live",
+                               return_value=False), \
+             mock.patch.object(mesh, "_read_hook_input", return_value={}), \
+             mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([])), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_claude_hook(argparse.Namespace(timeout=1))
+        stale.assert_not_called()
+        self.assertEqual(mesh._HOOK_PENDING_CHECKPOINTS, [])
+
+    def test_codex_continuation_checkpoints_after_json_handoff(self):
+        cfg = self._setup_mesh()
+        ev = self._msg_event(cfg, "beta", "codex payload", "h2", 207)
+        lock = os.path.abspath("hook.lock")
+        with open(lock, "w") as f:
+            f.write("{}")
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_acquire_hook_lock",
+                               return_value=lock), \
+             mock.patch.object(mesh, "_presence_is_live",
+                               return_value=False), \
+             mock.patch.object(mesh, "_read_hook_input", return_value={}), \
+             mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_codex_hook(argparse.Namespace(timeout=5))
+        payload = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload.get("decision"), "block")
+        self.assertIn("codex payload", payload.get("reason", ""))
+        self.assertEqual(self._cursor()["since"], 207)
+
+
 class CodexHookTests(MembershipCmdTests):
     def _setup_mesh(self):
         cfg = make_cfg()
@@ -3475,6 +3692,25 @@ class AgentWatchWarningTests(unittest.TestCase):
                     follow=True, timeout=None, as_node=None))
         self.assertIn("does NOT wake the agent", err.getvalue())
         self.assertIn("mesh claude-setup", err.getvalue())
+
+    def test_cmd_watch_follow_warning_names_one_shot_fallback(self):
+        # #86: until the lifecycle hook can wake every harness, the warning
+        # must name the working fallback instead of steering into a dead end.
+        self._isolate_markers()
+        os.environ["CLAUDECODE"] = "1"
+        cfg = make_cfg()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(mesh, "my_node", return_value="alpha"), \
+                mock.patch.object(mesh, "_acquire_presence_lock",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                mesh.cmd_watch(argparse.Namespace(
+                    follow=True, timeout=None, as_node=None))
+        self.assertIn("#86", err.getvalue())
+        self.assertIn("mesh watch --timeout 5400", err.getvalue())
 
 
 class ReplayLedgerTests(unittest.TestCase):
@@ -5409,7 +5645,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.16.0")
+        self.assertEqual(release, "0.16.1")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]

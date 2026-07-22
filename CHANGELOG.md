@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.16.1
+- Fixed the two delivery-loss mechanisms behind #86, validated live on all
+  three platforms:
+  - Every delivery path now writes the per-node activity file (shared
+    `_activity_line` format), so a lifecycle hook deferring behind a plain
+    `mesh watch` presence holder wakes on delivery instead of starving and
+    dying silently when the watch exits.
+  - Transport checkpoints (cursor + replay fingerprint) run only after the
+    delivery handoff — inline after a successful emit for standalone
+    watches, deferred until after the hook's own output in hook relay mode.
+    A death before handoff leaves the frame re-deliverable: at-least-once
+    instead of silent loss. Undeliverable frames are consumed exactly once
+    and leave a visible activity trace.
+  - Activity previews decode message envelopes (not just tasks), keeping
+    the watch and MCP writers in agreement.
+- The agent-session watch warning now names the one-shot
+  `mesh watch --timeout` re-arm fallback for harnesses where the hook
+  cannot wake yet; the defer-mode wake summary mentions the CLI drain
+  commands for sessions without MCP tools.
+- Known limb, tracked in #90: on Windows the harness-spawned async
+  claude-hook process exits instantly and never receives — with this
+  release that degrades to delayed redelivery, never loss; the one-shot
+  re-arm loop remains the Windows posture.
+
 ## 0.16.0
 - Per-node message signing (#62 phase 2): every node holds its own ed25519
   key, signs its outbound frames over the wire AAD + payload, and classifies
