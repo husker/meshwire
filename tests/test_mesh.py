@@ -3300,6 +3300,78 @@ class NodeSigningTests(unittest.TestCase):
             self._verify(forged, pub=self.pub))
 
 
+class SignOnSendTests(unittest.TestCase):
+    """Slice 2: send attaches a signature and a pubkey hint to the wrapper,
+    over the wire, backward-compatibly."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        self.pub = mesh._ensure_node_key(self.cfg, "laptop", "claude")
+
+    def _wire_round_trip(self, to="all", ctl=None):
+        payload = {"f": "laptop", "t": to, "b": "hi"}
+        if ctl:
+            payload["c"] = ctl
+        ts, signed = mesh._sign_wrapper_payload(
+            self.cfg, to, payload, harness="claude")
+        wire = mesh.encrypt(self.cfg, json.dumps(signed), to=to, timestamp=ts)
+        pt = mesh.decrypt(self.cfg, wire,
+                          expected_topic=mesh.topic(self.cfg, to))
+        self.assertIsNotNone(pt)
+        return ts, json.loads(pt)
+
+    def test_signed_frame_round_trips_and_verifies(self):
+        to = "all"
+        ts, wrapper = self._wire_round_trip(to)
+        self.assertIn("s", wrapper)
+        self.assertIn("k", wrapper)
+        base = {k: v for k, v in wrapper.items() if k not in ("s", "k")}
+        self.assertTrue(mesh._verify_node_sig(
+            self.cfg, "laptop", wrapper["k"], mesh.topic(self.cfg, to),
+            ts, base, wrapper["s"]))
+
+    def test_tampering_after_signing_fails_verification(self):
+        to = "all"
+        ts, wrapper = self._wire_round_trip(to)
+        base = {k: v for k, v in wrapper.items() if k not in ("s", "k")}
+        base["b"] = "tampered"
+        self.assertFalse(mesh._verify_node_sig(
+            self.cfg, "laptop", wrapper["k"], mesh.topic(self.cfg, to),
+            ts, base, wrapper["s"]))
+
+    def test_unpatched_open_still_reads_f_t_b(self):
+        # _open_details validates required keys only, so a receiver that does
+        # not verify still reads the message and ignores s/k. This is the
+        # backward-compat guarantee.
+        to = "laptop"
+        payload = {"f": "peer", "t": to, "b": "body-text"}
+        ts, signed = mesh._sign_wrapper_payload(
+            self.cfg, to, payload, harness="claude")
+        wire = mesh.encrypt(self.cfg, json.dumps(signed), to=to, timestamp=ts)
+        ev = {"message": wire, "topic": mesh.topic(self.cfg, to)}
+        frm, recipient, body, trusted, ctl, fp = mesh._open_details(
+            ev, self.cfg, me="laptop")
+        self.assertTrue(trusted)
+        self.assertEqual(frm, "peer")
+        self.assertEqual(body, "body-text")
+
+    def test_unsigned_when_no_node_key(self):
+        keyless = make_cfg(tempfile.mkdtemp())  # no _ensure_node_key
+        payload = {"f": "x", "t": "all", "b": "y"}
+        ts, out = mesh._sign_wrapper_payload(
+            keyless, "all", payload, harness="claude")
+        self.assertNotIn("s", out)
+        self.assertNotIn("k", out)
+        self.assertEqual(out, payload)
+
+
 class PeerPinTests(unittest.TestCase):
     """Trust-on-first-use pinning of peer node keys."""
 

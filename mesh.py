@@ -1449,6 +1449,52 @@ def _sign_as_node(cfg, harness, relay_topic, timestamp, payload):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _own_node_pubkey(cfg, harness):
+    """This node's own normalized public key, or None if it has no key."""
+    try:
+        pub_path = node_key_file(cfg, harness) + ".pub"
+        with open(pub_path, "r", encoding="utf-8") as f:
+            return _normalize_pubkey(f.read().strip())
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _sign_wrapper_payload(cfg, to, payload, harness=None):
+    """Best-effort: return (timestamp, payload) with this node's signature
+    `s` and public-key hint `k` added, or the payload unchanged if this node
+    cannot sign.
+
+    Signing is NON-FATAL in the migration window. A node with no key, or on a
+    platform where signing fails, still sends -- an unsigned frame is a valid
+    frame until the ratchet closes on it (slice 4). The receiver ignores `s`
+    and `k` if it does not yet verify (they are extra wrapper fields), so
+    this is backward compatible with every unpatched node.
+
+    The signature covers the payload WITHOUT `s`/`k`, over the same timestamp
+    the returned value is encrypted under, so the receiver can reconstruct
+    exactly these bytes. `k` lets a peer pin this node on first contact."""
+    timestamp = int(time.time_ns() // 1_000_000_000)
+    # No key store without a directory to hold it -> send unsigned. A cfg
+    # can legitimately lack _dir (in-memory), and signing is best-effort.
+    if not cfg.get("key") or not cfg.get("_dir"):
+        return timestamp, payload
+    if harness is None:
+        harness = _detect_harness()
+    try:
+        pub = _own_node_pubkey(cfg, harness)
+        if pub is None:
+            return timestamp, payload
+        relay_topic = topic(cfg, to) if to is not None else ""
+        signature = _sign_as_node(cfg, harness, relay_topic, timestamp,
+                                  payload)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return timestamp, payload
+    signed = dict(payload)
+    signed["s"] = signature
+    signed["k"] = pub
+    return timestamp, signed
+
+
 def _verify_node_sig(cfg, node, pinned_pub, relay_topic, timestamp,
                      payload, signature):
     """True iff `signature` is `pinned_pub`'s over this frame's AAD+payload.
@@ -4517,7 +4563,11 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
         payload = {"f": sender, "t": to, "b": body}
         if ctl:
             payload["c"] = ctl
-        wire = encrypt(cfg, json.dumps(payload), to=to)
+        # Sign best-effort, then encrypt under the SAME timestamp the
+        # signature covers. Unsigned still sends (migration window); unknown
+        # `s`/`k` fields are ignored by receivers that do not yet verify.
+        timestamp, payload = _sign_wrapper_payload(cfg, to, payload)
+        wire = encrypt(cfg, json.dumps(payload), to=to, timestamp=timestamp)
         headers = {"Title": cfg["mesh"]}
     else:
         wire = body
