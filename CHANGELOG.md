@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.0
+- Per-node message signing (#62 phase 2): every node holds its own ed25519
+  key, signs its outbound frames over the wire AAD + payload, and classifies
+  inbound frames against a locally-pinned identity (verified / unverified /
+  unsigned / mismatch). Trust is trust-on-first-use; the receive path is
+  NON-ENFORCING — it surfaces a verdict and pins peers but drops no frame.
+  Enforcement + the downgrade ratchet are still pending (#74). A node
+  generates its key on first send, so upgrading an existing node is enough.
+- Owner-trust now prints a SHA256 fingerprint and requires a terminal
+  confirmation before pinning; the owner private key's permissions are
+  asserted (POSIX mode + Windows ACL).
+- Bound the replay ledger with time-based eviction (#77); mesh status shows
+  the held count.
+- mesh peek no longer mislabels expired large-message attachments as
+  [UNVERIFIED] (#65).
+- `mesh watch --follow` warns when it would be a write-only pipe in an agent
+  session; join steers to the lifecycle hook (#57).
+- `mesh mcp-serve --harness` resolves identity from the pin at each startup,
+  so `mesh iam` renames take effect (#59, #60).
+- The generated .gitignore now uses a `.meshwire.*` glob, closing a gap that
+  left the owner private key stageable.
+
 ## 0.15.1
 - Security: invite bootstrap blocks now download `mesh.py` pinned to the
   inviting node's release tag (`v<VERSION>`) instead of the tip of `main`,

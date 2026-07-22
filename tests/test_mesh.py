@@ -3234,6 +3234,23 @@ class AgentWatchWarningTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertIsNone(mesh._agent_session_without_wake())
 
+    def test_cmd_watch_follow_logs_running_version(self):
+        # #75: process-state must be visible, not just install-state -- the
+        # long-running watch logs the version it is actually running.
+        self._isolate_markers()
+        cfg = make_cfg()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(mesh, "my_node", return_value="alpha"), \
+                mock.patch.object(mesh, "_acquire_presence_lock",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                mesh.cmd_watch(argparse.Namespace(
+                    follow=True, timeout=None, as_node=None))
+        self.assertIn(f"MESH_WATCH_START v{mesh.VERSION}", err.getvalue())
+
     def test_cmd_watch_follow_warns_in_agent_session(self):
         self._isolate_markers()
         os.environ["CLAUDECODE"] = "1"
@@ -5184,7 +5201,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.15.1")
+        self.assertEqual(release, "0.16.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
