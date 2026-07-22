@@ -1477,6 +1477,18 @@ def _verify_frame(cfg, frm, carried_pub, signature, relay_topic,
         return FRAME_UNSIGNED
     pinned = _pinned_peer_key(cfg, frm)
     if pinned is None:
+        # SLICE 4 / ENROLLMENT CONSTRAINT (design, not yet enforced): this
+        # pin write is a receive-path side effect, so a malicious MEMBER (it
+        # is past the MAC, so mesh-key-holders only) can pin N fabricated
+        # names and grow the store without bound. Same class as the replay
+        # ledger, but the remedy does NOT transfer: the ledger evicts by age,
+        # and dropping a pin is not space reclaimed -- it reopens TOFU for an
+        # established name, an AUTHENTICATION downgrade. So the store stays
+        # durable and must be bounded another way: a distinct-pin cap, or
+        # owner-signed enrollment (non-self-service pins, which also closes
+        # the TOFU first-contact-MITM window). Decide this in slice 4; do not
+        # discover it. "Member-only, so fine" is the phrasing to distrust --
+        # a malicious member is who signing exists to constrain.
         if isinstance(carried_pub, str) and carried_pub.strip():
             try:
                 _bind_peer(cfg, frm, carried_pub)
