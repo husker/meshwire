@@ -1484,6 +1484,11 @@ def _verify_frame(cfg, frm, carried_pub, signature, relay_topic,
                 # a concurrent first-contact pinned a DIFFERENT key; this
                 # frame's key is not the established one -> not authentic
                 return FRAME_MISMATCH
+            except (RuntimeError, OSError):
+                # transient: the pin lock or store was unavailable. This runs
+                # on the receive hot path, so it must never crash the loop --
+                # leave the peer unpinned and try again on a later frame.
+                return FRAME_UNVERIFIED
         return FRAME_UNVERIFIED
     if not isinstance(signature, str) or not signature.strip():
         return FRAME_UNSIGNED
@@ -1498,6 +1503,43 @@ def _base_payload(wrapper):
     """The wrapper fields a signature covers: everything except the signature
     `s` and the pubkey hint `k`, which are added after signing."""
     return {k: v for k, v in wrapper.items() if k not in ("s", "k")}
+
+
+def _frame_verdict(cfg, frm, recipient, body, ctl, sig, pubkey, wire_ts, ev):
+    """Stage-3 authenticity verdict for an inbound frame, reconstructing the
+    signed payload from the already-unpacked fields. This runs AFTER the
+    shared-key MAC (stage 1, in decrypt) and the replay fingerprint (stage 2)
+    -- the caller must not invoke it earlier, or an anonymous or replayed
+    frame would reach the ssh-keygen spawn.
+
+    Non-enforcing at this slice: it returns a verdict and, as a side effect,
+    pins an unseen peer (TOFU). It never decides delivery. Enforcement -- and
+    the downgrade ratchet -- is slice 4, re-argued on its own risk.
+
+    ev["topic"] is the authenticated relay topic, not untrusted metadata: a
+    frame only reaches here after decrypt, and decrypt drops any frame whose
+    MAC-covered wire relay topic does not equal ev["topic"]. So a delivered
+    frame's ev["topic"] provably equals the topic the signature was bound
+    to. (ntfy sets this field on every message event.)"""
+    relay_topic = (ev.get("topic")
+                   if isinstance(ev.get("topic"), str) else None)
+    base = {"f": frm, "t": recipient, "b": body}
+    if ctl:
+        base["c"] = ctl
+    return _verify_frame(cfg, frm, pubkey, sig, relay_topic, wire_ts, base)
+
+
+def _report_verdict(frm, ev, verdict):
+    """Surface a non-verified verdict without affecting delivery. Mismatch is
+    louder (a pinned peer's signature failed -- forgery or corruption);
+    unsigned/unverified are informational. Verified is silent."""
+    if verdict == FRAME_MISMATCH:
+        print(f"MESH_WARN: signature mismatch from {_single_line(frm)} "
+              f"id={_single_line(ev.get('id'))} "
+              f"(the pinned key did not verify this frame)", file=sys.stderr)
+    elif verdict in (FRAME_UNSIGNED, FRAME_UNVERIFIED):
+        print(f"MESH_VERIFY id={_single_line(ev.get('id'))} "
+              f"from={_single_line(frm)} status={verdict}", file=sys.stderr)
 
 
 def _own_node_pubkey(cfg, harness):
@@ -5802,6 +5844,10 @@ def _cmd_watch_owned(args, cfg, me):
             save_replays(cfg, me, replay_seen)
         if frm == me:
             continue  # own echo (e.g. broadcast)
+        # stage 3: classify sender authenticity. Non-enforcing -- the verdict
+        # is surfaced and pins an unseen peer, but never drops a frame.
+        _report_verdict(frm, ev, _frame_verdict(
+            cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev))
         if ctl:
             line = _handle_control(cfg, me, frm, ctl)
             if line:
@@ -6452,11 +6498,15 @@ class MeshMCPServer:
                 save_replays(cfg, me, replay_seen)
             if frm == me:
                 continue
+            # stage 3: classify sender authenticity (non-enforcing).
+            verdict = _frame_verdict(
+                cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev)
+            _report_verdict(frm, ev, verdict)
             if ctl:
                 line = _handle_control(cfg, me, frm, ctl)
                 if line:
                     self.deliver({"kind": "node_joined", "from": frm,
-                                  "text": line})
+                                  "text": line, "verify": verdict})
                 continue
             note_peer(cfg, frm, "message")
             _send_ack(cfg, me, frm, ev)
@@ -6466,6 +6516,7 @@ class MeshMCPServer:
                 delivery = self._delivery(
                     frm, recipient, body, ev, task_record=task_record)
             if delivery:
+                delivery["verify"] = verdict
                 self.deliver(delivery)
 
 

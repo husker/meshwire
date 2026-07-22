@@ -3422,6 +3422,21 @@ class VerifyFrameTests(unittest.TestCase):
             self.topic, ts2, mesh._base_payload(w2))
         self.assertEqual(status, mesh.FRAME_VERIFIED)
 
+    def test_pin_lock_unavailable_is_unverified_not_a_crash(self):
+        # _verify_frame runs on the receive hot path; a transient pin-lock
+        # failure must degrade to unverified, never propagate and crash the
+        # watcher.
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        mesh._ensure_node_key(forger, "laptop", "claude")
+        ts, wrapper = self._frame_from(forger)
+        with mock.patch.object(mesh, "_acquire_path_lock", return_value=None):
+            status = mesh._verify_frame(
+                self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+                self.topic, ts, mesh._base_payload(wrapper))
+        self.assertEqual(status, mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
     def test_forger_first_contact_is_never_verified(self):
         # THE property. An attacker first-contacts as "laptop" with their own
         # key and a valid self-signature. Verifying against the carried key
@@ -5474,6 +5489,105 @@ class WatchLoopResilienceTests(unittest.TestCase):
         self.assertEqual(len(calls), 8)              # 7 retries + clean pass
         self.assertEqual([c.args[0] for c in waited.call_args_list],
                           [1, 2, 4, 8, 16, 30, 30])   # doubles, caps at 30
+
+
+class VerifyWireTests(unittest.TestCase):
+    """Slice 3b: the receive loop computes a per-frame verdict and surfaces
+    it, and pins peers on first contact — but drops NO frame (non-enforcing).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        self.cfg["nodes"] = ["alpha", "beta"]
+        self.srv = mesh.MeshMCPServer(self.cfg, "alpha", out=[].append)
+        # beta: a remote sender sharing the mesh key/id, its own key store
+        self.beta = make_cfg(tempfile.mkdtemp())
+        self.beta["id"] = self.cfg["id"]
+        self.beta["key"] = self.cfg["key"]
+        self.beta["mesh"] = self.cfg["mesh"]
+        self.beta_pub = mesh._ensure_node_key(self.beta, "beta", "claude")
+
+    def _signed_event(self, signer_cfg, body="hello", eid="e1"):
+        payload = {"f": "beta", "t": "alpha", "b": body}
+        ts, signed = mesh._sign_wrapper_payload(
+            signer_cfg, "alpha", payload, harness="claude")
+        wire = mesh.encrypt(self.cfg, json.dumps(signed), to="alpha",
+                            timestamp=ts)
+        return {"event": "message", "id": eid, "time": int(mesh.time.time()),
+                "topic": mesh.topic(self.cfg, "alpha"), "message": wire}
+
+    def _run(self, ev):
+        cf = mesh.cursor_file(self.cfg, "alpha")
+        mesh._write_json_secure(cf, {"since": 0, "seen": []})
+        with mock.patch.object(mesh, "_stream_events",
+                               side_effect=lambda *a, **k: iter([ev])), \
+             mock.patch.object(mesh, "_send_ack"), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            self.srv._watch_once(self.cfg, "alpha", "topic")
+        with self.srv._buf_lock:
+            delivered = list(self.srv._buf)
+            self.srv._buf.clear()
+        return delivered, err.getvalue()
+
+    def test_first_contact_delivers_and_pins_as_unverified(self):
+        delivered, _ = self._run(self._signed_event(self.beta))
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_UNVERIFIED)
+        # peer got pinned
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "beta"),
+                         mesh._normalize_pubkey(self.beta_pub))
+
+    def test_pinned_sender_delivers_verified(self):
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        delivered, _ = self._run(self._signed_event(self.beta))
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_VERIFIED)
+
+    def test_forgery_is_delivered_but_marked_mismatch(self):
+        # THE non-enforcing property: beta is pinned to its real key; an
+        # impersonator's frame is STILL delivered (slice 3b rejects nothing),
+        # only marked mismatch and warned to stderr. Slice 4 will drop it.
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        forger["key"] = self.cfg["key"]
+        forger["mesh"] = self.cfg["mesh"]
+        mesh._ensure_node_key(forger, "beta", "claude")
+        delivered, err = self._run(self._signed_event(forger, eid="e2"))
+        self.assertEqual(len(delivered), 1, "forged frame must still deliver")
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_MISMATCH)
+        self.assertIn("MESH_WARN: signature mismatch", err)
+
+    def test_unsigned_from_unpinned_is_unverified_first_contact(self):
+        # An unsigned frame from a name we have never pinned is first
+        # contact: unverified, not unsigned. There is no key to pin (no `k`).
+        wire = mesh.encrypt(self.cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "plain"}), to="alpha")
+        ev = {"event": "message", "id": "e3", "time": int(mesh.time.time()),
+              "topic": mesh.topic(self.cfg, "alpha"), "message": wire}
+        delivered, _ = self._run(ev)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_UNVERIFIED)
+
+    def test_unsigned_from_pinned_peer_is_unsigned(self):
+        # A peer we have pinned (has signed before) sending no signature is
+        # the migration/ratchet case: unsigned. Slice 4 turns this into a
+        # reject once the peer is known to sign; slice 3b just marks it.
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        wire = mesh.encrypt(self.cfg, json.dumps(
+            {"f": "beta", "t": "alpha", "b": "plain"}), to="alpha")
+        ev = {"event": "message", "id": "e4", "time": int(mesh.time.time()),
+              "topic": mesh.topic(self.cfg, "alpha"), "message": wire}
+        delivered, _ = self._run(ev)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_UNSIGNED)
 
 
 class MCPServeTests(unittest.TestCase):
