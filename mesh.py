@@ -1449,6 +1449,57 @@ def _sign_as_node(cfg, harness, relay_topic, timestamp, payload):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+FRAME_VERIFIED = "verified"
+FRAME_MISMATCH = "mismatch"
+FRAME_UNSIGNED = "unsigned"
+FRAME_UNVERIFIED = "unverified"
+
+
+def _verify_frame(cfg, frm, carried_pub, signature, relay_topic,
+                  timestamp, base_payload):
+    """Classify a received frame's sender authenticity. Returns one of
+    FRAME_VERIFIED / FRAME_MISMATCH / FRAME_UNSIGNED / FRAME_UNVERIFIED.
+
+    The whole scheme's correctness is here, in which key the verification
+    runs against: the LOCAL pin for the name the frame CLAIMS, never the key
+    the frame carried. A signature checks against the pin, or it does not
+    authenticate anyone.
+
+    First contact (an unpinned name) is deliberately NOT verified against its
+    own carried key. Doing so proves only that the sender holds the key they
+    presented -- not that they are `frm` -- and reporting that as verified
+    would rebuild the shared-key gap one level up. The carried key is pinned
+    (TOFU) and the frame is marked UNVERIFIED; authenticity begins at the
+    NEXT frame, checked against that pin. This is why slice 3 cannot fully
+    separate from the migration/ratchet rules: first contact is an
+    accept-but-mark, not a verify. [imac]"""
+    if not isinstance(frm, str) or not frm:
+        return FRAME_UNSIGNED
+    pinned = _pinned_peer_key(cfg, frm)
+    if pinned is None:
+        if isinstance(carried_pub, str) and carried_pub.strip():
+            try:
+                _bind_peer(cfg, frm, carried_pub)
+            except ValueError:
+                # a concurrent first-contact pinned a DIFFERENT key; this
+                # frame's key is not the established one -> not authentic
+                return FRAME_MISMATCH
+        return FRAME_UNVERIFIED
+    if not isinstance(signature, str) or not signature.strip():
+        return FRAME_UNSIGNED
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        return FRAME_MISMATCH  # a signed frame must carry its wire timestamp
+    ok = _verify_node_sig(cfg, frm, pinned, relay_topic, timestamp,
+                          base_payload, signature)
+    return FRAME_VERIFIED if ok else FRAME_MISMATCH
+
+
+def _base_payload(wrapper):
+    """The wrapper fields a signature covers: everything except the signature
+    `s` and the pubkey hint `k`, which are added after signing."""
+    return {k: v for k, v in wrapper.items() if k not in ("s", "k")}
+
+
 def _own_node_pubkey(cfg, harness):
     """This node's own normalized public key, or None if it has no key."""
     try:
@@ -1809,27 +1860,37 @@ def encrypt(cfg, plaintext, to=None, timestamp=None):
         header + topic_bytes + nonce + ct + tag).decode("ascii")
 
 
-def decrypt(cfg, body, expected_topic=None, now=None):
-    """Return plaintext, or None if not-encrypted/undecryptable."""
+def _decrypt_meta(cfg, body, expected_topic=None, now=None):
+    """Return (plaintext, wire_timestamp), or (None, None).
+
+    The wire timestamp is what a node signature's AAD is bound to, so a
+    receiver needs it to reconstruct the signed bytes at verify time (stage
+    3). It is surfaced here rather than re-parsed at the call site so the
+    frame layout lives in exactly one place. Only WIRE_MAGIC frames carry a
+    timestamp; legacy frames return None for it and cannot bear a node
+    signature anyway. This function is authenticated: the timestamp it
+    returns is inside the MAC-covered AAD, so a returned non-None value has
+    already been verified, not merely parsed."""
     if not cfg.get("key"):
-        return None
+        return None, None
     try:
         k_enc, k_mac = _keys(cfg)
+        timestamp = None
         if body.startswith(LEGACY_WIRE_MAGIC):
             raw = base64.b64decode(body[len(LEGACY_WIRE_MAGIC):],
                                    validate=True)
             if len(raw) < 32:
-                return None
+                return None, None
             nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
             want = hmac.new(k_mac, nonce + ct, hashlib.sha256).digest()[:16]
         elif body.startswith(WIRE_MAGIC):
             raw = base64.b64decode(body[len(WIRE_MAGIC):], validate=True)
             if len(raw) < 42:
-                return None
+                return None, None
             timestamp = int.from_bytes(raw[:8], "big")
             topic_len = int.from_bytes(raw[8:10], "big")
             if len(raw) < 42 + topic_len:
-                return None
+                return None, None
             topic_end = 10 + topic_len
             relay_topic = raw[10:topic_end].decode("utf-8")
             nonce = raw[topic_end:topic_end + 16]
@@ -1840,17 +1901,22 @@ def decrypt(cfg, body, expected_topic=None, now=None):
                     current - timestamp > WIRE_MAX_AGE or
                     (expected_topic is not None and
                      relay_topic != expected_topic)):
-                return None
+                return None, None
             aad = _wire_aad(cfg, relay_topic, timestamp)
             want = hmac.new(k_mac, aad + nonce + ct,
                             hashlib.sha256).digest()[:16]
         else:
-            return None
+            return None, None
         if not hmac.compare_digest(tag, want):
-            return None
-        return _keystream_xor(k_enc, nonce, ct).decode("utf-8")
+            return None, None
+        return _keystream_xor(k_enc, nonce, ct).decode("utf-8"), timestamp
     except (ValueError, UnicodeDecodeError):
-        return None
+        return None, None
+
+
+def decrypt(cfg, body, expected_topic=None, now=None):
+    """Return plaintext, or None if not-encrypted/undecryptable."""
+    return _decrypt_meta(cfg, body, expected_topic, now)[0]
 
 
 def join_code(cfg):
@@ -1959,34 +2025,36 @@ def _open_details(ev, cfg, me=None):
     """Open a relay event, retaining the authenticated wrapper recipient."""
     body = _unwrap(ev, cfg)
     if not isinstance(body, str):
-        return None, None, "", False, None, None
+        return None, None, "", False, None, None, None, None, None
     relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
-    pt = decrypt(cfg, body, expected_topic=relay_topic)
+    pt, wire_ts = _decrypt_meta(cfg, body, expected_topic=relay_topic)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
         except (json.JSONDecodeError, ValueError):
-            return None, None, "", False, None, None
+            return None, None, "", False, None, None, None, None, None
         if (not isinstance(wrapper, dict) or
                 not isinstance(wrapper.get("f"), str) or
                 not isinstance(wrapper.get("t"), str) or
                 not isinstance(wrapper.get("b"), str) or
                 ("c" in wrapper and not isinstance(wrapper["c"], dict)) or
                 (me is not None and wrapper["t"] not in (me, BROADCAST))):
-            return None, None, "", False, None, None
+            return None, None, "", False, None, None, None, None, None
         fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        sig = wrapper.get("s") if isinstance(wrapper.get("s"), str) else None
+        pubkey = wrapper.get("k") if isinstance(wrapper.get("k"), str) else None
         return (wrapper["f"], wrapper["t"], wrapper["b"], True,
-                wrapper.get("c"), fingerprint)
+                wrapper.get("c"), fingerprint, sig, pubkey, wire_ts)
     if body.startswith((WIRE_MAGIC, LEGACY_WIRE_MAGIC)):
-        return None, None, "", False, None, None
+        return None, None, "", False, None, None, None, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     if "title" in ev and not isinstance(title, str):
-        return None, None, "", False, None, None
+        return None, None, "", False, None, None, None, None, None
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, None, body, not cfg.get("key"), None, None
+    return frm, None, body, not cfg.get("key"), None, None, None, None, None
 
 
 def _parse_envelope(body):
@@ -5701,7 +5769,8 @@ def _cmd_watch_owned(args, cfg, me):
         if (event_time is None or event_time < since or
                 (event_time == since and ev.get("id") in seen)):
             continue
-        frm, recipient, body, trusted, ctl, fingerprint = _open_details(
+        (frm, recipient, body, trusted, ctl, fingerprint,
+         _sig, _pk, _wts) = _open_details(
             ev, cfg, me)
         if not trusted:
             if body != "":
@@ -6358,7 +6427,8 @@ class MeshMCPServer:
             if (et is None or et < since or
                     (et == since and ev.get("id") in seen)):
                 continue
-            frm, recipient, body, trusted, ctl, fingerprint = \
+            (frm, recipient, body, trusted, ctl, fingerprint,
+             _sig, _pk, _wts) = \
                 _open_details(ev, cfg, me)
             if not trusted:
                 continue
@@ -7510,7 +7580,8 @@ def _await_result(cfg, me, task_id, timeout, first=None,
                      if expected.get("direction") == "outbound" else None)
     for ev in _stream_events(cfg, tpc, stream_since, deadline,
                              first=first):
-        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
+        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+            ev, cfg, me)
         if not trusted or ctl:
             continue
         env = _parse_envelope(body)
@@ -7565,7 +7636,8 @@ def _await_worker_result(cfg, me, task_id, node, backend, timeout,
         max(0, int(expected.get("updated", time.time())) - 1))
     for ev in _stream_events(
             cfg, topic(cfg, me), stream_since, deadline, first=first):
-        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
+        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+            ev, cfg, me)
         if not trusted or ctl or frm != node or recipient != me:
             continue
         env = _parse_envelope(body)
@@ -7622,7 +7694,8 @@ def _collect_recipe_results(cfg, me, pending, timeout, first=None, since=None):
     stream_since = since if since is not None else str(int(time.time()) - 5)
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
     for ev in _stream_events(cfg, tpc, stream_since, deadline, first=first):
-        frm, recipient, body, trusted, ctl, _ = _open_details(ev, cfg, me)
+        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+            ev, cfg, me)
         if not trusted or ctl:
             continue
         env = _parse_envelope(body)

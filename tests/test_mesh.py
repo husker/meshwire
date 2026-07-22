@@ -1697,7 +1697,7 @@ class WatchTests(MembershipCmdTests):
         ev = self._msg_event(cfg, "beta", body, "invalid-route-event", 200)
         opened = (
             "beta", None, body, True, None,
-            "invalid-plaintext-route-fingerprint")
+            "invalid-plaintext-route-fingerprint", None, None, None)
         acks = []
         out, err = io.StringIO(), io.StringIO()
 
@@ -3356,8 +3356,8 @@ class SignOnSendTests(unittest.TestCase):
             self.cfg, to, payload, harness="claude")
         wire = mesh.encrypt(self.cfg, json.dumps(signed), to=to, timestamp=ts)
         ev = {"message": wire, "topic": mesh.topic(self.cfg, to)}
-        frm, recipient, body, trusted, ctl, fp = mesh._open_details(
-            ev, self.cfg, me="laptop")
+        (frm, recipient, body, trusted, ctl, fp,
+         _s, _k, _ts) = mesh._open_details(ev, self.cfg, me="laptop")
         self.assertTrue(trusted)
         self.assertEqual(frm, "peer")
         self.assertEqual(body, "body-text")
@@ -3370,6 +3370,133 @@ class SignOnSendTests(unittest.TestCase):
         self.assertNotIn("s", out)
         self.assertNotIn("k", out)
         self.assertEqual(out, payload)
+
+
+class VerifyFrameTests(unittest.TestCase):
+    """Slice 3: classifying a received frame's authenticity. The security
+    property is that verification runs against the local pin for the claimed
+    name, never the carried key, and first contact is accept-but-mark."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        # a receiver; "laptop" is a remote sender with its own key
+        self.sender_cfg = make_cfg(tempfile.mkdtemp())
+        self.sender_cfg["id"] = self.cfg["id"]
+        self.sender_pub = mesh._ensure_node_key(
+            self.sender_cfg, "laptop", "claude")
+        self.to = "all"
+        self.topic = mesh.topic(self.cfg, self.to)
+
+    def _frame_from(self, cfg, f="laptop", b="hi"):
+        payload = {"f": f, "t": self.to, "b": b}
+        ts, signed = mesh._sign_wrapper_payload(
+            cfg, self.to, payload, harness="claude")
+        return ts, signed
+
+    def test_first_contact_is_accept_but_mark_and_pins(self):
+        ts, wrapper = self._frame_from(self.sender_cfg)
+        status = mesh._verify_frame(
+            self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+            self.topic, ts, mesh._base_payload(wrapper))
+        self.assertEqual(status, mesh.FRAME_UNVERIFIED)
+        # and it pinned the carried key
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "laptop"),
+                         mesh._normalize_pubkey(self.sender_pub))
+
+    def test_second_frame_from_pinned_sender_verifies(self):
+        # first contact pins
+        ts1, w1 = self._frame_from(self.sender_cfg)
+        mesh._verify_frame(self.cfg, "laptop", w1.get("k"), w1.get("s"),
+                           self.topic, ts1, mesh._base_payload(w1))
+        # a genuine second frame from the same key now verifies
+        ts2, w2 = self._frame_from(self.sender_cfg, b="second")
+        status = mesh._verify_frame(
+            self.cfg, "laptop", w2.get("k"), w2.get("s"),
+            self.topic, ts2, mesh._base_payload(w2))
+        self.assertEqual(status, mesh.FRAME_VERIFIED)
+
+    def test_forger_first_contact_is_never_verified(self):
+        # THE property. An attacker first-contacts as "laptop" with their own
+        # key and a valid self-signature. Verifying against the carried key
+        # would PASS and report authenticity. It must be UNVERIFIED, not
+        # VERIFIED — the carried key proves nothing about identity.
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        mesh._ensure_node_key(forger, "laptop", "claude")
+        ts, wrapper = self._frame_from(forger)  # signed by forger's key
+        status = mesh._verify_frame(
+            self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+            self.topic, ts, mesh._base_payload(wrapper))
+        self.assertEqual(status, mesh.FRAME_UNVERIFIED)
+
+    def test_pinned_sender_wrong_signature_is_mismatch(self):
+        # laptop is pinned to its real key; an impersonator sends a frame
+        # claiming "laptop" signed with a DIFFERENT key. Verified against the
+        # pin (not the carried key), it is a mismatch — an active forgery.
+        mesh._bind_peer(self.cfg, "laptop", self.sender_pub)
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        mesh._ensure_node_key(forger, "laptop", "claude")
+        ts, wrapper = self._frame_from(forger)
+        status = mesh._verify_frame(
+            self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+            self.topic, ts, mesh._base_payload(wrapper))
+        self.assertEqual(status, mesh.FRAME_MISMATCH)
+
+    def test_unsigned_frame_from_pinned_sender_is_unsigned(self):
+        mesh._bind_peer(self.cfg, "laptop", self.sender_pub)
+        status = mesh._verify_frame(
+            self.cfg, "laptop", None, None, self.topic, 1_700_000_000,
+            {"f": "laptop", "t": self.to, "b": "hi"})
+        self.assertEqual(status, mesh.FRAME_UNSIGNED)
+
+    def test_tampered_body_from_pinned_sender_is_mismatch(self):
+        mesh._bind_peer(self.cfg, "laptop", self.sender_pub)
+        ts, wrapper = self._frame_from(self.sender_cfg)
+        base = mesh._base_payload(wrapper)
+        base["b"] = "tampered"
+        status = mesh._verify_frame(
+            self.cfg, "laptop", wrapper.get("k"), wrapper.get("s"),
+            self.topic, ts, base)
+        self.assertEqual(status, mesh.FRAME_MISMATCH)
+
+
+class DecryptMetaTests(unittest.TestCase):
+    """decrypt keeps its plaintext-only contract; _decrypt_meta additionally
+    surfaces the authenticated wire timestamp for stage-3 verification."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def test_meta_returns_authenticated_timestamp(self):
+        wire = mesh.encrypt(self.cfg, "payload", to="all",
+                            timestamp=1_700_000_123)
+        pt, ts = mesh._decrypt_meta(
+            self.cfg, wire, expected_topic=mesh.topic(self.cfg, "all"),
+            now=1_700_000_123)  # age-check relative to the frame's own time
+        self.assertEqual(pt, "payload")
+        self.assertEqual(ts, 1_700_000_123)
+
+    def test_decrypt_still_returns_plaintext_only(self):
+        wire = mesh.encrypt(self.cfg, "payload", to="all")
+        out = mesh.decrypt(self.cfg, wire,
+                           expected_topic=mesh.topic(self.cfg, "all"))
+        self.assertEqual(out, "payload")
+
+    def test_meta_rejects_wrong_topic(self):
+        wire = mesh.encrypt(self.cfg, "p", to="all")
+        pt, ts = mesh._decrypt_meta(self.cfg, wire, expected_topic="mw-wrong")
+        self.assertIsNone(pt)
+        self.assertIsNone(ts)
 
 
 class PeerPinTests(unittest.TestCase):
