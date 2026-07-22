@@ -3200,6 +3200,58 @@ class SignedApprovalTests(unittest.TestCase):
             mesh._apply_owner_trust(self.cfg, block)
 
 
+class AgentWatchWarningTests(unittest.TestCase):
+    """#57: warn when `mesh watch --follow` in an agent session would be a
+    write-only pipe that never wakes the model."""
+
+    def _isolate_markers(self):
+        # save every harness marker and clear them; restore on cleanup so the
+        # test does not leak env state to the rest of the run
+        saved = {m: os.environ.get(m)
+                 for spec in mesh.HARNESS_SPECS.values()
+                 for m in spec.env_markers}
+        for m in saved:
+            os.environ.pop(m, None)
+
+        def restore():
+            for m, v in saved.items():
+                if v is None:
+                    os.environ.pop(m, None)
+                else:
+                    os.environ[m] = v
+        self.addCleanup(restore)
+
+    def test_detects_agent_session_when_stdout_not_tty(self):
+        self._isolate_markers()
+        os.environ["CLAUDECODE"] = "1"
+        with contextlib.redirect_stdout(io.StringIO()):   # non-tty stdout
+            spec = mesh._agent_session_without_wake()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.name, "claude")
+
+    def test_no_warning_without_a_harness_marker(self):
+        self._isolate_markers()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(mesh._agent_session_without_wake())
+
+    def test_cmd_watch_follow_warns_in_agent_session(self):
+        self._isolate_markers()
+        os.environ["CLAUDECODE"] = "1"
+        cfg = make_cfg()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(mesh, "my_node", return_value="alpha"), \
+                mock.patch.object(mesh, "_acquire_presence_lock",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):   # presence lock None -> exit
+                mesh.cmd_watch(argparse.Namespace(
+                    follow=True, timeout=None, as_node=None))
+        self.assertIn("does NOT wake the agent", err.getvalue())
+        self.assertIn("mesh claude-setup", err.getvalue())
+
+
 class ReplayLedgerTests(unittest.TestCase):
     """Time-based bounding of the replay fingerprint ledger (#77). Evict on
     the same WIRE_MAX_AGE window decrypt uses; migrate legacy lists without

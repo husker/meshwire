@@ -5817,9 +5817,36 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
     return got
 
 
+def _agent_session_without_wake():
+    """The harness spec when `mesh watch --follow` here would be a write-only
+    pipe: stdout is not a terminal AND an agent-harness env marker is present.
+    In that case deliveries land in background output the model never reads --
+    the plugin lifecycle hook is what actually wakes the session. Returns the
+    spec (for its setup command) or None."""
+    try:
+        if sys.stdout.isatty():
+            return None
+    except (ValueError, OSError):
+        pass  # detached stdout -> treat as non-tty
+    for spec in HARNESS_SPECS.values():
+        if any(os.environ.get(m) for m in spec.env_markers):
+            return spec
+    return None
+
+
 def cmd_watch(args):
     cfg = load_config()
     me = my_node(cfg, args.as_node)
+    if args.follow or args.timeout is None:  # long-running watch
+        spec = _agent_session_without_wake()
+        if spec is not None:
+            print(
+                f"MESH_WARN: `mesh watch --follow` inside a "
+                f"{spec.display_name} session receives messages but does NOT "
+                f"wake the agent -- deliveries land in background output the "
+                f"model never reads. Use the lifecycle hook instead "
+                f"(`{spec.setup_command}`); see the a2acast mesh-agent skill.",
+                file=sys.stderr)
     plock = _acquire_presence_lock(cfg, me)
     if plock is None:
         sys.exit(f"error: node '{me}' already has a live presence watcher; "
