@@ -6650,6 +6650,19 @@ class CodexSetupTests(unittest.TestCase):
             json.dump({k: v for k, v in cfg.items()
                        if not k.startswith("_")}, f)
 
+    def test_harness_registration_makes_the_pin_the_source_of_truth(self):
+        # The #60 payoff: because the server resolves --harness codex from the
+        # pin at each startup (rather than a baked --as), a later `mesh iam`
+        # rename actually takes effect on restart. Model that: resolve, rename
+        # the pin, resolve again.
+        cfg = mesh.load_config()
+        mesh._pin_node_name({"_dir": cfg["_dir"]}, "codex-one", "codex")
+        self.assertEqual(
+            mesh.my_node(cfg, None, harness="codex", learn=False), "codex-one")
+        mesh._pin_node_name({"_dir": cfg["_dir"]}, "codex-two", "codex")
+        self.assertEqual(
+            mesh.my_node(cfg, None, harness="codex", learn=False), "codex-two")
+
     def test_invokes_codex_mcp_add_with_pinned_config(self):
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run",
@@ -6661,19 +6674,18 @@ class CodexSetupTests(unittest.TestCase):
                         supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
         expected_cfg = os.path.abspath(mesh.CONFIG_NAME)
-        # identity is pinned via --as: Codex does not pass the session env
-        # to MCP servers, so the server cannot detect its own harness
+        # identity comes from --harness (the pin file), not a baked --as:
+        # Codex does not pass the session env, so --harness supplies the
+        # harness AND keeps the pin as the single source of truth (#60)
         self.assertEqual(cmd, ["codex", "mcp", "add", "a2acast", "--",
                                "mesh", "mcp-serve", "--config",
-                               expected_cfg, "--as",
-                               mesh._default_node_name("codex")])
+                               expected_cfg, "--harness", "codex"])
         popen.assert_not_called()
 
     def test_derived_identity_is_persisted_to_the_pin_file(self):
-        """codex-setup bakes --as into the MCP registration, and --as is top
-        precedence in my_node. If the derived name is not also written to the
-        pin file, nothing can ever change it: a later `mesh iam` writes a pin
-        the MCP server will never consult."""
+        """codex-setup registers --harness codex (the pin file), so the pin
+        must be written or the server has no identity to resolve. With it,
+        a later `mesh iam` rewrite is picked up on restart (#60)."""
         ok = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(mesh.subprocess, "run", return_value=ok):
             with mock.patch.object(mesh.subprocess, "Popen"):
@@ -6699,7 +6711,7 @@ class CodexSetupTests(unittest.TestCase):
                     mesh.cmd_codex_setup(argparse.Namespace(
                         dir=None, supervise=False,
                         supervise_sandbox="read-only"))
-        self.assertEqual(run.call_args[0][0][-2:], ["--as", "chosen-name"])
+        self.assertEqual(run.call_args[0][0][-2:], ["--harness", "codex"])
         with open(".meshwire.node.codex") as f:
             self.assertEqual(f.read().strip(), "chosen-name")
 
@@ -6715,9 +6727,11 @@ class CodexSetupTests(unittest.TestCase):
                         dir=None, supervise=False,
                         supervise_sandbox="read-only"))
         cmd = run.call_args[0][0]
-        # the migrated identity (established via the generic node file)
-        # must win over the raw hostname-derived name
-        self.assertEqual(cmd[-2:], ["--as", "alpha"])
+        # registration carries --harness, not a name; the migrated identity
+        # lands in the pin file, which the server resolves at startup
+        self.assertEqual(cmd[-2:], ["--harness", "codex"])
+        with open(".meshwire.node.codex") as f:
+            self.assertEqual(f.read().strip(), "alpha")
 
     def test_missing_codex_cli_prints_manual_toml(self):
         with mock.patch.object(mesh.subprocess, "run",
@@ -6733,7 +6747,7 @@ class CodexSetupTests(unittest.TestCase):
         self.assertIn('command = "mesh"', msg)
         self.assertIn(
             f'args = ["mcp-serve", "--config", "{expected_cfg}", '
-            f'"--as", "{me}"]', msg)
+            f'"--harness", "codex"]', msg)
 
     def test_codex_failure_surfaces_stderr(self):
         bad = mock.Mock(returncode=1, stdout="", stderr="nope")

@@ -6700,7 +6700,11 @@ def _run_mcp_server(args, label, idle_hint):
         cfg = json.load(f)
     cfg["_path"] = path
     cfg["_dir"] = os.path.dirname(path)
-    me = my_node(cfg, getattr(args, "as_node", None))
+    # --harness pins identity to that harness's pin file, resolved fresh here
+    # at startup, so `mesh iam` renames take effect on restart. --as still
+    # overrides (legacy registrations); harness=None keeps env auto-detection.
+    me = my_node(cfg, getattr(args, "as_node", None),
+                 harness=getattr(args, "harness", None))
     print(f"a2acast {label}: serving as node '{me}' ({cfg['_dir']}) "
           f"via {how}", file=sys.stderr)
     server = MeshMCPServer(cfg, me)
@@ -8497,22 +8501,24 @@ def cmd_codex_setup(args):
             me = None
     me = me or _default_node_name(spec.name)
     if me:
-        # persist it: --as is top precedence in my_node, so the baked-in name
-        # wins over the pin file forever. Without this the pin never exists,
-        # and a later `mesh iam` writes one the MCP server never consults —
-        # leaving the node permanently unrenameable.
+        # The pin is the single source of truth. We register `--harness codex`
+        # (not a baked `--as`), so the server resolves this pin at each
+        # startup: a later `mesh iam` rewrites it and the server picks up the
+        # new name on restart, instead of being frozen to a name baked into
+        # ~/.codex/config.toml forever (#60). Codex spawns MCP servers without
+        # the session env, so --harness supplies the harness the server could
+        # not otherwise detect.
         _pin_node_name({"_dir": project_dir}, me, spec.name)
-        cmd += ["--as", me]
+    cmd += ["--harness", spec.name]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        as_hint = f", \"--as\", \"{me}\"" if me else ""
         sys.exit("error: `codex` CLI not found on PATH. Install Codex CLI, "
                  f"or add this to {spec.settings_path} yourself:\n"
                  "  [mcp_servers.a2acast]\n"
                  "  command = \"mesh\"\n"
-                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\""
-                 f"{as_hint}]")
+                 f"  args = [\"mcp-serve\", \"--config\", \"{pinned}\", "
+                 f"\"--harness\", \"{spec.name}\"]")
     if r.returncode != 0:
         sys.exit("error: `codex mcp add` failed: "
                  f"{(r.stderr or r.stdout).strip()}")
@@ -10196,6 +10202,11 @@ def main():
 
     p = sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     p.add_argument("--as", dest="as_node", default=None)
+    p.add_argument("--harness", dest="harness", default=None,
+                   help="resolve identity from this harness's pin file "
+                        "(.meshwire.node.<harness>) at each startup, so "
+                        "`mesh iam` renames take effect — instead of a name "
+                        "frozen into a baked --as")
     p.add_argument("--config", default=None,
                    help="explicit path to the .meshwire.json to watch")
     p.set_defaults(fn=cmd_mcp_serve)
