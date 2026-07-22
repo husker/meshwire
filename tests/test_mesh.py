@@ -1081,6 +1081,7 @@ class SendStatusInviteTests(MembershipCmdTests):
         line = out.getvalue()
         self.assertIn("[UNVERIFIED]", line)
         self.assertNotIn("[attachment expired]", line)
+        self.assertIn("title?=imac", line)         # crafted Title not an id
 
     def test_peek_foreign_attachment_url_stays_unverified(self):
         # #88: the benign expired-attachment label keys on the URL living on
@@ -1094,12 +1095,14 @@ class SendStatusInviteTests(MembershipCmdTests):
               "attachment": {"url": "https://evil.example/loot.txt",
                              "size": 5000}, "title": "devmesh"}
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(mesh, "http",
+                               side_effect=urllib.error.URLError("nope")), \
+                contextlib.redirect_stdout(out):
             mesh._print_peek_event(ev, cfg, "alpha")
         line = out.getvalue()
         self.assertIn("[UNVERIFIED]", line)
         self.assertNotIn("[attachment expired]", line)
-        self.assertIn("title?=imac", line)         # crafted Title not an id
+        self.assertIn("title?=devmesh", line)      # crafted Title not an id
 
     def test_peek_learns_peers(self):
         cfg = self._write_cfg()
