@@ -7554,10 +7554,26 @@ def _print_peek_event(event, cfg, node, details=None):
     relay_time = _relay_time(event["time"])
     ts = time.strftime("%Y-%m-%d %H:%M:%S",
                        time.localtime(relay_time))
-    mark = "" if trusted else " [UNVERIFIED]"
+    att = event.get("attachment")
+    has_attachment = isinstance(att, dict) and bool(att.get("url"))
+    if trusted:
+        mark = ""
+    elif has_attachment:
+        # The payload was a large-message attachment. ntfy attachments carry
+        # a ~3h TTL, so an untrusted attachment row is almost always an
+        # expired/unfetchable payload, not a spoof. [UNVERIFIED] must mean
+        # only that present content FAILED THE HMAC, or it reads a delivered
+        # message back as an intrusion (#65).
+        mark = " [attachment expired]"
+    else:
+        mark = " [UNVERIFIED]"
     if ctl:
         mark += f" [control:{ctl.get('mw')}]"
-    print(f"[{ts}] {frm or event.get('title', '')}{mark}: {text}")
+    # For an untrusted row there is no authenticated sender; the ntfy Title
+    # is sender-controlled, so a crafted `Title: imac` would read as a real
+    # node line here. Render it as clearly-not-an-identity instead.
+    who = frm if frm else f"title?={event.get('title', '')}"
+    print(f"[{ts}] {who}{mark}: {text}")
     return True
 
 

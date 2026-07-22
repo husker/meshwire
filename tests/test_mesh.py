@@ -1048,6 +1048,41 @@ class SendStatusInviteTests(MembershipCmdTests):
             f.write("alpha\n")
         return cfg
 
+    def test_peek_expired_attachment_is_not_unverified(self):
+        # #65: a large-message attachment whose payload expired off the relay
+        # must not read as a failed-auth [UNVERIFIED] intrusion.
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(".meshwire.json")
+        cfg["_dir"] = os.getcwd()
+        url = f"{cfg['server']}/{mesh.topic(cfg, 'alpha')}/attachment.txt"
+        ev = {"event": "message", "id": "e", "time": 100,
+              "message": "You received a file: attachment.txt",
+              "attachment": {"url": url, "size": 5000}, "title": "devmesh"}
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http",
+                               side_effect=urllib.error.URLError("gone")), \
+                contextlib.redirect_stdout(out):
+            mesh._print_peek_event(ev, cfg, "alpha")
+        line = out.getvalue()
+        self.assertIn("[attachment expired]", line)
+        self.assertNotIn("[UNVERIFIED]", line)
+        self.assertIn("title?=devmesh", line)      # not shown as an identity
+
+    def test_peek_inline_failed_auth_stays_unverified(self):
+        # an inline (non-attachment) untrusted row keeps the precise label
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(".meshwire.json")
+        cfg["_dir"] = os.getcwd()
+        ev = {"event": "message", "id": "e2", "time": 100,
+              "message": "not our wire format", "title": "imac"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh._print_peek_event(ev, cfg, "alpha")
+        line = out.getvalue()
+        self.assertIn("[UNVERIFIED]", line)
+        self.assertNotIn("[attachment expired]", line)
+        self.assertIn("title?=imac", line)         # crafted Title not an id
+
     def test_peek_learns_peers(self):
         cfg = self._write_cfg()
         cfg["_path"] = os.path.abspath(".meshwire.json")
