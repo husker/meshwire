@@ -1759,10 +1759,20 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
     try:
         with open(payload_path, "wb") as f:
             f.write(payload)
-        completed = subprocess.run(
-            [binary, "-Y", "sign", "-f", key_path,
-             "-n", _approval_namespace(cfg), payload_path],
-            capture_output=True, text=True, timeout=60)
+        try:
+            completed = subprocess.run(
+                [binary, "-Y", "sign", "-f", key_path,
+                 "-n", _approval_namespace(cfg), payload_path],
+                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            # A passphrase-protected owner key (#64) prompts for the
+            # passphrase; with no one at the terminal, POSIX ssh-keygen fails
+            # fast but Windows ssh-keygen blocks on the console. Either way an
+            # unattended process must not mint -- fail closed, gracefully.
+            raise ValueError(
+                "signing timed out — a passphrase-protected owner key needs "
+                "a present human to enter the passphrase at the terminal; an "
+                "unattended process cannot mint (#64)")
         if completed.returncode != 0:
             raise ValueError("ssh-keygen could not sign the approval: "
                              + completed.stderr.strip())

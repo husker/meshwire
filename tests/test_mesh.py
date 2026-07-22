@@ -2968,8 +2968,16 @@ class SignedApprovalTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             mesh._owner_init(fresh, passphrase="correct horse")
         key = mesh.owner_key_file(fresh)
+        # cross-platform: the key file itself is encrypted
         self.assertTrue(self._key_is_encrypted(key), "owner key not encrypted")
-        # empirically: signing without the passphrase fails (no signature)
+        if os.name != "posix":
+            # Windows ssh-keygen blocks on the console for the passphrase
+            # rather than failing fast when stdin is closed, so the empirical
+            # sign-fails probe would hang. _approve_descriptor's timeout
+            # handles that path in production; the encryption check above is
+            # the cross-platform guarantee.
+            return
+        # POSIX: signing with no passphrase available fails, no signature
         env = {k: v for k, v in os.environ.items()
                if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "DISPLAY")}
         with open(os.path.join(other.name, "m"), "w") as f:
@@ -2977,10 +2985,21 @@ class SignedApprovalTests(unittest.TestCase):
         r = subprocess.run(
             [shutil.which("ssh-keygen"), "-Y", "sign", "-f", key,
              "-n", "t", os.path.join(other.name, "m")],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=30,
             stdin=subprocess.DEVNULL, env=env)
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(other.name, "m.sig")))
+
+    def test_approve_fails_closed_when_signing_times_out(self):
+        # An unattended mint against a passphrase-protected key must fail
+        # closed, not raise an unhandled TimeoutExpired (Windows blocks on the
+        # console rather than failing fast).
+        descriptor = self._descriptor()
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=mesh.subprocess.TimeoutExpired("ssh-keygen", 60)):
+            with self.assertRaisesRegex(ValueError, "present human"):
+                mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
 
     def test_owner_init_requires_passphrase_or_explicit_optout(self):
         other = tempfile.TemporaryDirectory()
