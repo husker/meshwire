@@ -7583,6 +7583,9 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
 
     cfg = load_config()
     me = my_node(cfg, None, harness)
+    # A prior flow's stale deferred checkpoint must never advance the cursor
+    # past a frame THIS flow hasn't handed off (imac's PR-89 seat, N2).
+    del _HOOK_PENDING_CHECKPOINTS[:]
     lock = _acquire_hook_lock(cfg, me, hook_input, harness)
     if lock is None:
         return None

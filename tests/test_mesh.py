@@ -2654,6 +2654,30 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         self.assertIn("untrusted external input", good.getvalue())
         self.assertEqual(self._cursor()["since"], 206)
 
+    def test_stale_pending_checkpoint_is_discarded_at_hook_entry(self):
+        # imac's PR-89 seat, N2: a stale deferred checkpoint from a prior
+        # flow must be dropped unrun at hook entry -- draining it later could
+        # advance the cursor past a frame this flow never handed off.
+        self._setup_mesh()
+        stale = mock.Mock()
+        mesh._HOOK_PENDING_CHECKPOINTS.append(stale)
+        self.addCleanup(mesh._HOOK_PENDING_CHECKPOINTS.clear)
+        lock = os.path.abspath("hook.lock")
+        with open(lock, "w") as f:
+            f.write("{}")
+        with mock.patch.object(mesh, "_acquire_hook_lock",
+                               return_value=lock), \
+             mock.patch.object(mesh, "_presence_is_live",
+                               return_value=False), \
+             mock.patch.object(mesh, "_read_hook_input", return_value={}), \
+             mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([])), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_claude_hook(argparse.Namespace(timeout=1))
+        stale.assert_not_called()
+        self.assertEqual(mesh._HOOK_PENDING_CHECKPOINTS, [])
+
     def test_codex_continuation_checkpoints_after_json_handoff(self):
         cfg = self._setup_mesh()
         ev = self._msg_event(cfg, "beta", "codex payload", "h2", 207)
