@@ -2990,6 +2990,54 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(other.name, "m.sig")))
 
+    def test_minting_scrubs_ssh_agent_from_the_environment(self):
+        # #64 BLOCKING fix (imac): an ssh-add'd owner key must not let
+        # ssh-keygen mint without the passphrase via the agent. The minting
+        # subprocess env must exclude SSH_AUTH_SOCK / SSH_ASKPASS, or the one
+        # action a careful owner takes (ssh-add) silently defeats the whole
+        # feature while it still looks protected.
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            with open(cmd[-1] + ".sig", "w") as f:   # let _approve proceed
+                f.write("sig")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ,
+                             {"SSH_AUTH_SOCK": "/tmp/agent.sock",
+                              "SSH_ASKPASS": "/bin/askpass"}), \
+                mock.patch.object(mesh.subprocess, "run",
+                                  side_effect=fake_run):
+            mesh._approve_descriptor(self.cfg, self._descriptor(), ttl=600)
+        env = captured.get("env")
+        self.assertIsNotNone(env, "minting must pass an explicit env")
+        self.assertNotIn("SSH_AUTH_SOCK", env)
+        self.assertNotIn("SSH_ASKPASS", env)
+
+    def test_rotation_via_replace_still_requires_fingerprint_confirmation(self):
+        # #64 caveat 3: --replace allows replacing a DIFFERENT owner, but must
+        # NOT skip the terminal fingerprint confirmation.
+        member = self._member()
+        mesh._apply_owner_trust(member, mesh._owner_trust_block(self.cfg))
+        other = make_cfg(tempfile.mkdtemp())
+        other["id"] = self.cfg["id"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(other, allow_unprotected=True)
+        block2 = mesh._owner_trust_block(other)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(self._trust_args(block2, replace=True))
+        self.assertIn("terminal", str(caught.exception))
+        # rotation did NOT happen without confirmation: old owner still trusted
+        self.assertEqual(
+            mesh._load_owner_trust(member),
+            mesh._parse_owner_trust_block(
+                member, mesh._owner_trust_block(self.cfg)))
+
     def test_approve_fails_closed_when_signing_times_out(self):
         # An unattended mint against a passphrase-protected key must fail
         # closed, not raise an unhandled TimeoutExpired (Windows blocks on the

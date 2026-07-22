@@ -1081,6 +1081,22 @@ def _ssh_keygen_binary():
     return binary
 
 
+def _signing_env():
+    """Environment for ssh-keygen SIGNING, with SSH_AUTH_SOCK and SSH_ASKPASS
+    scrubbed so ssh-keygen cannot reach an ssh-agent or an askpass helper and
+    MUST use the key file directly.
+
+    Without this, an owner who `ssh-add`ed a passphrase-protected owner key
+    would let any process on the box -- a harnessed agent included -- mint
+    approvals with no passphrase, silently defeating #64: the agent supplies
+    the decrypted key and `ssh-keygen -Y sign -f` uses it. The one action a
+    security-conscious owner is most likely to take (ssh-add so they stop
+    typing the passphrase) would otherwise be the action that defeats the
+    protection, which is worse than none because it looks protected. [imac]"""
+    return {k: v for k, v in os.environ.items()
+            if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS")}
+
+
 def _approval_namespace(cfg):
     return f"a2acast-approval@{cfg['id']}"
 
@@ -1513,7 +1529,7 @@ def _sign_as_node(cfg, harness, relay_topic, timestamp, payload):
         completed = subprocess.run(
             [binary, "-Y", "sign", "-f", key_path,
              "-n", _node_key_namespace(cfg), message_path],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60, env=_signing_env())
         if completed.returncode != 0:
             raise ValueError("ssh-keygen could not sign as node: "
                              + completed.stderr.strip())
@@ -1763,7 +1779,8 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
             completed = subprocess.run(
                 [binary, "-Y", "sign", "-f", key_path,
                  "-n", _approval_namespace(cfg), payload_path],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60,
+                env=_signing_env())
         except subprocess.TimeoutExpired:
             # A passphrase-protected owner key (#64) prompts for the
             # passphrase; with no one at the terminal, POSIX ssh-keygen fails
