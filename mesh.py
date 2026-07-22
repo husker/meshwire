@@ -1296,6 +1296,34 @@ def _ensure_node_key(cfg, node, harness):
 
 PIN_NAME = ".meshwire.pins.json"
 
+# ssh-keygen's allowed-signers line is `principal namespaces="..." KEY`, one
+# per line. Everything on it is trusted to authenticate the signer, so no
+# attacker-controlled bytes may reach it. A public key's COMMENT field is
+# attacker-set when the key arrives over the wire, and a newline in it would
+# inject a second signers line. We therefore store and emit keys as exactly
+# two fields, type and blob, dropping the comment. The principal is a
+# constant (the empirical finding: ssh-keygen binds to key+namespace, not
+# principal), so the claimed node name never reaches the file either.
+NODE_SIG_PRINCIPAL = "a2acast-peer"
+
+
+def _normalize_pubkey(pub):
+    """Reduce an OpenSSH public key to `type blob` — no comment, no trailing
+    bytes — after validating the blob decodes. Raises on anything malformed.
+    This is the only form allowed into a pin store or a signers line."""
+    if not isinstance(pub, str):
+        raise ValueError("public key is not a string")
+    parts = pub.split()
+    if len(parts) < 2:
+        raise ValueError("public key is malformed")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("public key is malformed") from exc
+    if not blob:
+        raise ValueError("public key is malformed")
+    return f"{parts[0]} {parts[1]}"
+
 
 def pins_file(cfg):
     return os.path.join(cfg["_dir"], PIN_NAME)
@@ -1324,8 +1352,9 @@ def _bind_peer(cfg, node, pub):
     rather than be adopted. Same shape as _apply_owner_trust's refusal."""
     if not isinstance(pub, str) or not pub.strip():
         raise ValueError("peer key is empty")
-    pub = pub.strip()
-    _key_fingerprint(pub)  # reject an unparseable key before pinning
+    # Normalize to type+blob before anything else: a carried key's comment is
+    # attacker-controlled and must never enter the store or a signers line.
+    pub = _normalize_pubkey(pub)
     pins = _load_pins(cfg)
     existing = pins.get(node)
     if isinstance(existing, str) and existing.strip():
@@ -1405,7 +1434,15 @@ def _verify_node_sig(cfg, node, pinned_pub, relay_topic, timestamp,
         message = _node_sig_message(cfg, relay_topic, timestamp, payload)
     except ValueError:
         return False
-    principal = f"{node}@{cfg['id']}"
+    # Constant principal and a normalized key: nothing attacker-controlled
+    # reaches the signers line. The claimed `node` deliberately does NOT
+    # appear here — it authenticates nothing (see docstring), and keeping it
+    # out removes it as an injection vector. Authentication is entirely that
+    # `pinned_pub` is the key the CALLER looked up for the claimed name.
+    try:
+        signer_key = _normalize_pubkey(pinned_pub)
+    except ValueError:
+        return False
     workdir = tempfile.mkdtemp(prefix="mw-nodeverify-")
     try:
         sig_path = os.path.join(workdir, "m.sig")
@@ -1413,11 +1450,12 @@ def _verify_node_sig(cfg, node, pinned_pub, relay_topic, timestamp,
             f.write(signature)
         signers_path = os.path.join(workdir, "signers")
         with open(signers_path, "w", encoding="utf-8") as f:
-            f.write(f"{principal} "
+            f.write(f"{NODE_SIG_PRINCIPAL} "
                     f"namespaces=\"{_node_key_namespace(cfg)}\" "
-                    f"{pinned_pub.strip()}\n")
+                    f"{signer_key}\n")
         completed = subprocess.run(
-            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+            [binary, "-Y", "verify", "-f", signers_path,
+             "-I", NODE_SIG_PRINCIPAL,
              "-n", _node_key_namespace(cfg), "-s", sig_path],
             input=message, capture_output=True, timeout=60)
         return completed.returncode == 0

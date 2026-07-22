@@ -3252,6 +3252,25 @@ class NodeSigningTests(unittest.TestCase):
                                       "x", "claude")
         self.assertFalse(self._verify(sig, node="laptop", pub=other))
 
+    def test_pinned_key_comment_cannot_inject_a_second_signer(self):
+        # A pin's key text flows into ssh-keygen's allowed-signers file. A
+        # carried key's comment is attacker-set; a newline in it would inject
+        # a second authorized line. Normalization to type+blob must prevent a
+        # foreign key smuggled in a comment from ever being authorized.
+        foreign_cfg = make_cfg(tempfile.mkdtemp())
+        foreign_cfg["id"] = self.cfg["id"]
+        foreign_pub = mesh._ensure_node_key(foreign_cfg, "evil", "claude")
+        foreign_sig = mesh._sign_as_node(
+            foreign_cfg, "claude", self.topic, self.ts, self.payload)
+        ns = mesh._node_key_namespace(self.cfg)
+        malicious_pin = (self.pub + f" c\n{mesh.NODE_SIG_PRINCIPAL} "
+                         f'namespaces="{ns}" {foreign_pub}')
+        # Without normalization the injected line authorizes foreign_pub and
+        # this VERIFIES. With it, only laptop's key survives, so it fails.
+        self.assertFalse(self._verify(foreign_sig, pub=malicious_pin))
+        # and laptop's own signature still verifies against the same pin
+        self.assertTrue(self._verify(self._sign(), pub=malicious_pin))
+
     def test_signature_is_not_the_carried_key_check(self):
         # Guard against the shape imac warned about: verifying against a key
         # the "message" supplies proves only internal consistency. Here a
@@ -3281,17 +3300,20 @@ class PeerPinTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.cfg = make_cfg(tmp.name)
         self.pub = mesh._ensure_node_key(self.cfg, "peer", "claude")
+        # pins are stored normalized (type+blob, no comment), so that is the
+        # form _bind_peer returns and _pinned_peer_key reads back
+        self.npub = mesh._normalize_pubkey(self.pub)
 
     def test_first_sight_pins_and_returns_the_key(self):
         self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
         bound = mesh._bind_peer(self.cfg, "peer", self.pub)
-        self.assertEqual(bound, self.pub)
-        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.pub)
+        self.assertEqual(bound, self.npub)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.npub)
 
     def test_same_key_is_idempotent(self):
         mesh._bind_peer(self.cfg, "peer", self.pub)
         self.assertEqual(mesh._bind_peer(self.cfg, "peer", self.pub),
-                         self.pub)
+                         self.npub)
 
     def test_different_key_is_a_hard_reject(self):
         mesh._bind_peer(self.cfg, "peer", self.pub)
@@ -3300,12 +3322,23 @@ class PeerPinTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different key"):
             mesh._bind_peer(self.cfg, "peer", other)
         # the original pin survives the rejected rebind
-        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.pub)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "peer"), self.npub)
 
     def test_unparseable_key_is_refused_before_pinning(self):
         with self.assertRaises(ValueError):
             mesh._bind_peer(self.cfg, "peer", "not-a-key")
         self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
+
+    def test_bind_strips_comment_and_injection_attempt(self):
+        parts = self.pub.split()
+        malicious = (f"{parts[0]} {parts[1]} innocent\n"
+                     f'attacker namespaces="x" ssh-ed25519 AAAAINJECTED')
+        bound = mesh._bind_peer(self.cfg, "peer", malicious)
+        self.assertEqual(bound, f"{parts[0]} {parts[1]}")
+        stored = mesh._pinned_peer_key(self.cfg, "peer")
+        self.assertNotIn("\n", stored)
+        self.assertNotIn("INJECTED", stored)
+        self.assertNotIn("innocent", stored)
 
     def test_pin_file_is_not_world_readable(self):
         if os.name != "posix":
