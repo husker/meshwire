@@ -21,6 +21,7 @@ import base64
 import contextlib
 import email.message
 import errno
+import getpass
 import hashlib
 import hmac
 import io
@@ -1151,16 +1152,31 @@ def _load_owner_trust(cfg):
     return pub.strip()
 
 
-def _owner_init(cfg):
-    """Create the mesh owner keypair here and trust it locally."""
+def _owner_init(cfg, passphrase=None, allow_unprotected=False):
+    """Create the mesh owner keypair here and trust it locally.
+
+    The key is passphrase-protected by default. Minting an approval then runs
+    `ssh-keygen -Y sign` against the encrypted key, which requires the
+    passphrase on the controlling terminal -- a harnessed agent, with no
+    terminal, cannot answer it and cannot mint. So an owner signature proves
+    a HUMAN acted, not merely that a process could read the key file. That is
+    the gap #64 closes: cryptography cannot supply a decision nobody made.
+
+    `allow_unprotected` (from `--no-passphrase`) keeps the old passphraseless
+    key for tests/CI, with the risk stated loudly in the output."""
     key_path = owner_key_file(cfg)
     if os.path.exists(key_path) or os.path.exists(owner_trust_file(cfg)):
         raise ValueError("a mesh owner key or trust store already exists "
                          "here; refusing to replace it")
+    if not allow_unprotected and not (isinstance(passphrase, str)
+                                      and passphrase):
+        raise ValueError("owner key needs a passphrase (or --no-passphrase "
+                         "for an unprotected key)")
     binary = _ssh_keygen_binary()
     completed = subprocess.run(
-        [binary, "-q", "-t", "ed25519", "-N", "", "-C",
-         f"a2acast-owner-{cfg['mesh']}", "-f", key_path],
+        [binary, "-q", "-t", "ed25519",
+         "-N", "" if allow_unprotected else passphrase,
+         "-C", f"a2acast-owner-{cfg['mesh']}", "-f", key_path],
         capture_output=True, text=True, timeout=60)
     if completed.returncode != 0:
         raise ValueError("ssh-keygen could not create the owner key: "
@@ -1176,6 +1192,12 @@ def _owner_init(cfg):
     print("  Read that aloud to whoever runs `mesh owner-trust`. The block")
     print("  travels over a channel that cannot prove who sent it; the")
     print("  fingerprint, compared out of band, is what proves it.")
+    if allow_unprotected:
+        print()
+        print("  WARNING: this owner key has NO passphrase. Any process that "
+              "can read it — including an agent on this machine — can mint "
+              "owner approvals unattended. Re-run `mesh owner-init` without "
+              "--no-passphrase to require a present human (#64).")
     return pub
 
 
@@ -1230,15 +1252,16 @@ def _parse_owner_trust_block(cfg, block):
     return pub.strip()
 
 
-def _apply_owner_trust(cfg, block):
+def _apply_owner_trust(cfg, block, replace=False):
     pub = _parse_owner_trust_block(cfg, block)
     try:
         existing = _load_owner_trust(cfg)
     except ValueError:
         existing = None
-    if existing is not None and existing != pub:
+    if existing is not None and existing != pub and not replace:
         raise ValueError("a different owner is already trusted here; "
-                         "refusing to replace it")
+                         "refusing to replace it (pass --replace to rotate "
+                         "the owner key)")
     _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
     return pub
 
@@ -4952,8 +4975,30 @@ def cmd_owner_init(args):
     # cmd_join already refresh via _write_config_here; this was the third
     # entry point where a directory gains a secret, and it did not.
     _ensure_gitignore(cfg["_dir"])
+    passphrase = None
+    if not getattr(args, "no_passphrase", False):
+        # Read the passphrase on the terminal (getpass, no echo). This is the
+        # point of #64: an unattended/agent run has no terminal and MUST fail
+        # here rather than silently mint a passphraseless key an agent could
+        # then use to sign approvals unattended.
+        if not sys.stdin.isatty():
+            sys.exit("error: owner-init needs a terminal to set the key "
+                     "passphrase. Run it interactively, or pass "
+                     "--no-passphrase for an unprotected key (agents can then "
+                     "mint unattended — see #64).")
+        try:
+            passphrase = getpass.getpass("Owner key passphrase: ")
+            confirm = getpass.getpass("Confirm passphrase: ")
+        except (EOFError, KeyboardInterrupt):
+            sys.exit("error: owner-init aborted")
+        if not passphrase:
+            sys.exit("error: empty passphrase; use --no-passphrase for an "
+                     "unprotected key")
+        if passphrase != confirm:
+            sys.exit("error: passphrases did not match")
     try:
-        _owner_init(cfg)
+        _owner_init(cfg, passphrase=passphrase,
+                    allow_unprotected=getattr(args, "no_passphrase", False))
     except ValueError as exc:
         sys.exit(f"error: {exc}")
 
@@ -4977,6 +5022,12 @@ def cmd_owner_trust(args):
     if already == pub:
         print(f"mesh owner already trusted here ({fingerprint}) — no change")
         return
+    if already is not None and not getattr(args, "replace", False):
+        sys.exit("error: a different owner is already trusted here. This is "
+                 "an owner-key ROTATION — pass --replace once you have "
+                 "confirmed the new fingerprint out of band.")
+    if already is not None:
+        print("ROTATION: replacing the currently trusted owner key.")
     print(f"owner fingerprint: {fingerprint}")
     print("This block arrived over a channel that proves shared-key custody,")
     print("NOT who sent it. Any member could have injected it. Confirm the")
@@ -4998,7 +5049,8 @@ def cmd_owner_trust(args):
         if answer != want:
             sys.exit("error: fingerprint not confirmed — nothing was trusted")
     try:
-        _apply_owner_trust(cfg, args.block)
+        _apply_owner_trust(cfg, args.block,
+                           replace=getattr(args, "replace", False))
     except ValueError as exc:
         sys.exit(f"error: {exc}")
     print("mesh owner trusted — approvals from this owner verify here now")
@@ -5010,6 +5062,12 @@ def cmd_approve(args):
         descriptor = json.loads(args.descriptor)
     except ValueError as exc:
         sys.exit(f"error: descriptor is not valid JSON: {exc}")
+    # Show exactly what is being signed, so the ceremony is legible in
+    # terminal history (#64). The passphrase prompt from a protected owner
+    # key is the actual human gate; this makes the decision auditable.
+    print("minting an owner approval for this descriptor:", file=sys.stderr)
+    print("  " + json.dumps(descriptor, sort_keys=True,
+                            separators=(",", ":")), file=sys.stderr)
     try:
         token = _approve_descriptor(cfg, descriptor, ttl=args.ttl)
     except ValueError as exc:
@@ -10130,6 +10188,10 @@ def main():
     p = sub.add_parser("owner-init",
                        help="create the mesh owner key on this machine and "
                             "print the trust block for the other members")
+    p.add_argument("--no-passphrase", action="store_true",
+                   help="create an UNPROTECTED owner key (tests/CI only) — "
+                        "any process that can read it, including an agent, "
+                        "can mint owner approvals unattended")
     p.set_defaults(fn=cmd_owner_init)
 
     p = sub.add_parser("owner-trust",
@@ -10139,6 +10201,9 @@ def main():
     p.add_argument("--unattended", action="store_true",
                    help="skip the terminal fingerprint check; also requires "
                         f"{OWNER_TRUST_UNATTENDED_ENV}=1")
+    p.add_argument("--replace", action="store_true",
+                   help="rotate: replace a different already-trusted owner "
+                        "key (confirm the new fingerprint out of band first)")
     p.set_defaults(fn=cmd_owner_trust)
 
     p = sub.add_parser("approve",

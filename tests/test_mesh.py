@@ -2930,7 +2930,7 @@ class SignedApprovalTests(unittest.TestCase):
         self.cfg = make_cfg(tmp.name)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            mesh._owner_init(self.cfg)
+            mesh._owner_init(self.cfg, allow_unprotected=True)
 
     def _descriptor(self, **overrides):
         value = {"action": "git-push+pr", "repo": "husker/a2acast",
@@ -2941,7 +2941,7 @@ class SignedApprovalTests(unittest.TestCase):
 
     def test_owner_init_refuses_a_second_owner(self):
         with self.assertRaisesRegex(ValueError, "owner"):
-            mesh._owner_init(self.cfg)
+            mesh._owner_init(self.cfg, allow_unprotected=True)
 
     def test_canonical_descriptor_is_key_order_independent(self):
         self.assertEqual(
@@ -2949,6 +2949,107 @@ class SignedApprovalTests(unittest.TestCase):
                 {"b": 1, "action": "x", "nonce": "n" * 16}),
             mesh._canonical_descriptor(
                 {"nonce": "n" * 16, "action": "x", "b": 1}))
+
+    @staticmethod
+    def _key_is_encrypted(path):
+        with open(path) as f:
+            body = "".join(l for l in f.read().splitlines()
+                           if "-----" not in l)
+        blob = base64.b64decode(body)
+        # OpenSSH key: magic then ciphername; "none" = unencrypted
+        return b"aes256-ctr" in blob[:64] and b"none" not in blob[:32]
+
+    def test_owner_init_default_key_is_passphrase_protected(self):
+        # #64 core: a passphrase-protected owner key cannot be used to mint
+        # without the passphrase, so an agent (no terminal) cannot sign.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(fresh, passphrase="correct horse")
+        key = mesh.owner_key_file(fresh)
+        self.assertTrue(self._key_is_encrypted(key), "owner key not encrypted")
+        # empirically: signing without the passphrase fails (no signature)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "DISPLAY")}
+        with open(os.path.join(other.name, "m"), "w") as f:
+            f.write("x")
+        r = subprocess.run(
+            [shutil.which("ssh-keygen"), "-Y", "sign", "-f", key,
+             "-n", "t", os.path.join(other.name, "m")],
+            capture_output=True, text=True, timeout=60,
+            stdin=subprocess.DEVNULL, env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(other.name, "m.sig")))
+
+    def test_owner_init_requires_passphrase_or_explicit_optout(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        with self.assertRaisesRegex(ValueError, "passphrase"):
+            mesh._owner_init(make_cfg(other.name))
+
+    def test_no_passphrase_creates_unprotected_key_with_warning(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh._owner_init(fresh, allow_unprotected=True)
+        self.assertFalse(self._key_is_encrypted(mesh.owner_key_file(fresh)))
+        self.assertIn("NO passphrase", out.getvalue())
+
+    def test_cmd_owner_init_without_terminal_refuses(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        cfg = make_cfg(other.name)
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_init(argparse.Namespace(no_passphrase=False))
+        self.assertIn("terminal", str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_key_file(cfg)))
+
+    def test_cmd_owner_init_prompts_and_encrypts(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        cfg = make_cfg(other.name)
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(mesh.getpass, "getpass",
+                                  return_value="a-good-pass"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_owner_init(argparse.Namespace(no_passphrase=False))
+        self.assertTrue(self._key_is_encrypted(mesh.owner_key_file(cfg)))
+
+    def test_owner_trust_replace_rotates_a_different_owner(self):
+        member = tempfile.TemporaryDirectory()
+        self.addCleanup(member.cleanup)
+        m = make_cfg(member.name)
+        m["id"] = self.cfg["id"]
+        block1 = mesh._owner_trust_block(self.cfg)
+        mesh._apply_owner_trust(m, block1)
+        foreign = make_cfg(tempfile.mkdtemp())
+        foreign["id"] = self.cfg["id"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(foreign, allow_unprotected=True)
+        block2 = mesh._owner_trust_block(foreign)
+        with self.assertRaisesRegex(ValueError, "different owner"):
+            mesh._apply_owner_trust(m, block2)                 # refuses
+        mesh._apply_owner_trust(m, block2, replace=True)       # rotates
+        self.assertEqual(mesh._load_owner_trust(m),
+                         mesh._parse_owner_trust_block(m, block2))
+
+    def test_approve_prints_the_descriptor(self):
+        descriptor = self._descriptor()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            mesh.cmd_approve(argparse.Namespace(
+                descriptor=json.dumps(descriptor), ttl=600))
+        self.assertIn("minting an owner approval", err.getvalue())
+        self.assertIn(descriptor["action"], err.getvalue())
 
     def test_approve_then_verify_round_trip(self):
         descriptor = self._descriptor()
@@ -2988,7 +3089,7 @@ class SignedApprovalTests(unittest.TestCase):
         foreign = make_cfg(other.name)
         foreign["id"] = self.cfg["id"]  # same mesh id, different owner key
         with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(foreign)
+            mesh._owner_init(foreign, allow_unprotected=True)
         descriptor = self._descriptor()
         forged = mesh._approve_descriptor(foreign, descriptor, ttl=600)
         ok, reason = mesh._verify_approval(self.cfg, descriptor, forged)
@@ -3040,7 +3141,7 @@ class SignedApprovalTests(unittest.TestCase):
         fresh = make_cfg(other.name)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            pub = mesh._owner_init(fresh)
+            pub = mesh._owner_init(fresh, allow_unprotected=True)
         self.assertIn(mesh._key_fingerprint(pub), out.getvalue())
 
     def test_parse_block_does_not_pin_anything(self):
@@ -3053,8 +3154,9 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertEqual(pub, mesh._load_owner_trust(self.cfg))
         self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
 
-    def _trust_args(self, block, unattended=False):
-        return argparse.Namespace(block=block, unattended=unattended)
+    def _trust_args(self, block, unattended=False, replace=False):
+        return argparse.Namespace(block=block, unattended=unattended,
+                                  replace=replace)
 
     def _member(self):
         tmp = tempfile.TemporaryDirectory()
@@ -3194,7 +3296,7 @@ class SignedApprovalTests(unittest.TestCase):
         foreign = make_cfg(other.name)
         foreign["id"] = self.cfg["id"]
         with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(foreign)
+            mesh._owner_init(foreign, allow_unprotected=True)
         block = mesh._owner_trust_block(foreign)
         with self.assertRaisesRegex(ValueError, "different owner"):
             mesh._apply_owner_trust(self.cfg, block)

@@ -8,6 +8,7 @@
   NON-ENFORCING — it surfaces a verdict and pins peers but drops no frame.
   Enforcement + the downgrade ratchet are still pending (#74). A node
   generates its key on first send, so upgrading an existing node is enough.
+- Owner keys are passphrase-protected by default (#64): minting an approval then needs the passphrase on the terminal, which a harnessed agent cannot answer — so an owner signature proves a human acted, not just that a process read the key. `owner-init --no-passphrase` keeps the old unprotected key (loudly warned); `owner-trust --replace` rotates the trusted owner key.
 - Owner-trust now prints a SHA256 fingerprint and requires a terminal
   confirmation before pinning; the owner private key's permissions are
   asserted (POSIX mode + Windows ACL).
