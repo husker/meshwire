@@ -2990,6 +2990,45 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(other.name, "m.sig")))
 
+    @unittest.skipUnless(
+        os.name == "posix" and os.environ.get("A2ACAST_AGENT_TEST") == "1"
+        and shutil.which("ssh-agent") and shutil.which("ssh-add"),
+        "integration: set A2ACAST_AGENT_TEST=1 (POSIX + ssh-agent) to run")
+    def test_agent_loaded_key_still_cannot_mint_integration(self):
+        # Preserves the METHOD that found the #64 bypass (imac): a passphrase
+        # owner key ssh-add'd to a live agent must STILL be refused, because
+        # minting scrubs SSH_AUTH_SOCK. Skipped by default — agent setup is
+        # flaky and no CI runner ssh-adds; the deterministic env-scrub test
+        # guards the regression in CI. Run explicitly to re-confirm the real
+        # behaviour after touching the signing env handling.
+        import re as _re
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        cfg = make_cfg(d)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(cfg, passphrase="s3cret")
+        ag = subprocess.run(["ssh-agent", "-s"], capture_output=True,
+                            text=True)
+        sock = _re.search(r"SSH_AUTH_SOCK=([^;]+)", ag.stdout).group(1)
+        pid = _re.search(r"SSH_AGENT_PID=([^;]+)", ag.stdout).group(1)
+        self.addCleanup(lambda: subprocess.run(
+            ["ssh-agent", "-k"],
+            env={**os.environ, "SSH_AUTH_SOCK": sock, "SSH_AGENT_PID": pid},
+            capture_output=True))
+        ap = os.path.join(d, "ap")
+        with open(ap, "w") as f:
+            f.write("#!/bin/sh\necho s3cret\n")
+        os.chmod(ap, 0o755)
+        subprocess.run(
+            ["ssh-add", mesh.owner_key_file(cfg)],
+            env={**os.environ, "SSH_AUTH_SOCK": sock, "SSH_ASKPASS": ap,
+                 "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": ":0"},
+            capture_output=True, stdin=subprocess.DEVNULL)
+        # agent live and holding the key; minting must STILL refuse
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": sock}):
+            with self.assertRaises(ValueError):
+                mesh._approve_descriptor(cfg, self._descriptor(), ttl=600)
+
     def test_minting_scrubs_ssh_agent_from_the_environment(self):
         # #64 BLOCKING fix (imac): an ssh-add'd owner key must not let
         # ssh-keygen mint without the passphrase via the agent. The minting
