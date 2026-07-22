@@ -120,7 +120,7 @@ BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
 # that reports a version derives from this so labels can't drift.
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
