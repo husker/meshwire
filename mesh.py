@@ -1359,29 +1359,52 @@ def _pinned_peer_key(cfg, node):
     return pub.strip() if isinstance(pub, str) and pub.strip() else None
 
 
+def _pins_lock_file(cfg):
+    suffix = hashlib.sha256(
+        os.path.abspath(pins_file(cfg)).encode()).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), "mw-pins-lock-" + suffix)
+
+
 def _bind_peer(cfg, node, pub):
     """Trust-on-first-use pin of node -> public key; returns the bound key.
 
     Raises ValueError when `node` is already pinned to a different key. Never
     a silent replace: the pin is the identity, so a changed key is either a
     rotation nobody authorised or an impersonation, and both must surface
-    rather than be adopted. Same shape as _apply_owner_trust's refusal."""
+    rather than be adopted. Same shape as _apply_owner_trust's refusal.
+
+    The read-check-write runs under a lock, re-reading the pin store inside
+    it. Without that, two processes first-contacting the same node
+    concurrently with DIFFERENT keys both see "no pin", both write, and last
+    wins -- which silently breaks the reject-a-different-key invariant at the
+    one moment it matters, the establishment boundary. Two harness agents
+    share one mesh directory (e.g. imac and imac-codex), so this race is
+    reachable here, not theoretical."""
     if not isinstance(pub, str) or not pub.strip():
         raise ValueError("peer key is empty")
     # Normalize to type+blob before anything else: a carried key's comment is
     # attacker-controlled and must never enter the store or a signers line.
     pub = _normalize_pubkey(pub)
-    pins = _load_pins(cfg)
-    existing = pins.get(node)
-    if isinstance(existing, str) and existing.strip():
-        if existing.strip() != pub:
-            raise ValueError(
-                f"peer '{node}' is already pinned to a different key; "
-                f"refusing to replace it")
-        return existing.strip()
-    pins[node] = pub
-    _write_json_secure(pins_file(cfg), pins)
-    return pub
+    lock = _acquire_path_lock(_pins_lock_file(cfg))
+    if lock is None:
+        raise RuntimeError("peer-pin lock is unavailable")
+    try:
+        pins = _load_pins(cfg)  # fresh read INSIDE the lock
+        existing = pins.get(node)
+        if isinstance(existing, str) and existing.strip():
+            if existing.strip() != pub:
+                raise ValueError(
+                    f"peer '{node}' is already pinned to a different key; "
+                    f"refusing to replace it")
+            return existing.strip()
+        pins[node] = pub
+        _write_json_secure(pins_file(cfg), pins)
+        return pub
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def _node_sig_message(cfg, relay_topic, timestamp, payload):

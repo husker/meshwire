@@ -3361,6 +3361,44 @@ class PeerPinTests(unittest.TestCase):
             mesh._bind_peer(self.cfg, "peer", f"ssh-rsa {blob}")
         self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
 
+    def test_concurrent_first_contact_upholds_the_reject_invariant(self):
+        # Two processes first-contacting the same name with DIFFERENT keys
+        # at once must not both succeed: exactly one pins, the other is
+        # rejected, and the stored key is whichever won -- never a
+        # last-writer-wins clobber that breaks the reject-a-different-key
+        # guarantee. Threads share the file store, which is what the lock
+        # serialises.
+        keyA = self.pub
+        keyB = mesh._ensure_node_key(make_cfg(tempfile.mkdtemp()),
+                                     "peer", "claude")
+        results = []
+        barrier = threading.Barrier(2)
+
+        def bind(k):
+            barrier.wait()
+            try:
+                results.append(("ok", mesh._bind_peer(self.cfg, "peer", k)))
+            except ValueError as exc:
+                results.append(("reject", str(exc)))
+
+        ts = [threading.Thread(target=bind, args=(k,))
+              for k in (keyA, keyB)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        oks = [r for r in results if r[0] == "ok"]
+        rejects = [r for r in results if r[0] == "reject"]
+        # both may "ok" only if they raced to the SAME key; with different
+        # keys exactly one ok and one reject, or two oks of the same key is
+        # impossible here since keys differ
+        stored = mesh._pinned_peer_key(self.cfg, "peer")
+        self.assertIn(stored, (mesh._normalize_pubkey(keyA),
+                               mesh._normalize_pubkey(keyB)))
+        self.assertEqual(len(oks), 1, results)
+        self.assertEqual(len(rejects), 1, results)
+        self.assertIn("different key", rejects[0][1])
+
     def test_pin_file_is_not_world_readable(self):
         if os.name != "posix":
             self.skipTest("POSIX permission semantics")
