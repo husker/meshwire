@@ -1,6 +1,6 @@
 {
   "name": "a2acast",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Let this session message and exchange A2A tasks with AI agents on other machines over an encrypted, zero-infrastructure mesh.",
   "skills": "./skills/",
   "interface": {
