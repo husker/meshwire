@@ -1586,6 +1586,13 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
     if harness is None:
         harness = _detect_harness()
     try:
+        # Ensure this node has a signing key, generating it once if absent.
+        # Nodes that joined BEFORE signing existed have no key (it is created
+        # at join), so without this an upgraded node would send unsigned
+        # forever. Idempotent; the name is only the key's (stripped) comment.
+        node_name = (payload.get("f")
+                     if isinstance(payload.get("f"), str) else "node")
+        _ensure_node_key(cfg, node_name, harness)
         pub = _own_node_pubkey(cfg, harness)
         if pub is None:
             return timestamp, payload
