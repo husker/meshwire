@@ -83,6 +83,8 @@ TASKS_NAME = ".meshwire.tasks.json"
 DELEGATE_TASKS_NAME = ".meshwire.delegate-tasks.{}.json"
 PEERS_NAME = ".meshwire.peers.json"
 REPLAY_NAME = ".meshwire.replay-{}.json"
+REPLAY_REVISIT_THRESHOLD = 20000  # #77: above this, the full-rewrite save is
+# worth measuring (~26ms); surfaced in `mesh status` so the trigger is visible
 STATUS_NAME = ".meshwire.status-{}.json"
 BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
@@ -992,17 +994,66 @@ def replay_file(cfg, node):
     return os.path.join(cfg["_dir"], REPLAY_NAME.format(node))
 
 
+def _prune_replays(replays, now=None):
+    """Drop fingerprints whose frame is older than WIRE_MAX_AGE -- the SAME
+    window decrypt enforces, so at that age decrypt already rejects a replay
+    on its timestamp and the fingerprint is redundant. Mutates in place and
+    returns it.
+
+    Time-based only, never size-based: evicting a fingerprint that is still
+    inside the window would reopen the replay hole for that exact frame. So
+    the ledger is bounded to WIRE_MAX_AGE of traffic, not to a count."""
+    if now is None:
+        now = int(time.time())
+    cutoff = now - WIRE_MAX_AGE
+    for fp in [fp for fp, ts in replays.items()
+               if not (isinstance(ts, int) and not isinstance(ts, bool)
+                       and ts >= cutoff)]:
+        del replays[fp]
+    return replays
+
+
 def load_replays(cfg, node):
+    """Return {fingerprint: message_ts}. The legacy on-disk form is a flat
+    list of bare fingerprints; migrate it by stamping each with now(). We
+    OVER-retain (by up to WIRE_MAX_AGE) rather than drop unknown-age entries:
+    dropping them would reopen the replay window for every frame captured in
+    the last WIRE_MAX_AGE, on every node, at upgrade."""
     try:
         with open(replay_file(cfg, node), "r", encoding="utf-8") as f:
-            values = json.load(f)
-        return set(values) if isinstance(values, list) else set()
+            value = json.load(f)
     except (OSError, ValueError):
-        return set()
+        return {}
+    now = int(time.time())
+    if isinstance(value, list):
+        replays = {fp: now for fp in value if isinstance(fp, str)}
+    elif isinstance(value, dict):
+        replays = {fp: ts for fp, ts in value.items()
+                   if isinstance(fp, str) and isinstance(ts, int)
+                   and not isinstance(ts, bool)}
+    else:
+        return {}
+    return _prune_replays(replays, now)
 
 
-def save_replays(cfg, node, values):
-    _write_json_secure(replay_file(cfg, node), sorted(values))
+def save_replays(cfg, node, replays):
+    """Persist {fingerprint: message_ts}, pruning expired entries in place so
+    both the file AND the caller's in-memory map stay bounded to WIRE_MAX_AGE
+    of traffic. A bare set/list of fingerprints is accepted too (stamped
+    now()), for callers that predate the timestamped form."""
+    if not isinstance(replays, dict):
+        replays = {fp: int(time.time()) for fp in replays}
+    _write_json_secure(replay_file(cfg, node), _prune_replays(replays))
+
+
+def _note_replay(replays, fingerprint, message_ts):
+    """Record a fingerprint against its frame's wire timestamp (for age-based
+    eviction), falling back to now() when the frame carried none -- which
+    only over-retains, never under-retains."""
+    replays[fingerprint] = (message_ts
+                            if isinstance(message_ts, int)
+                            and not isinstance(message_ts, bool)
+                            else int(time.time()))
 
 
 # -- signed approvals (#62) ----------------------------------------------
@@ -5859,7 +5910,7 @@ def _cmd_watch_owned(args, cfg, me):
         if not save_cursor(ev):
             continue
         if fingerprint:
-            replay_seen.add(fingerprint)
+            _note_replay(replay_seen, fingerprint, _wts)
             save_replays(cfg, me, replay_seen)
         if frm == me:
             continue  # own echo (e.g. broadcast)
@@ -6513,7 +6564,7 @@ class MeshMCPServer:
             since = et
             _write_json_secure(cf, {"since": et, "seen": seen[-50:]})
             if fingerprint:
-                replay_seen.add(fingerprint)
+                _note_replay(replay_seen, fingerprint, _wts)
                 save_replays(cfg, me, replay_seen)
             if frm == me:
                 continue
@@ -7596,6 +7647,11 @@ def cmd_status(args):
     print(f"config: {cfg['_path']}")
     if me:
         print(f"topic:  {topic(cfg, me)}")
+        held = len(load_replays(cfg, me))
+        hint = ("  (large — measure save_replays; see #77)"
+                if held > REPLAY_REVISIT_THRESHOLD else "")
+        print(f"replays: {held} held (bounded to {WIRE_MAX_AGE // 86400}d "
+              f"of traffic){hint}")
 
 
 def cmd_ping(args):

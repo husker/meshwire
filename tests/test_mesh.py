@@ -1719,9 +1719,9 @@ class WatchTests(MembershipCmdTests):
             self.assertEqual(json.load(f),
                              {"since": 200,
                               "seen": ["invalid-route-event"]})
-        self.assertEqual(
-            mesh.load_replays(mesh.load_config(), "alpha"),
-            {"invalid-plaintext-route-fingerprint"})
+        self.assertIn(
+            "invalid-plaintext-route-fingerprint",
+            mesh.load_replays(mesh.load_config(), "alpha"))
         self.assertEqual(err.getvalue().count(
             "dropped invalid A2A envelope"), 1)
         self.assertNotIn("MESH_TASK from=", out.getvalue())
@@ -3163,6 +3163,67 @@ class SignedApprovalTests(unittest.TestCase):
         block = mesh._owner_trust_block(foreign)
         with self.assertRaisesRegex(ValueError, "different owner"):
             mesh._apply_owner_trust(self.cfg, block)
+
+
+class ReplayLedgerTests(unittest.TestCase):
+    """Time-based bounding of the replay fingerprint ledger (#77). Evict on
+    the same WIRE_MAX_AGE window decrypt uses; migrate legacy lists without
+    dropping; never bound by size."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+
+    def test_note_roundtrip_keeps_timestamp(self):
+        now = int(mesh.time.time())
+        seen = mesh.load_replays(self.cfg, "alpha")
+        mesh._note_replay(seen, "fp1", now)
+        mesh.save_replays(self.cfg, "alpha", seen)
+        loaded = mesh.load_replays(self.cfg, "alpha")
+        self.assertIn("fp1", loaded)            # the receive-loop membership
+        self.assertEqual(loaded["fp1"], now)
+
+    def test_none_timestamp_falls_back_to_now(self):
+        seen = {}
+        mesh._note_replay(seen, "fp", None)     # legacy frame, no wire ts
+        self.assertGreaterEqual(seen["fp"], int(mesh.time.time()) - 5)
+
+    def test_expired_entry_is_evicted_on_save_and_load(self):
+        now = int(mesh.time.time())
+        seen = {"old": now - mesh.WIRE_MAX_AGE - 1, "fresh": now - 10}
+        mesh.save_replays(self.cfg, "alpha", seen)
+        self.assertNotIn("old", seen)           # pruned in place (memory)
+        self.assertIn("fresh", seen)
+        loaded = mesh.load_replays(self.cfg, "alpha")
+        self.assertNotIn("old", loaded)         # and on disk
+        self.assertIn("fresh", loaded)
+
+    def test_legacy_list_migrates_without_dropping(self):
+        # THE ships-green risk: a legacy flat list must NOT lose entries on
+        # upgrade, or a frame captured within WIRE_MAX_AGE stops being blocked.
+        mesh._write_json_secure(
+            mesh.replay_file(self.cfg, "alpha"), ["a", "b", "c"])
+        loaded = mesh.load_replays(self.cfg, "alpha")
+        self.assertEqual(set(loaded), {"a", "b", "c"})   # all retained
+        for ts in loaded.values():                       # stamped ~now
+            self.assertGreaterEqual(ts, int(mesh.time.time()) - 5)
+
+    def test_eviction_threshold_matches_decrypt_window(self):
+        # dropped exactly when now - ts > WIRE_MAX_AGE, so anything evicted is
+        # already rejected by decrypt on its timestamp -- never a reopen.
+        now = 1_000_000_000
+        pruned = mesh._prune_replays(
+            {"keep": now - mesh.WIRE_MAX_AGE,
+             "drop": now - mesh.WIRE_MAX_AGE - 1}, now)
+        self.assertIn("keep", pruned)
+        self.assertNotIn("drop", pruned)
+
+    def test_set_input_is_accepted_and_stamped(self):
+        # a legacy caller passing a bare set still works
+        mesh.save_replays(self.cfg, "alpha", {"x", "y"})
+        loaded = mesh.load_replays(self.cfg, "alpha")
+        self.assertEqual(set(loaded), {"x", "y"})
 
 
 class NodeSigningTests(unittest.TestCase):
