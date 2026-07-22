@@ -3271,6 +3271,19 @@ class NodeSigningTests(unittest.TestCase):
         # and laptop's own signature still verifies against the same pin
         self.assertTrue(self._verify(self._sign(), pub=malicious_pin))
 
+    def test_principal_is_not_in_the_signed_material(self):
+        # Why the constant-principal change is safe on every platform, not
+        # just the two we tested: SSHSIG signs the namespace and the message
+        # hash, never a principal, so no verifier anywhere can bind one. This
+        # is structural, not OS-specific. Guard it: the namespace appears in
+        # the signature bytes, the signer's name does not.
+        sig = self._sign()
+        body = "".join(l for l in sig.splitlines()
+                       if not l.startswith("---"))
+        blob = base64.b64decode(body)
+        self.assertIn(b"a2acast-node", blob)   # namespace is signed
+        self.assertNotIn(b"laptop", blob)       # principal is not
+
     def test_signature_is_not_the_carried_key_check(self):
         # Guard against the shape imac warned about: verifying against a key
         # the "message" supplies proves only internal consistency. Here a
@@ -3339,6 +3352,14 @@ class PeerPinTests(unittest.TestCase):
         self.assertNotIn("\n", stored)
         self.assertNotIn("INJECTED", stored)
         self.assertNotIn("innocent", stored)
+
+    def test_mislabeled_key_type_is_rejected_at_bind(self):
+        # ed25519 blob under a wrong type label: cannot inject, but as a pin
+        # it could only ever fail verification. Reject at bind, not at use.
+        blob = self.pub.split()[1]
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            mesh._bind_peer(self.cfg, "peer", f"ssh-rsa {blob}")
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "peer"))
 
     def test_pin_file_is_not_world_readable(self):
         if os.name != "posix":

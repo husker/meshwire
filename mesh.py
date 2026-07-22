@@ -1320,8 +1320,24 @@ def _normalize_pubkey(pub):
         blob = base64.b64decode(parts[1], validate=True)
     except (ValueError, TypeError) as exc:
         raise ValueError("public key is malformed") from exc
-    if not blob:
+    if len(blob) < 4:
         raise ValueError("public key is malformed")
+    # The type label must match the blob's own internal type string. A
+    # decodable-but-mislabeled key ("ssh-rsa <ed25519 blob>") does not inject
+    # -- the output is still two fields -- but stored as a pin it can only
+    # ever fail verification, taking that peer silently dark at use time far
+    # from the bind that caused it. Reject it here instead. [imac]
+    tlen = int.from_bytes(blob[:4], "big")
+    if tlen <= 0 or len(blob) < 4 + tlen:
+        raise ValueError("public key blob is malformed")
+    try:
+        inner_type = blob[4:4 + tlen].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("public key blob is malformed") from exc
+    if inner_type != parts[0]:
+        raise ValueError(
+            f"public key type '{parts[0]}' does not match its blob "
+            f"('{inner_type}')")
     return f"{parts[0]} {parts[1]}"
 
 
