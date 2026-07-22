@@ -2548,6 +2548,20 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
             self.assertIn("task from beta: build it", f.read())
 
+    def test_envelope_message_activity_line_shows_decoded_text(self):
+        # imac's PR-89 live seat, N3: an envelope-wrapped plain message must
+        # produce a decoded activity preview, not raw mw-envelope JSON --
+        # the MCP writer records decoded text and the writers must agree.
+        cfg = self._setup_mesh()
+        body = json.dumps({"mw": "message", "id": "env-msg-1",
+                           "intent": "inform",
+                           "text": "decoded wake preview"})
+        self._one_shot(self._msg_event(cfg, "beta", body, "n3", 208))
+        with open(mesh.activity_file(mesh.load_config(), "alpha")) as f:
+            line = f.read()
+        self.assertIn("message from beta: decoded wake preview", line)
+        self.assertNotIn('"mw"', line)
+
     def test_mcp_record_activity_uses_shared_line_format(self):
         self._setup_mesh()
         cfg = mesh.load_config()

@@ -6126,14 +6126,20 @@ def _cmd_watch_owned(args, cfg, me):
 
 
 def _activity_preview(body, kind):
-    """Preview text for an activity line: envelope text for tasks, the raw
-    body for plain messages."""
+    """Preview text for an activity line: decoded envelope text whenever the
+    body parses as one, raw body otherwise. Tasks and messages both decode --
+    the MCP writer records decoded text, and the two writers must agree
+    (imac's PR-89 live seat, N3)."""
     if kind in ("task", "task_update"):
         env = _parse_envelope(_sanitize_delivery_text(body))
         if env:
             details = _envelope_details(env)
             if details is not None:
                 return details[6]
+        return body
+    message = _message_details(body)
+    if message is not None:
+        return _sanitize_delivery_text(message["text"])
     return body
 
 
