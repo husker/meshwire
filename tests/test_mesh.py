@@ -1083,6 +1083,27 @@ class SendStatusInviteTests(MembershipCmdTests):
         self.assertNotIn("[attachment expired]", line)
         self.assertIn("title?=imac", line)         # crafted Title not an id
 
+    def test_peek_foreign_attachment_url_stays_unverified(self):
+        # #88: the benign expired-attachment label keys on the URL living on
+        # THIS mesh's relay -- a crafted row with an arbitrary attachment.url
+        # must keep the loud [UNVERIFIED] mark, not read as a dead payload.
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(".meshwire.json")
+        cfg["_dir"] = os.getcwd()
+        ev = {"event": "message", "id": "spoof-att", "time": 200,
+              "message": "You received a file: attachment.txt",
+              "attachment": {"url": "https://evil.example/loot.txt",
+                             "size": 5000}, "title": "devmesh"}
+        out = io.StringIO()
+        with mock.patch.object(mesh, "http",
+                               side_effect=urllib.error.URLError("nope")), \
+                contextlib.redirect_stdout(out):
+            mesh._print_peek_event(ev, cfg, "alpha")
+        line = out.getvalue()
+        self.assertIn("[UNVERIFIED]", line)
+        self.assertNotIn("[attachment expired]", line)
+        self.assertIn("title?=devmesh", line)      # crafted Title not an id
+
     def test_peek_learns_peers(self):
         cfg = self._write_cfg()
         cfg["_path"] = os.path.abspath(".meshwire.json")

@@ -7761,6 +7761,18 @@ def _peek_details(event, cfg, node):
     return frm, text, trusted, ctl
 
 
+def _attachment_from_relay(cfg, url):
+    """True only for attachment URLs served by this mesh's own relay. The
+    benign [attachment expired] downgrade must not be purchasable by a
+    crafted row carrying an arbitrary attachment.url (#88) -- only a
+    payload that genuinely lived on the configured relay can have expired
+    there."""
+    if not isinstance(url, str):
+        return False
+    server = (cfg.get("server") or "").rstrip("/")
+    return bool(server) and url.startswith(server + "/")
+
+
 def _print_peek_event(event, cfg, node, details=None):
     details = details or _peek_details(event, cfg, node)
     if details is None:
@@ -7772,7 +7784,8 @@ def _print_peek_event(event, cfg, node, details=None):
     ts = time.strftime("%Y-%m-%d %H:%M:%S",
                        time.localtime(relay_time))
     att = event.get("attachment")
-    has_attachment = isinstance(att, dict) and bool(att.get("url"))
+    has_attachment = (isinstance(att, dict) and
+                      _attachment_from_relay(cfg, att.get("url")))
     if trusted:
         mark = ""
     elif has_attachment:
