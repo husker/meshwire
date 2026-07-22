@@ -2930,7 +2930,7 @@ class SignedApprovalTests(unittest.TestCase):
         self.cfg = make_cfg(tmp.name)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            mesh._owner_init(self.cfg)
+            mesh._owner_init(self.cfg, allow_unprotected=True)
 
     def _descriptor(self, **overrides):
         value = {"action": "git-push+pr", "repo": "husker/a2acast",
@@ -2941,7 +2941,7 @@ class SignedApprovalTests(unittest.TestCase):
 
     def test_owner_init_refuses_a_second_owner(self):
         with self.assertRaisesRegex(ValueError, "owner"):
-            mesh._owner_init(self.cfg)
+            mesh._owner_init(self.cfg, allow_unprotected=True)
 
     def test_canonical_descriptor_is_key_order_independent(self):
         self.assertEqual(
@@ -2949,6 +2949,213 @@ class SignedApprovalTests(unittest.TestCase):
                 {"b": 1, "action": "x", "nonce": "n" * 16}),
             mesh._canonical_descriptor(
                 {"nonce": "n" * 16, "action": "x", "b": 1}))
+
+    @staticmethod
+    def _key_is_encrypted(path):
+        with open(path) as f:
+            body = "".join(l for l in f.read().splitlines()
+                           if "-----" not in l)
+        blob = base64.b64decode(body)
+        # OpenSSH key: magic then ciphername; "none" = unencrypted
+        return b"aes256-ctr" in blob[:64] and b"none" not in blob[:32]
+
+    def test_owner_init_default_key_is_passphrase_protected(self):
+        # #64 core: a passphrase-protected owner key cannot be used to mint
+        # without the passphrase, so an agent (no terminal) cannot sign.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(fresh, passphrase="correct horse")
+        key = mesh.owner_key_file(fresh)
+        # cross-platform: the key file itself is encrypted
+        self.assertTrue(self._key_is_encrypted(key), "owner key not encrypted")
+        if os.name != "posix":
+            # Windows ssh-keygen blocks on the console for the passphrase
+            # rather than failing fast when stdin is closed, so the empirical
+            # sign-fails probe would hang. _approve_descriptor's timeout
+            # handles that path in production; the encryption check above is
+            # the cross-platform guarantee.
+            return
+        # POSIX: signing with no passphrase available fails, no signature
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "DISPLAY")}
+        with open(os.path.join(other.name, "m"), "w") as f:
+            f.write("x")
+        r = subprocess.run(
+            [shutil.which("ssh-keygen"), "-Y", "sign", "-f", key,
+             "-n", "t", os.path.join(other.name, "m")],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, env=env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(other.name, "m.sig")))
+
+    @unittest.skipUnless(
+        os.name == "posix" and os.environ.get("A2ACAST_AGENT_TEST") == "1"
+        and shutil.which("ssh-agent") and shutil.which("ssh-add"),
+        "integration: set A2ACAST_AGENT_TEST=1 (POSIX + ssh-agent) to run")
+    def test_agent_loaded_key_still_cannot_mint_integration(self):
+        # Preserves the METHOD that found the #64 bypass (imac): a passphrase
+        # owner key ssh-add'd to a live agent must STILL be refused, because
+        # minting scrubs SSH_AUTH_SOCK. Skipped by default — agent setup is
+        # flaky and no CI runner ssh-adds; the deterministic env-scrub test
+        # guards the regression in CI. Run explicitly to re-confirm the real
+        # behaviour after touching the signing env handling.
+        import re as _re
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        cfg = make_cfg(d)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(cfg, passphrase="s3cret")
+        ag = subprocess.run(["ssh-agent", "-s"], capture_output=True,
+                            text=True)
+        sock = _re.search(r"SSH_AUTH_SOCK=([^;]+)", ag.stdout).group(1)
+        pid = _re.search(r"SSH_AGENT_PID=([^;]+)", ag.stdout).group(1)
+        self.addCleanup(lambda: subprocess.run(
+            ["ssh-agent", "-k"],
+            env={**os.environ, "SSH_AUTH_SOCK": sock, "SSH_AGENT_PID": pid},
+            capture_output=True))
+        ap = os.path.join(d, "ap")
+        with open(ap, "w") as f:
+            f.write("#!/bin/sh\necho s3cret\n")
+        os.chmod(ap, 0o755)
+        subprocess.run(
+            ["ssh-add", mesh.owner_key_file(cfg)],
+            env={**os.environ, "SSH_AUTH_SOCK": sock, "SSH_ASKPASS": ap,
+                 "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": ":0"},
+            capture_output=True, stdin=subprocess.DEVNULL)
+        # agent live and holding the key; minting must STILL refuse
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": sock}):
+            with self.assertRaises(ValueError):
+                mesh._approve_descriptor(cfg, self._descriptor(), ttl=600)
+
+    def test_minting_scrubs_ssh_agent_from_the_environment(self):
+        # #64 BLOCKING fix (imac): an ssh-add'd owner key must not let
+        # ssh-keygen mint without the passphrase via the agent. The minting
+        # subprocess env must exclude SSH_AUTH_SOCK / SSH_ASKPASS, or the one
+        # action a careful owner takes (ssh-add) silently defeats the whole
+        # feature while it still looks protected.
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            with open(cmd[-1] + ".sig", "w") as f:   # let _approve proceed
+                f.write("sig")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ,
+                             {"SSH_AUTH_SOCK": "/tmp/agent.sock",
+                              "SSH_ASKPASS": "/bin/askpass"}), \
+                mock.patch.object(mesh.subprocess, "run",
+                                  side_effect=fake_run):
+            mesh._approve_descriptor(self.cfg, self._descriptor(), ttl=600)
+        env = captured.get("env")
+        self.assertIsNotNone(env, "minting must pass an explicit env")
+        self.assertNotIn("SSH_AUTH_SOCK", env)
+        self.assertNotIn("SSH_ASKPASS", env)
+
+    def test_rotation_via_replace_still_requires_fingerprint_confirmation(self):
+        # #64 caveat 3: --replace allows replacing a DIFFERENT owner, but must
+        # NOT skip the terminal fingerprint confirmation.
+        member = self._member()
+        mesh._apply_owner_trust(member, mesh._owner_trust_block(self.cfg))
+        other = make_cfg(tempfile.mkdtemp())
+        other["id"] = self.cfg["id"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(other, allow_unprotected=True)
+        block2 = mesh._owner_trust_block(other)
+        with self._as_member(member), \
+                mock.patch.object(mesh, "_read_from_terminal",
+                                  return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(self._trust_args(block2, replace=True))
+        self.assertIn("terminal", str(caught.exception))
+        # rotation did NOT happen without confirmation: old owner still trusted
+        self.assertEqual(
+            mesh._load_owner_trust(member),
+            mesh._parse_owner_trust_block(
+                member, mesh._owner_trust_block(self.cfg)))
+
+    def test_approve_fails_closed_when_signing_times_out(self):
+        # An unattended mint against a passphrase-protected key must fail
+        # closed, not raise an unhandled TimeoutExpired (Windows blocks on the
+        # console rather than failing fast).
+        descriptor = self._descriptor()
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=mesh.subprocess.TimeoutExpired("ssh-keygen", 60)):
+            with self.assertRaisesRegex(ValueError, "present human"):
+                mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
+
+    def test_owner_init_requires_passphrase_or_explicit_optout(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        with self.assertRaisesRegex(ValueError, "passphrase"):
+            mesh._owner_init(make_cfg(other.name))
+
+    def test_no_passphrase_creates_unprotected_key_with_warning(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh._owner_init(fresh, allow_unprotected=True)
+        self.assertFalse(self._key_is_encrypted(mesh.owner_key_file(fresh)))
+        self.assertIn("NO passphrase", out.getvalue())
+
+    def test_cmd_owner_init_without_terminal_refuses(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        cfg = make_cfg(other.name)
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_init(argparse.Namespace(no_passphrase=False))
+        self.assertIn("terminal", str(caught.exception))
+        self.assertFalse(os.path.exists(mesh.owner_key_file(cfg)))
+
+    def test_cmd_owner_init_prompts_and_encrypts(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        cfg = make_cfg(other.name)
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(mesh.getpass, "getpass",
+                                  return_value="a-good-pass"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_owner_init(argparse.Namespace(no_passphrase=False))
+        self.assertTrue(self._key_is_encrypted(mesh.owner_key_file(cfg)))
+
+    def test_owner_trust_replace_rotates_a_different_owner(self):
+        member = tempfile.TemporaryDirectory()
+        self.addCleanup(member.cleanup)
+        m = make_cfg(member.name)
+        m["id"] = self.cfg["id"]
+        block1 = mesh._owner_trust_block(self.cfg)
+        mesh._apply_owner_trust(m, block1)
+        foreign = make_cfg(tempfile.mkdtemp())
+        foreign["id"] = self.cfg["id"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(foreign, allow_unprotected=True)
+        block2 = mesh._owner_trust_block(foreign)
+        with self.assertRaisesRegex(ValueError, "different owner"):
+            mesh._apply_owner_trust(m, block2)                 # refuses
+        mesh._apply_owner_trust(m, block2, replace=True)       # rotates
+        self.assertEqual(mesh._load_owner_trust(m),
+                         mesh._parse_owner_trust_block(m, block2))
+
+    def test_approve_prints_the_descriptor(self):
+        descriptor = self._descriptor()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            mesh.cmd_approve(argparse.Namespace(
+                descriptor=json.dumps(descriptor), ttl=600))
+        self.assertIn("minting an owner approval", err.getvalue())
+        self.assertIn(descriptor["action"], err.getvalue())
 
     def test_approve_then_verify_round_trip(self):
         descriptor = self._descriptor()
@@ -2988,7 +3195,7 @@ class SignedApprovalTests(unittest.TestCase):
         foreign = make_cfg(other.name)
         foreign["id"] = self.cfg["id"]  # same mesh id, different owner key
         with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(foreign)
+            mesh._owner_init(foreign, allow_unprotected=True)
         descriptor = self._descriptor()
         forged = mesh._approve_descriptor(foreign, descriptor, ttl=600)
         ok, reason = mesh._verify_approval(self.cfg, descriptor, forged)
@@ -3040,7 +3247,7 @@ class SignedApprovalTests(unittest.TestCase):
         fresh = make_cfg(other.name)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            pub = mesh._owner_init(fresh)
+            pub = mesh._owner_init(fresh, allow_unprotected=True)
         self.assertIn(mesh._key_fingerprint(pub), out.getvalue())
 
     def test_parse_block_does_not_pin_anything(self):
@@ -3053,8 +3260,9 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertEqual(pub, mesh._load_owner_trust(self.cfg))
         self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
 
-    def _trust_args(self, block, unattended=False):
-        return argparse.Namespace(block=block, unattended=unattended)
+    def _trust_args(self, block, unattended=False, replace=False):
+        return argparse.Namespace(block=block, unattended=unattended,
+                                  replace=replace)
 
     def _member(self):
         tmp = tempfile.TemporaryDirectory()
@@ -3194,7 +3402,7 @@ class SignedApprovalTests(unittest.TestCase):
         foreign = make_cfg(other.name)
         foreign["id"] = self.cfg["id"]
         with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(foreign)
+            mesh._owner_init(foreign, allow_unprotected=True)
         block = mesh._owner_trust_block(foreign)
         with self.assertRaisesRegex(ValueError, "different owner"):
             mesh._apply_owner_trust(self.cfg, block)
