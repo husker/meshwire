@@ -3217,7 +3217,8 @@ class SignedApprovalTests(unittest.TestCase):
             return
         # POSIX: signing with no passphrase available fails, no signature
         env = {k: v for k, v in os.environ.items()
-               if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "DISPLAY")}
+               if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS",
+                            "SSH_ASKPASS_REQUIRE", "DISPLAY")}
         with open(os.path.join(other.name, "m"), "w") as f:
             f.write("x")
         r = subprocess.run(
@@ -3283,7 +3284,9 @@ class SignedApprovalTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ,
                              {"SSH_AUTH_SOCK": "/tmp/agent.sock",
-                              "SSH_ASKPASS": "/bin/askpass"}), \
+                              "SSH_ASKPASS": "/bin/askpass",
+                              "SSH_ASKPASS_REQUIRE": "force",
+                              "DISPLAY": ":0"}), \
                 mock.patch.object(mesh.subprocess, "run",
                                   side_effect=fake_run):
             mesh._approve_descriptor(self.cfg, self._descriptor(), ttl=600)
@@ -3291,6 +3294,11 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertIsNotNone(env, "minting must pass an explicit env")
         self.assertNotIn("SSH_AUTH_SOCK", env)
         self.assertNotIn("SSH_ASKPASS", env)
+        # #87: DISPLAY alone reaches the compiled-in default askpass, and
+        # SSH_ASKPASS_REQUIRE=force mandates it -- production must scrub at
+        # least what the POSIX probe below models.
+        self.assertNotIn("SSH_ASKPASS_REQUIRE", env)
+        self.assertNotIn("DISPLAY", env)
 
     def test_rotation_via_replace_still_requires_fingerprint_confirmation(self):
         # #64 caveat 3: --replace allows replacing a DIFFERENT owner, but must

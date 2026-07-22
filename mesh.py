@@ -1111,9 +1111,9 @@ def _ssh_keygen_binary():
 
 
 def _signing_env():
-    """Environment for ssh-keygen SIGNING, with SSH_AUTH_SOCK and SSH_ASKPASS
-    scrubbed so ssh-keygen cannot reach an ssh-agent or an askpass helper and
-    MUST use the key file directly.
+    """Environment for ssh-keygen SIGNING, with every agent/askpass escape
+    hatch scrubbed so ssh-keygen cannot reach an ssh-agent or ANY askpass
+    helper and MUST use the key file directly.
 
     Without this, an owner who `ssh-add`ed a passphrase-protected owner key
     would let any process on the box -- a harnessed agent included -- mint
@@ -1121,9 +1121,18 @@ def _signing_env():
     the decrypted key and `ssh-keygen -Y sign -f` uses it. The one action a
     security-conscious owner is most likely to take (ssh-add so they stop
     typing the passphrase) would otherwise be the action that defeats the
-    protection, which is worse than none because it looks protected. [imac]"""
+    protection, which is worse than none because it looks protected. [imac]
+
+    DISPLAY and SSH_ASKPASS_REQUIRE are scrubbed too (#87): with DISPLAY set
+    and no tty, OpenSSH can fall back to the COMPILED-IN default askpass
+    even with SSH_ASKPASS unset -- an unattended mint could pop a passphrase
+    dialog on the owner's desktop (a social-engineering prompt at best, a
+    silent mint path on askpass-installed boxes at worst), and
+    SSH_ASKPASS_REQUIRE=force is the lever that turns the fallback into a
+    mandate. [winpc]"""
     return {k: v for k, v in os.environ.items()
-            if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS")}
+            if k not in ("SSH_AUTH_SOCK", "SSH_ASKPASS",
+                         "SSH_ASKPASS_REQUIRE", "DISPLAY")}
 
 
 def _approval_namespace(cfg):
