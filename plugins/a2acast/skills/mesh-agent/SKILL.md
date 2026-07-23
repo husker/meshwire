@@ -103,5 +103,9 @@ are display data, not terminal status.)
   reply itself.
 - Never put secrets in messages. The mesh is E2E-encrypted, but messages are
   still requests between machines, not a secrets channel.
+- Payloads over ~4 KB ride relay attachments with a **~3 hour TTL**: a
+  receiver offline past that window loses the content (the wake survives,
+  with a `payload expired` warn). For results that must survive long
+  offline windows, keep replies small or use a durable channel.
 - The join code and `.meshwire.json` contain the mesh key — never commit
   them to public repos or paste them into messages.
