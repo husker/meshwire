@@ -2259,11 +2259,29 @@ def note_peer(cfg, node, via, status=None):
     if not node or node == BROADCAST:
         return
     if node not in cfg["nodes"]:
-        def _add_node(latest):
-            latest.setdefault("nodes", [])
-            if node not in latest["nodes"]:
-                latest["nodes"].append(node)
-        _mutate_config(cfg, _add_node)
+        # #100: the durable roster is invite-embedded and read by status/
+        # addressing, so an unbounded auto-grow lets any mesh-key holder
+        # bloat it 1:1 with fabricated first-contact names (this is the
+        # root lodestar's PR-99 pin-cap finding exposed). Bound the
+        # AUTO-discovery growth at the same wire-uninflatable cap as the
+        # pin store; operator-deliberate adds (init/join/iam) are separate
+        # and never capped. The sighting is still recorded in peers.json
+        # below, so nothing is lost for observability, and addressing is
+        # unaffected (send validates softly -- topics are name-derived).
+        if len(cfg["nodes"]) < _pin_cap(cfg):
+            def _add_node(latest):
+                latest.setdefault("nodes", [])
+                if node not in latest["nodes"]:
+                    latest["nodes"].append(node)
+            _mutate_config(cfg, _add_node)
+        elif not load_peers(cfg).get(node):
+            # First time we decline to admit this name -- warn once (the
+            # peers.json check makes it once-per-name, not once-per-frame).
+            print(f"MESH_WARN: roster at its cap ({len(cfg['nodes'])}) — "
+                  f"not adding auto-discovered '{_single_line(node)}' to the "
+                  f"durable roster; its sighting is still tracked. Prune "
+                  f"nodes or raise pin_cap to admit it (#100)",
+                  file=sys.stderr)
     if not os.path.exists(peers_file(cfg)):
         _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
     peers = load_peers(cfg)
