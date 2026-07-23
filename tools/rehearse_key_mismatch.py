@@ -25,14 +25,20 @@ through the actual chain -- `_sign_wrapper_payload` -> `_frame_verdict` ->
 `_verify_frame` -> `_handle_control` -- so the mismatch comes from a genuine
 cryptographic key conflict.
 
-Both arms run, and both must hold:
+Three arms run, and all must hold:
 
-  attack  key B signs as `victim`  -> FRAME_MISMATCH -> KEY_MISMATCH
-  control key A signs as `victim`  -> FRAME_VERIFIED -> WOULD_MIGRATE
+  attack      key B signs as `victim`        -> FRAME_MISMATCH -> KEY_MISMATCH
+  control     key A signs as `victim`        -> FRAME_VERIFIED -> WOULD_MIGRATE
+  forged hint key B signs, hint claims key A -> FRAME_MISMATCH -> KEY_MISMATCH
 
-The control arm is not decoration. Without it, a verifier that returned
-`mismatch` unconditionally would pass the attack arm and the rehearsal would
-be theatre.
+None of the three is decoration. Without the control arm, a verifier that
+returned `mismatch` unconditionally would pass the attack arm. Without the
+forged-hint arm, a verifier that compared the CARRIED HINT to the pin and
+never checked a signature would pass both of the others -- key identity
+discriminated correctly, crypto entirely gutted. The third arm is the only
+one that pins the invariant the whole scheme rests on: verification runs
+against the pin for the claimed name, never against anything the frame
+carried.
 
 SAFETY
 ------
@@ -86,14 +92,20 @@ def _fpr(pub):
     return mesh._key_fingerprint(mesh._normalize_pubkey(pub))
 
 
-def _run_arm(receiver, signer, frame_id):
+def _run_arm(receiver, signer, frame_id, forged_hint=None):
     """Sign a rename control frame AS `victim` with `signer`'s key, then run
-    it through the real receive path. Returns (verdict, stderr_text)."""
+    it through the real receive path. Returns (verdict, stderr_text).
+
+    `forged_hint` overwrites the carried public-key hint `k` after signing.
+    A real forger controls that field, so a receiver must never treat it as
+    evidence -- verification runs against the PIN for the claimed name."""
     ctl = {"mw": "rename", "new": CLAIMED_NEW, "ts": 1784847000}
     payload = {"f": VICTIM, "t": mesh.BROADCAST,
                "b": "%s is now %s" % (VICTIM, CLAIMED_NEW), "c": ctl}
     wire_ts, signed = mesh._sign_wrapper_payload(
         signer, mesh.BROADCAST, payload, harness="claude")
+    if forged_hint is not None:
+        signed["k"] = forged_hint
     ev = {"id": frame_id, "topic": mesh.topic(receiver, mesh.BROADCAST)}
     verdict = mesh._frame_verdict(
         receiver, signed["f"], signed["t"], signed["b"], signed.get("c"),
@@ -171,7 +183,33 @@ def rehearse(out=sys.stdout, keep=False):
                 failures.append("control arm: leaked %s" % token)
         say()
 
-        # ---- Ph1 purity: neither arm may mutate durable state ----
+        # ---- arm 3: forged key hint (bastion, PR-109 seat) ----
+        # Arms 1 and 2 prove the harness discriminates by KEY IDENTITY, but
+        # NOT that it checks SIGNATURE BYTES: a regression replacing
+        # _verify_node_sig with `carried hint == pin` passes both (attack
+        # B!=A -> mismatch, control A==A -> verified) while the crypto is
+        # gutted. This arm is the one that catches it. The attacker signs
+        # with key B and then LIES in the carried hint, claiming key A --
+        # which a real forger can do freely, since `k` is just a wrapper
+        # field. Only verifying the signature against the PIN rejects it.
+        say("--- ARM 3: key B signs, carried hint forged to claim key A ---")
+        verdict3, log3 = _run_arm(receiver, attacker,
+                                  "rehearsal-forgedhint-0003",
+                                  forged_hint=key_a)
+        say("derived verdict      : %r" % verdict3)
+        for line in (log3.strip().splitlines() or ["(no verdict warning)"]):
+            say("  %s" % line)
+        if verdict3 != mesh.FRAME_MISMATCH:
+            failures.append(
+                "forged-hint arm: verdict %r, want FRAME_MISMATCH -- the "
+                "receiver trusted the carried hint over the pin" % verdict3)
+        if "KEY_MISMATCH" not in log3:
+            failures.append("forged-hint arm: no KEY_MISMATCH evidence line")
+        if "WOULD_MIGRATE" in log3:
+            failures.append("forged-hint arm: leaked WOULD_MIGRATE")
+        say()
+
+        # ---- Ph1 purity: no arm may mutate durable state ----
         say("--- Ph1 purity: did either arm mutate the pin store? ---")
         pins = mesh._load_pins(receiver)
         say("  %s still pinned to key A : %s"
@@ -192,7 +230,8 @@ def rehearse(out=sys.stdout, keep=False):
             say("REHEARSAL RESULT: PASS")
         return {"ok": not failures, "root": root, "failures": failures,
                 "attack": {"verdict": verdict, "log": log},
-                "control": {"verdict": verdict2, "log": log2}}
+                "control": {"verdict": verdict2, "log": log2},
+                "forged_hint": {"verdict": verdict3, "log": log3}}
     finally:
         if not keep:
             shutil.rmtree(root, ignore_errors=True)
