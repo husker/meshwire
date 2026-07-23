@@ -3200,6 +3200,22 @@ class RegularReadonlyFallbackTests(unittest.TestCase):
         self.assertTrue(mesh._preflight_worker_evidence(cfg))
 
 
+def make_protected_owner_key(cfg, passphrase):
+    """Test-only stand-in for the F3 interactive ceremony. Production
+    _owner_init NEVER takes a passphrase and never puts one on argv (#87
+    F3); tests mint throwaway protected keys directly so the empirical
+    #64 assertions (key encrypted, sign-fails-without-passphrase) still
+    run against real ssh-keygen output."""
+    key = mesh.owner_key_file(cfg)
+    subprocess.run(
+        [shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+         "-N", passphrase, "-C", "test-owner", "-f", key],
+        check=True, capture_output=True, timeout=60)
+    with open(key + ".pub", "r", encoding="utf-8") as f:
+        pub = f.read().strip()
+    mesh._write_json_secure(mesh.owner_trust_file(cfg), {"owner_pub": pub})
+
+
 class SignedApprovalTests(unittest.TestCase):
     """Portable owner-signed approvals (#62): a token must prove origin
     (owner signature), authority (owner key from the trust store), and
@@ -3252,8 +3268,7 @@ class SignedApprovalTests(unittest.TestCase):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
         fresh = make_cfg(other.name)
-        with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(fresh, passphrase="correct horse")
+        make_protected_owner_key(fresh, "correct horse")
         key = mesh.owner_key_file(fresh)
         # cross-platform: the key file itself is encrypted
         self.assertTrue(self._key_is_encrypted(key), "owner key not encrypted")
@@ -3293,8 +3308,7 @@ class SignedApprovalTests(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         cfg = make_cfg(d)
-        with contextlib.redirect_stdout(io.StringIO()):
-            mesh._owner_init(cfg, passphrase="s3cret")
+        make_protected_owner_key(cfg, "s3cret")
         ag = subprocess.run(["ssh-agent", "-s"], capture_output=True,
                             text=True)
         sock = _re.search(r"SSH_AUTH_SOCK=([^;]+)", ag.stdout).group(1)
@@ -3383,11 +3397,59 @@ class SignedApprovalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "present human"):
                 mesh._approve_descriptor(self.cfg, descriptor, ttl=600)
 
-    def test_owner_init_requires_passphrase_or_explicit_optout(self):
+    def test_owner_init_protected_path_keeps_argv_clean(self):
+        # #87 F3: the protected path never passes -N (no secret on argv),
+        # inherits stdio for the prompt, uses the scrubbed signing env so
+        # no askpass can intercept, and allows human typing time.
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
-        with self.assertRaisesRegex(ValueError, "passphrase"):
-            mesh._owner_init(make_cfg(other.name))
+        fresh = make_cfg(other.name)
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            with open(mesh.owner_key_file(fresh), "w") as f:
+                f.write("key")
+            with open(mesh.owner_key_file(fresh) + ".pub", "w") as f:
+                f.write("ssh-ed25519 AAAA test")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(mesh.subprocess, "run",
+                               side_effect=fake_run), \
+                mock.patch.object(mesh, "_owner_key_is_passphraseless",
+                                  return_value=False), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(fresh)
+        self.assertNotIn("-N", seen["cmd"])
+        self.assertNotIn("capture_output", seen["kw"])   # stdio inherited
+        self.assertEqual(seen["kw"].get("timeout"), 300)
+        self.assertNotIn("DISPLAY", seen["kw"].get("env", {"DISPLAY": 1}))
+
+    def test_owner_init_deletes_key_minted_with_empty_passphrase(self):
+        # #87 F3: passthrough cannot pre-validate non-emptiness; an empty
+        # passphrase at the prompt must not leave a passphraseless owner
+        # key behind (#64) -- probe, delete, and fail loudly.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+
+        def fake_run(cmd, **kw):
+            with open(mesh.owner_key_file(fresh), "w") as f:
+                f.write("key")
+            with open(mesh.owner_key_file(fresh) + ".pub", "w") as f:
+                f.write("ssh-ed25519 AAAA test")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(mesh.subprocess, "run",
+                               side_effect=fake_run), \
+                mock.patch.object(mesh, "_owner_key_is_passphraseless",
+                                  return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "WITHOUT a passphrase"):
+                mesh._owner_init(fresh)
+        self.assertFalse(os.path.exists(mesh.owner_key_file(fresh)))
+        self.assertFalse(os.path.exists(mesh.owner_key_file(fresh) + ".pub"))
 
     def test_no_passphrase_creates_unprotected_key_with_warning(self):
         other = tempfile.TemporaryDirectory()
@@ -3411,17 +3473,22 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertIn("terminal", str(caught.exception))
         self.assertFalse(os.path.exists(mesh.owner_key_file(cfg)))
 
-    def test_cmd_owner_init_prompts_and_encrypts(self):
+    def test_cmd_owner_init_delegates_prompting_to_keygen(self):
+        # #87 F3: cmd_owner_init no longer reads a passphrase itself -- with
+        # a terminal it announces the handoff and calls _owner_init in
+        # protected mode; ssh-keygen owns the prompt from there.
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
         cfg = make_cfg(other.name)
+        out = io.StringIO()
         with mock.patch.object(mesh, "load_config", return_value=cfg), \
                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
-                mock.patch.object(mesh.getpass, "getpass",
-                                  return_value="a-good-pass"), \
-                contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(mesh, "_owner_init") as init, \
+                contextlib.redirect_stdout(out):
             mesh.cmd_owner_init(argparse.Namespace(no_passphrase=False))
-        self.assertTrue(self._key_is_encrypted(mesh.owner_key_file(cfg)))
+        init.assert_called_once_with(cfg, allow_unprotected=False)
+        self.assertIn("ssh-keygen will prompt", out.getvalue())
+        self.assertNotIn("Owner key passphrase", out.getvalue())
 
     def test_owner_trust_replace_rotates_a_different_owner(self):
         member = tempfile.TemporaryDirectory()
@@ -3558,6 +3625,51 @@ class SignedApprovalTests(unittest.TestCase):
     def _trust_args(self, block, unattended=False, replace=False):
         return argparse.Namespace(block=block, unattended=unattended,
                                   replace=replace)
+
+    def _assert_replace_refused_pre_io(self, args, env):
+        # #87 F2: the refusal must fire before ANY config or trust-file
+        # read/write -- prove it by making every I/O entry explode.
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(mesh, "load_config",
+                                  side_effect=AssertionError("config read")), \
+                mock.patch.object(mesh, "_load_owner_trust",
+                                  side_effect=AssertionError("trust read")), \
+                mock.patch.object(mesh, "_apply_owner_trust",
+                                  side_effect=AssertionError("trust write")):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(args)
+        self.assertIn("unattended posture", str(caught.exception))
+
+    def test_replace_refuses_with_unattended_flag_alone(self):
+        env = {k: v for k, v in os.environ.items()}
+        env.pop(mesh.OWNER_TRUST_UNATTENDED_ENV, None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self._assert_replace_refused_pre_io(
+                self._trust_args("block", unattended=True, replace=True), {})
+
+    def test_replace_refuses_with_armed_env_alone(self):
+        # The env var alone arms an unattended POSTURE even without the
+        # flag -- rotation must refuse on it (#87 F2's sharpest case).
+        self._assert_replace_refused_pre_io(
+            self._trust_args("block", unattended=False, replace=True),
+            {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"})
+
+    def test_replace_refuses_with_flag_and_env_together(self):
+        self._assert_replace_refused_pre_io(
+            self._trust_args("block", unattended=True, replace=True),
+            {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"})
+
+    def test_replace_refusal_ignores_byte_identical_trust_content(self):
+        # Refusal is about POSTURE, not content: even a block byte-identical
+        # to the already-trusted owner (the no-change fast path) must refuse
+        # before it is ever read or compared.
+        member = self._member()
+        mesh._apply_owner_trust(member, mesh._owner_trust_block(self.cfg))
+        same_block = mesh._owner_trust_block(self.cfg)
+        with self._as_member(member):
+            self._assert_replace_refused_pre_io(
+                self._trust_args(same_block, unattended=False, replace=True),
+                {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"})
 
     def _member(self):
         tmp = tempfile.TemporaryDirectory()
