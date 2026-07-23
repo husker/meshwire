@@ -2324,19 +2324,30 @@ def _note_revocation(cfg, body):
     _write_json_secure(revocations_file(cfg), store)
 
 
-def _key_revoked(cfg, pubkey):
-    """The revocation body for a key, or None. Read-only observability."""
+def _revocation_status(cfg, pubkey):
+    """'revoked', 'clean', or 'unknown'. Read-only.
+
+    'unknown' means the revocation store EXISTS but could not be read
+    (corrupt/oversize) -- we cannot prove the key is NOT revoked, so this
+    must FAIL SHUT downstream, never read as clean (lodestar B2). An ABSENT
+    store is 'clean' -- there genuinely are no revocations yet, the common
+    Phase A case; staleness of a present-but-behind view is the epoch gate's
+    job once distribution lands, not this function's."""
     try:
         fpr = _key_fingerprint(_normalize_pubkey(pubkey))
     except (ValueError, TypeError):
-        return None
+        return "clean"
+    path = revocations_file(cfg)
+    if not os.path.exists(path):
+        return "clean"
     try:
-        store = _load_json_regular(revocations_file(cfg),
-                                   require_private=False,
+        store = _load_json_regular(path, require_private=False,
                                    max_bytes=CERT_BLOCK_MAX * 64)
-    except (FileNotFoundError, OSError, ValueError):
-        return None
-    return store.get(fpr) if isinstance(store, dict) else None
+    except (OSError, ValueError):
+        return "unknown"
+    if not isinstance(store, dict):
+        return "unknown"
+    return "revoked" if fpr in store else "clean"
 
 
 def _report_cert_status(cfg, frm, pubkey):
@@ -2344,11 +2355,20 @@ def _report_cert_status(cfg, frm, pubkey):
     frame. Never affects delivery; this line is the soak evidence."""
     if not pubkey:
         return
-    if _key_revoked(cfg, pubkey) is not None:
+    rev = _revocation_status(cfg, pubkey)
+    if rev == "revoked":
         # Highest-priority signal: the owner has revoked this key. Log-only
         # in Phase A -- the frame still delivers -- but this is the line the
         # enforcement ratchet (#74) will one day act on.
         print(f"MESH_CERT from={_single_line(frm)} CERT_REVOKED",
+              file=sys.stderr)
+        return
+    if rev == "unknown":
+        # Fail SHUT (lodestar B2): the revocation store exists but is
+        # unreadable, so we cannot prove this key is clean. Never fall
+        # through to a clean-looking cert status -- report the failure.
+        print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
+              f"(revocation store unreadable — cannot confirm not-revoked)",
               file=sys.stderr)
         return
     body = _cert_for_key(cfg, pubkey)
@@ -6509,6 +6529,16 @@ def _handle_control(cfg, me, frm, ctl, verdict=None):
             print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
                   f"WOULD_MIGRATE (key-verified; Phase A log-only, pin NOT "
                   f"migrated)", file=sys.stderr)
+        elif verdict == FRAME_MISMATCH:
+            # A DIFFERENT key than the one pinned for `old` is asking the
+            # fleet to carry old's identity to `new` -- the exact
+            # impersonation shape #93 exists to catch. Phase A's whole
+            # product is evidence, so this cannot read as generic unverified
+            # chatter (lodestar B1); it is the attack-path event the #62
+            # soak bar requires witnessing.
+            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
+                  f"KEY_MISMATCH (pin conflict — possible impersonation)",
+                  file=sys.stderr)
         else:
             print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
                   f"UNVERIFIED_SOURCE (ignored — not a proven key-continuity "

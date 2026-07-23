@@ -3048,6 +3048,49 @@ class MemberCertTests(unittest.TestCase):
         self.assertEqual(mesh._load_pins(self.cfg), pins_before)
         self.assertNotIn("beta-new", mesh._load_pins(self.cfg))
 
+    def test_rename_key_mismatch_is_a_distinct_impersonation_signal(self):
+        # lodestar B1: a rename frame whose key MISMATCHES the pin for `old`
+        # is the impersonation shape #93 catches -- it must NOT flatten into
+        # the generic UNVERIFIED_SOURCE token, or the soak accrues
+        # clean-by-blindness days.
+        ctl = {"mw": "rename", "old": "beta", "new": "beta-evil", "ts": 1}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "alpha", "beta", ctl,
+                                 verdict=mesh.FRAME_MISMATCH)
+        out = err.getvalue()
+        self.assertIn("KEY_MISMATCH", out)
+        self.assertIn("impersonation", out)
+        self.assertNotIn("UNVERIFIED_SOURCE", out)
+        self.assertNotIn("WOULD_MIGRATE", out)
+
+    def test_revoked_status_fails_shut_on_unreadable_store(self):
+        # lodestar B2: a revoked key whose revocation store is corrupt must
+        # NOT read as clean -- CERT_REVCHECK_FAILED, never CERT_OK. The cert
+        # path's identical corruption fails to CERT_MISSING (already shut),
+        # but the revocation path must not fall through to it.
+        pub = self._node_pubkey()
+        cert = mesh._mint_member_cert(self.cfg, "beta", pub)
+        _, _, cbody = mesh._verify_member_cert(self.cfg, cert)
+        mesh._note_cert(self.cfg, cbody)   # would otherwise say CERT_OK
+        # a present-but-corrupt revocation store
+        with open(mesh.revocations_file(self.cfg), "w") as f:
+            f.write("{ this is not json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._report_cert_status(self.cfg, "beta", pub)
+        out = err.getvalue()
+        self.assertIn("CERT_REVCHECK_FAILED", out)
+        self.assertNotIn("CERT_OK", out)
+        self.assertNotIn("CERT_REVOKED", out)
+        # sanity: an ABSENT store is clean (no revocations yet), so the cert
+        # status shows through
+        os.remove(mesh.revocations_file(self.cfg))
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            mesh._report_cert_status(self.cfg, "beta", pub)
+        self.assertIn("CERT_OK", err2.getvalue())
+
     def test_cert_mint_requires_a_pinned_key(self):
         with mock.patch.object(mesh, "load_config",
                                return_value=self.cfg), \
