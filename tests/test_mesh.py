@@ -1083,6 +1083,55 @@ class SendStatusInviteTests(MembershipCmdTests):
         self.assertNotIn("[attachment expired]", line)
         self.assertIn("title?=imac", line)         # crafted Title not an id
 
+    def _ctl_event(self, cfg, frm, ctl, eid, t, to=mesh.BROADCAST):
+        payload = {"f": frm, "t": to, "b": f"{frm} joined the mesh",
+                   "c": ctl}
+        return {"event": "message", "id": eid, "time": t,
+                "message": mesh.encrypt(cfg, json.dumps(payload))}
+
+    def test_await_join_announce_returns_joining_node(self):
+        cfg = self._write_cfg()
+        ev = self._ctl_event(cfg, "newnode", {"mw": "announce"}, "j1", 300)
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])):
+            self.assertEqual(
+                mesh._await_join_announce(cfg, "alpha", timeout=5),
+                "newnode")
+
+    def test_await_join_announce_ignores_noise_and_own_announce(self):
+        cfg = self._write_cfg()
+        evs = [
+            # ordinary message: not an announce
+            {"event": "message", "id": "m1", "time": 301,
+             "message": mesh.encrypt(cfg, json.dumps(
+                 {"f": "beta", "t": mesh.BROADCAST, "b": "hello"}))},
+            # our own announce echo: not a JOINING node
+            self._ctl_event(cfg, "alpha", {"mw": "announce"}, "j2", 302),
+        ]
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter(evs)):
+            self.assertIsNone(
+                mesh._await_join_announce(cfg, "alpha", timeout=5))
+
+    def test_invite_waits_only_in_a_terminal(self):
+        self._write_cfg()
+        with mock.patch.object(mesh, "_interactive", return_value=False), \
+                mock.patch.object(mesh, "_await_join_announce") as wait, \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_invite(argparse.Namespace())
+        wait.assert_not_called()
+
+    def test_invite_confirms_observed_join(self):
+        self._write_cfg()
+        out = io.StringIO()
+        with mock.patch.object(mesh, "_interactive", return_value=True), \
+                mock.patch.object(mesh, "_await_join_announce",
+                                  return_value="newnode"), \
+                contextlib.redirect_stdout(out):
+            mesh.cmd_invite(argparse.Namespace())
+        self.assertIn("MESH_NODE_JOINED node=newnode", out.getvalue())
+        self.assertIn("join confirmed", out.getvalue())
+
     def test_peek_foreign_attachment_url_stays_unverified(self):
         # #88: the benign expired-attachment label keys on the URL living on
         # THIS mesh's relay -- a crafted row with an arbitrary attachment.url
