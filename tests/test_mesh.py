@@ -2602,6 +2602,43 @@ class WakeHookCheckpointTests(MembershipCmdTests):
                 timeout=60, as_node=None, follow=False))
         return out, err
 
+    def test_oversize_send_warns_about_attachment_ttl(self):
+        # #66: past the relay's inline limit the payload rides a ~3h-TTL
+        # attachment -- the sender must know durability just changed.
+        cfg = self._setup_mesh()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_post",
+                               return_value={"id": "x"}), \
+                contextlib.redirect_stderr(err):
+            mesh.send_raw(cfg, "alpha", "beta", "x" * 5000)
+        self.assertIn("~3h TTL", err.getvalue())
+        err2 = io.StringIO()
+        with mock.patch.object(mesh, "_post",
+                               return_value={"id": "y"}), \
+                contextlib.redirect_stderr(err2):
+            mesh.send_raw(cfg, "alpha", "beta", "small")
+        self.assertNotIn("TTL", err2.getvalue())
+
+    def test_expired_attachment_fetch_warns_and_signals_activity(self):
+        # #66: a failed fetch of a genuine relay attachment is the
+        # durability cliff, not a decrypt problem -- distinct warn plus an
+        # activity line a wake hook can surface.
+        self._setup_mesh()
+        cfg = mesh.load_config()
+        url = f"{cfg['server']}/{mesh.topic(cfg, 'alpha')}/att.txt"
+        ev = {"event": "message", "id": "e66", "time": 400,
+              "message": "You received a file: att.txt",
+              "attachment": {"url": url, "size": 5000}}
+        err = io.StringIO()
+        with mock.patch.object(mesh, "http",
+                               side_effect=urllib.error.URLError("gone")), \
+                contextlib.redirect_stderr(err):
+            got = mesh._unwrap(ev, cfg, node="alpha")
+        self.assertEqual(got, "You received a file: att.txt")
+        self.assertIn("expired or unreachable", err.getvalue())
+        with open(mesh.activity_file(cfg, "alpha")) as f:
+            self.assertIn("expired on the relay", f.read())
+
     def test_watch_delivery_appends_activity_line(self):
         cfg = self._setup_mesh()
         self._one_shot(self._msg_event(cfg, "beta", "hello there", "a1", 201))

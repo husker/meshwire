@@ -182,6 +182,14 @@ In a terminal, `init` and `join` flow straight into that watcher when they
 finish — programs calling mesh (scripts, agent harnesses; anything without
 a TTY) get the plain return-immediately behavior instead.
 
+**Message durability depends on size.** Messages under the relay's ~4 KB
+inline limit are cached with normal retention; larger payloads ride as
+relay *attachments* with a **~3 hour TTL** — a node offline past that
+window still gets the wake, but the content is gone and the sender must
+resend (`mesh` warns on both ends when this can happen). For bulk that
+must survive long offline windows, keep payloads small or use a durable
+channel such as a shared repo (#66 tracks a chunking fix).
+
 ## Delegating tasks: any AI talking to any AI
 
 Nodes don't just ping each other — they exchange real
