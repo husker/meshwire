@@ -51,6 +51,19 @@ class RehearsalToolTests(unittest.TestCase):
         for token in ("KEY_MISMATCH", "UNVERIFIED_SOURCE"):
             self.assertNotIn(token, result["control"]["log"])
 
+    def test_forged_hint_arm_pins_the_signature_check(self):
+        # bastion, PR-109 seat: arms 1 and 2 prove the harness discriminates
+        # by KEY IDENTITY but not that it checks SIGNATURE BYTES. Replacing
+        # _verify_node_sig with `carried hint == pin` passes both of them
+        # while gutting the crypto. This arm forges the carried hint -- which
+        # a real forger controls freely -- so only verifying against the PIN
+        # rejects it.
+        result = self.tool.rehearse(out=io.StringIO())
+        self.assertEqual(result["forged_hint"]["verdict"],
+                         self.mesh.FRAME_MISMATCH)
+        self.assertIn("KEY_MISMATCH", result["forged_hint"]["log"])
+        self.assertNotIn("WOULD_MIGRATE", result["forged_hint"]["log"])
+
     def test_rehearsal_cleans_up_its_scratch_mesh(self):
         result = self.tool.rehearse(out=io.StringIO())
         self.assertTrue(result["ok"], result["failures"])
