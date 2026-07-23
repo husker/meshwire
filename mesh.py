@@ -123,6 +123,9 @@ VERSION = "0.16.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
+NTFY_INLINE_LIMIT = 4096  # ntfy stores larger posts as ATTACHMENTS with a
+# ~3h TTL instead of the normal cache retention -- delivery durability
+# silently depends on size past this line (#66)
 # Relay clocks may lead the local clock briefly, but a wider window would let
 # a replay move a subscriber cursor past legitimate messages.
 RELAY_FUTURE_SKEW = 300
@@ -2212,10 +2215,15 @@ def http(url, data=None, headers=None, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def _unwrap(ev, cfg):
+def _unwrap(ev, cfg, node=None):
     """ntfy wraps large bodies into attachments. Return the effective body
     text of a message event, fetching the attachment when needed. Return None
-    for malformed relay fields so callers can fail closed."""
+    for malformed relay fields so callers can fail closed.
+
+    When `node` is given, a failed fetch of a genuine relay attachment is
+    surfaced loudly (#66): attachments expire in ~3h, so the wake often
+    outlives the content -- silence here reads as a decrypt problem instead
+    of the durability cliff it actually is."""
     if not isinstance(ev, dict):
         return None
     message = ev.get("message")
@@ -2252,6 +2260,14 @@ def _unwrap(ev, cfg):
                 return r.read(MAX_ATTACHMENT).decode("utf-8", "replace")
         except (urllib.error.URLError, socket.timeout, TimeoutError,
                 HTTPException, ValueError, OSError):
+            print("MESH_WARN: large message payload expired or unreachable "
+                  "on the relay (attachments live ~3h) — the sender must "
+                  "resend; the wake survived, the content did not (#66)",
+                  file=sys.stderr)
+            if node:
+                _append_activity(cfg, node, "message", "relay",
+                                 "large payload expired on the relay — ask "
+                                 "the sender to resend (#66)")
             return message
     return message
 
@@ -2273,7 +2289,7 @@ def _open_with_fingerprint(ev, cfg, me=None):
 
 def _open_details(ev, cfg, me=None):
     """Open a relay event, retaining the authenticated wrapper recipient."""
-    body = _unwrap(ev, cfg)
+    body = _unwrap(ev, cfg, node=me)
     if not isinstance(body, str):
         return None, None, "", False, None, None, None, None, None
     relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
@@ -4887,6 +4903,12 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
         timestamp, payload = _sign_wrapper_payload(cfg, to, payload)
         wire = encrypt(cfg, json.dumps(payload), to=to, timestamp=timestamp)
         headers = {"Title": cfg["mesh"]}
+        if len(wire) > NTFY_INLINE_LIMIT:
+            print(f"MESH_WARN: payload exceeds the relay's ~{NTFY_INLINE_LIMIT}B "
+                  f"inline limit and will ride an attachment with a ~3h TTL — "
+                  f"a receiver offline past that window loses the CONTENT "
+                  f"(the wake survives). Prefer smaller messages or a durable "
+                  f"channel for bulk (#66)", file=sys.stderr)
     else:
         wire = body
         headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
