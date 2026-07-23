@@ -3421,8 +3421,8 @@ class RevlistTests(unittest.TestCase):
         self.assertIn("different mesh", reason)
         now = int(mesh.time.time())
         cases = [
-            (self._crafted_body(iat=now, valid_until=now + 10) | {
-                "kind": "revlist2"}, "kind"),
+            (dict(self._crafted_body(iat=now, valid_until=now + 10),
+                  kind="revlist2"), "kind"),
             (self._crafted_body(iat=now, valid_until=now), "timestamps"),
             (self._crafted_body(iat=now + 600, valid_until=now + 700),
              "timestamps"),
