@@ -3094,9 +3094,40 @@ class MemberCertTests(unittest.TestCase):
         self.assertIn("impersonation", out)
         self.assertNotIn("UNVERIFIED_SOURCE", out)
         self.assertNotIn("WOULD_MIGRATE", out)
-        # bastion: soak-parseable evidence must survive a cp1252 console.
-        out.encode("cp1252")
-        self.assertTrue(out.strip().isascii())
+
+    def test_all_mesh_evidence_literals_are_ascii(self):
+        # lodestar (PR-108 correction): the crash in #98 is from INTERPOLATED
+        # content on stdout (stderr already backslashreplaces), not string
+        # literals -- so this scan is NOT a crash guard. It enforces the
+        # separate, real convention: MESH_* evidence is soak-parseable, and
+        # parseable evidence must not carry codepage-varying typography (em
+        # dashes render differently or mojibake across consoles). A
+        # per-test check guarded 1 line of 32; this AST scan covers every
+        # MESH_* print literal in the source and catches the next one.
+        import ast as _ast
+        src = open(mesh.__file__, encoding="utf-8").read()
+        offenders = []
+
+        def literals_of(node):
+            parts = []
+            for a in node.args:
+                if isinstance(a, _ast.Constant) and isinstance(a.value, str):
+                    parts.append(a.value)
+                elif isinstance(a, _ast.JoinedStr):
+                    parts += [v.value for v in a.values
+                              if isinstance(v, _ast.Constant)
+                              and isinstance(v.value, str)]
+            return "".join(parts)
+
+        for node in _ast.walk(_ast.parse(src)):
+            if (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Name)
+                    and node.func.id == "print"):
+                lit = literals_of(node)
+                if "MESH_" in lit and not lit.isascii():
+                    offenders.append((node.lineno,
+                                      lit.encode("unicode_escape").decode()))
+        self.assertEqual(offenders, [], f"non-ASCII MESH_* literals: {offenders}")
 
     def test_rename_line_carries_the_frame_id(self):
         # PR-102 follow-up (both seats): evidence must be auditable to a
