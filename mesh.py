@@ -1578,9 +1578,17 @@ def _pin_cap(cfg):
         store = _load_json_regular(certs_file(cfg), require_private=False,
                                    max_bytes=CERT_BLOCK_MAX * 64)
         if isinstance(store, dict):
-            certified = len(store)
+            # Count only UNEXPIRED certs (lodestar PR-99 nit): all are
+            # owner-signed so expired ones are harmless to the bound, but
+            # a stale cert should not keep buying pin headroom.
+            now = time.time()
+            certified = sum(
+                1 for body in store.values()
+                if isinstance(body, dict) and body.get("exp", 0) > now)
     except (FileNotFoundError, OSError, ValueError):
         pass
+    # Early Phase A before any cert is minted -> the FLOOR. A larger mesh
+    # wanting headroom mints member certs or sets a `pin_cap` override.
     return max(PIN_STORE_CAP_FLOOR, 4 * certified)
 
 

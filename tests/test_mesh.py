@@ -2936,6 +2936,10 @@ class MemberCertTests(unittest.TestCase):
                                        "key": "k", "iat": 1, "exp": 2**31})
         self.assertEqual(mesh._pin_cap(self.cfg), 32)
         self.assertEqual(mesh._pin_cap(dict(self.cfg, pin_cap=5)), 5)
+        # expired certs stop buying headroom (lodestar PR-99 nit)
+        mesh._note_cert(self.cfg, {"fpr": "SHA256:old", "name": "z",
+                                   "key": "k", "iat": 1, "exp": 2})
+        self.assertEqual(mesh._pin_cap(self.cfg), 32)
 
     def test_pin_cap_refuses_new_names_loudly_but_not_as_forgery(self):
         # #76 c4 (bastion): at the cap, a NEW name is refused with a loud
