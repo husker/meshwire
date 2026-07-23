@@ -2204,10 +2204,180 @@ def _cert_for_key(cfg, pubkey):
     return store.get(fpr) if isinstance(store, dict) else None
 
 
+REVOKES_NAME = ".meshwire.revocations.json"
+
+
+def revocations_file(cfg):
+    return os.path.join(cfg["_dir"], REVOKES_NAME)
+
+
+def _revoke_namespace(cfg):
+    """Distinct ssh-keygen namespace: a revocation must never verify as a
+    membership cert or an approval, nor the reverse."""
+    return f"a2acast-revoke-{cfg['id']}"
+
+
+def _mint_revocation(cfg, fpr, name=""):
+    """Owner-signed revocation of a node key, by fingerprint (#76 slice 2,
+    R1/c3). Permanent: a revoked key stays revoked, so unlike certs there is
+    no expiry. Minting runs the owner ceremony and fails closed unattended,
+    exactly like cert/approval minting."""
+    if not isinstance(fpr, str) or not fpr.startswith("SHA256:"):
+        raise ValueError("revocation needs a SHA256: key fingerprint")
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        raise ValueError("this machine does not hold the mesh owner key "
+                         "(run `mesh owner-init` where the owner works)")
+    issued = int(time.time())
+    body = {"v": 1, "kind": "revocation", "mesh": cfg["id"], "fpr": fpr,
+            "name": name if isinstance(name, str) else "",
+            "nonce": secrets.token_hex(16), "iat": issued}
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    binary = _ssh_keygen_binary()
+    workdir = tempfile.mkdtemp(prefix=".mw-revoke-", dir=cfg["_dir"])
+    payload_path = os.path.join(workdir, "payload")
+    try:
+        with open(payload_path, "wb") as f:
+            f.write(payload)
+        try:
+            completed = subprocess.run(
+                [binary, "-Y", "sign", "-f", key_path,
+                 "-n", _revoke_namespace(cfg), payload_path],
+                timeout=300, env=_signing_env())
+        except subprocess.TimeoutExpired:
+            raise ValueError(
+                "signing timed out — a passphrase-protected owner key needs "
+                "a present human to enter the passphrase at the terminal; an "
+                "unattended process cannot mint (#64)")
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign the revocation "
+                             "(see its output above)")
+        with open(payload_path + ".sig", "r", encoding="utf-8") as f:
+            signature = f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    token = json.dumps({"body": body, "sig": signature},
+                       sort_keys=True, separators=(",", ":"))
+    return "mwrevoke1-" + base64.urlsafe_b64encode(
+        token.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _verify_revocation(cfg, block):
+    """Return (ok, reason, body_or_None): owner signature, shape, mesh id."""
+    if (not isinstance(block, str) or not block.startswith("mwrevoke1-")
+            or len(block) > CERT_BLOCK_MAX):
+        return False, "revocation malformed", None
+    raw = block[len("mwrevoke1-"):]
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+        body, signature = parsed["body"], parsed["sig"]
+    except (ValueError, TypeError, KeyError):
+        return False, "revocation malformed", None
+    if not isinstance(body, dict) or not isinstance(signature, str):
+        return False, "revocation malformed", None
+    if body.get("v") != 1 or body.get("kind") != "revocation":
+        return False, "revocation version or kind unsupported", None
+    if body.get("mesh") != cfg["id"]:
+        return False, "revocation is for a different mesh", None
+    fpr = body.get("fpr")
+    if not isinstance(fpr, str) or not fpr.startswith("SHA256:"):
+        return False, "revocation fingerprint invalid", None
+    try:
+        owner_pub = _load_owner_trust(cfg)
+    except ValueError as exc:
+        return False, str(exc), None
+    try:
+        binary = _ssh_keygen_binary()
+    except ValueError as exc:
+        return False, str(exc), None
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    principal = f"owner@{cfg['id']}"
+    workdir = tempfile.mkdtemp(prefix=".mw-revverify-", dir=cfg["_dir"])
+    try:
+        sig_path = os.path.join(workdir, "payload.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(signature)
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{principal} "
+                    f"namespaces=\"{_revoke_namespace(cfg)}\" "
+                    f"{owner_pub}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+             "-n", _revoke_namespace(cfg), "-s", sig_path],
+            input=payload, capture_output=True, timeout=60)
+        if completed.returncode != 0:
+            return False, "revocation signature verification failed", None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return True, "ok", body
+
+
+def _note_revocation(cfg, body):
+    """Cache a VERIFIED revocation, keyed by fingerprint. Command-driven
+    only (never the receive path) so Phase A stays Ph1-pure; deleting the
+    file reverts it."""
+    try:
+        store = _load_json_regular(revocations_file(cfg),
+                                   require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        store = {}
+    if not isinstance(store, dict):
+        store = {}
+    store[body["fpr"]] = body
+    _write_json_secure(revocations_file(cfg), store)
+
+
+def _revocation_status(cfg, pubkey):
+    """'revoked', 'clean', or 'unknown'. Read-only.
+
+    'unknown' means the revocation store EXISTS but could not be read
+    (corrupt/oversize) -- we cannot prove the key is NOT revoked, so this
+    must FAIL SHUT downstream, never read as clean (lodestar B2). An ABSENT
+    store is 'clean' -- there genuinely are no revocations yet, the common
+    Phase A case; staleness of a present-but-behind view is the epoch gate's
+    job once distribution lands, not this function's."""
+    try:
+        fpr = _key_fingerprint(_normalize_pubkey(pubkey))
+    except (ValueError, TypeError):
+        return "clean"
+    path = revocations_file(cfg)
+    if not os.path.exists(path):
+        return "clean"
+    try:
+        store = _load_json_regular(path, require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (OSError, ValueError):
+        return "unknown"
+    if not isinstance(store, dict):
+        return "unknown"
+    return "revoked" if fpr in store else "clean"
+
+
 def _report_cert_status(cfg, frm, pubkey):
     """#76 Phase A observability: LOG-ONLY cert verdict for a pin-verified
     frame. Never affects delivery; this line is the soak evidence."""
     if not pubkey:
+        return
+    rev = _revocation_status(cfg, pubkey)
+    if rev == "revoked":
+        # Highest-priority signal: the owner has revoked this key. Log-only
+        # in Phase A -- the frame still delivers -- but this is the line the
+        # enforcement ratchet (#74) will one day act on.
+        print(f"MESH_CERT from={_single_line(frm)} CERT_REVOKED",
+              file=sys.stderr)
+        return
+    if rev == "unknown":
+        # Fail SHUT (lodestar B2): the revocation store exists but is
+        # unreadable, so we cannot prove this key is clean. Never fall
+        # through to a clean-looking cert status -- report the failure.
+        print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
+              f"(revocation store unreadable — cannot confirm not-revoked)",
+              file=sys.stderr)
         return
     body = _cert_for_key(cfg, pubkey)
     if body is None:
@@ -5552,6 +5722,49 @@ def cmd_cert_show(args):
             continue
         print(f"{_single_line(body.get('name', '?'))}  {fpr}  exp="
               f"{time.strftime('%Y-%m-%d', time.localtime(body.get('exp', 0)))}")
+    try:
+        revs = _load_json_regular(revocations_file(cfg),
+                                  require_private=False,
+                                  max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        revs = {}
+    for fpr, body in sorted((revs or {}).items()):
+        if isinstance(body, dict):
+            print(f"REVOKED  {_single_line(body.get('name', '?'))}  {fpr}")
+
+
+def cmd_cert_revoke(args):
+    cfg = load_config()
+    fpr = args.fingerprint
+    name = ""
+    if not fpr.startswith("SHA256:"):
+        # A node name: revoke the key currently PINNED for it.
+        pub = _load_pins(cfg).get(fpr)
+        if not pub:
+            sys.exit(f"error: '{fpr}' is neither a SHA256: fingerprint nor a "
+                     "pinned node name")
+        name, fpr = fpr, _key_fingerprint(_normalize_pubkey(pub))
+    try:
+        block = _mint_revocation(cfg, fpr, name=name)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"revocation for {fpr}"
+          f"{(' (' + name + ')') if name else ''} — distribute to every "
+          "member, each runs:")
+    print(f"  mesh revoke-trust {block}")
+    print("Log-only in Phase A (#76): receivers log CERT_REVOKED for frames "
+          "from this key; delivery is not yet gated (that is #74).")
+
+
+def cmd_revoke_trust(args):
+    cfg = load_config()
+    ok, reason, body = _verify_revocation(cfg, args.block)
+    if not ok:
+        sys.exit(f"error: revocation rejected: {reason}")
+    _note_revocation(cfg, body)
+    print(f"revocation cached: fpr={body['fpr']}"
+          f"{(' name=' + _single_line(body['name'])) if body.get('name') else ''} "
+          "(log-only in Phase A)")
 
 
 def cmd_approve(args):
@@ -5622,16 +5835,37 @@ def cmd_iam(args):
     cfg = load_config()
     if args.node == BROADCAST:
         sys.exit(f"error: '{BROADCAST}' is reserved for broadcast")
+    harness = _detect_harness()
+    try:
+        # First-ever naming has no prior identity -- `mesh iam` is itself
+        # the first-name command, and my_node exits when unnamed. No old
+        # name means nothing to announce a rename FROM.
+        old = my_node(cfg, None, harness)
+    except SystemExit:
+        old = None
     if args.node not in cfg["nodes"]:
         def _add_node(latest):
             latest.setdefault("nodes", [])
             if args.node not in latest["nodes"]:
                 latest["nodes"].append(args.node)
         _mutate_config(cfg, _add_node)
-    harness = _detect_harness()
     with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
+    # #93/#76 slice 2: announce the rename signed by the UNCHANGED node key,
+    # sent AS THE OLD NAME so the signature verifies against the pin peers
+    # already hold. Best-effort like presence -- a failed announce never
+    # fails the local rename; peers re-pin via TOFU on the next frame either
+    # way, and Phase A receivers only log WOULD_MIGRATE.
+    if old and old != args.node and cfg.get("key"):
+        try:
+            send_raw(cfg, old, BROADCAST, f"{old} is now {args.node}",
+                     ctl={"mw": "rename", "old": old, "new": args.node,
+                          "ts": int(time.time())})
+        except (urllib.error.URLError, socket.timeout, UnicodeError,
+                ValueError, OSError):
+            print("  note: rename announce delivery failed; peers will "
+                  "re-pin on your next frame.", file=sys.stderr)
     spec = HARNESS_SPECS.get(harness)
     if spec and spec.settings_kind == "owned-cli":
         # owned-cli harnesses bake --as into their MCP registration, and --as
@@ -6297,7 +6531,7 @@ def _stream_open(cfg, tpc, since, timeout):
     return http(f"{cfg['server']}/{tpc}/json?since={since}", timeout=timeout)
 
 
-def _handle_control(cfg, me, frm, ctl):
+def _handle_control(cfg, me, frm, ctl, verdict=None):
     """React to an announce/ping/pong control message.
     Returns an agent-facing stdout line, or None (control chatter never
     surfaces as MESH_MESSAGE and never wakes an agent, except the rare and
@@ -6306,6 +6540,36 @@ def _handle_control(cfg, me, frm, ctl):
     if kind == "announce":
         note_peer(cfg, frm, "announce", ctl.get("status"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
+    if kind == "rename":
+        # #93/#76 slice 2, LOG-ONLY: a node announces old->new signed by its
+        # UNCHANGED key, sent AS the old name so the signature verifies
+        # against the pin peers already hold. In Phase A we OBSERVE and log
+        # WOULD_MIGRATE -- we migrate no pin and write no tombstone; real
+        # migration is a gated later phase. Continuity is only as strong as
+        # the source pin (B3): a verified source is a real key-continuity
+        # rename, anything else is an unproven claim.
+        old, new = frm, ctl.get("new")
+        if not isinstance(new, str) or not new or new == BROADCAST:
+            return None
+        if verdict == FRAME_VERIFIED:
+            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
+                  f"WOULD_MIGRATE (key-verified; Phase A log-only, pin NOT "
+                  f"migrated)", file=sys.stderr)
+        elif verdict == FRAME_MISMATCH:
+            # A DIFFERENT key than the one pinned for `old` is asking the
+            # fleet to carry old's identity to `new` -- the exact
+            # impersonation shape #93 exists to catch. Phase A's whole
+            # product is evidence, so this cannot read as generic unverified
+            # chatter (lodestar B1); it is the attack-path event the #62
+            # soak bar requires witnessing.
+            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
+                  f"KEY_MISMATCH (pin conflict — possible impersonation)",
+                  file=sys.stderr)
+        else:
+            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
+                  f"UNVERIFIED_SOURCE (ignored — not a proven key-continuity "
+                  f"rename)", file=sys.stderr)
+        return None
     if kind == "ping":
         note_peer(cfg, frm, "message", ctl.get("status"))
         try:
@@ -6526,7 +6790,7 @@ def _cmd_watch_owned(args, cfg, me):
             # against the LOCAL pin (the key that actually verified).
             _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
         if ctl:
-            line = _handle_control(cfg, me, frm, ctl)
+            line = _handle_control(cfg, me, frm, ctl, verdict=verdict)
             checkpoint()  # control frames carry no undelivered payload
             if line:
                 print(line)
@@ -7203,7 +7467,7 @@ class MeshMCPServer:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
             if ctl:
-                line = _handle_control(cfg, me, frm, ctl)
+                line = _handle_control(cfg, me, frm, ctl, verdict=verdict)
                 if line:
                     self.deliver({"kind": "node_joined", "from": frm,
                                   "text": line, "verify": verdict})
@@ -10802,8 +11066,19 @@ def main():
     p.add_argument("block")
     p.set_defaults(fn=cmd_cert_trust)
     p = sub.add_parser("cert-show",
-                       help="list member certs cached on this node")
+                       help="list member certs and revocations cached here")
     p.set_defaults(fn=cmd_cert_show)
+    p = sub.add_parser("cert-revoke",
+                       help="owner: mint a revocation for a node name or "
+                            "SHA256: key fingerprint (#76 slice 2, log-only)")
+    p.add_argument("fingerprint",
+                   help="a pinned node name, or a SHA256: key fingerprint")
+    p.set_defaults(fn=cmd_cert_revoke)
+    p = sub.add_parser("revoke-trust",
+                       help="verify an owner-signed revocation and cache it "
+                            "(log-only in Phase A)")
+    p.add_argument("block")
+    p.set_defaults(fn=cmd_revoke_trust)
 
     p = sub.add_parser("approve",
                        help="owner machine only: mint a single-use, "
