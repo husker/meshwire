@@ -596,6 +596,33 @@ class PeerTests(unittest.TestCase):
             self.assertFalse(os.path.exists(cfg["_path"]))  # config untouched
             self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "pong")
 
+    def test_note_peer_caps_auto_roster_growth_but_still_tracks(self):
+        # #100: a flood of fabricated first-contact names cannot grow the
+        # durable (invite-embedded) roster without bound; past the cap the
+        # sighting is still recorded in peers.json, and a once-per-name warn
+        # fires. Operator adds are separate and uncapped.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            cap = mesh._pin_cap(cfg)  # 16 (floor) with no certs
+            # fill the roster to the cap with discovered names
+            for i in range(cap - len(cfg["nodes"])):
+                mesh.note_peer(cfg, f"disc{i}", "message")
+            self.assertEqual(len(cfg["nodes"]), cap)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                mesh.note_peer(cfg, "flooder", "message")
+            # roster did NOT grow past the cap...
+            self.assertNotIn("flooder", cfg["nodes"])
+            self.assertEqual(len(cfg["nodes"]), cap)
+            # ...but the sighting IS tracked, and the warn fired once
+            self.assertIn("flooder", mesh.load_peers(cfg))
+            self.assertIn("roster at its cap", err.getvalue())
+            # second frame from the same name: no duplicate warn
+            err2 = io.StringIO()
+            with contextlib.redirect_stderr(err2):
+                mesh.note_peer(cfg, "flooder", "pong")
+            self.assertNotIn("roster at its cap", err2.getvalue())
+
     def test_note_peer_ignores_broadcast_and_empty(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
