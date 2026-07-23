@@ -5029,8 +5029,46 @@ def _print_invite(cfg):
     print(f"  # already installed via pipx/uv?  mesh join {code}")
 
 
+def _await_join_announce(cfg, me, timeout=120):
+    """Ephemeral observer for a join announce on the broadcast topic (#54).
+    Read-only in the cmd_ping style: its own side-stream from now-5s, no
+    cursor writes, no replay marking, no presence claim -- it cannot eat a
+    frame from this node's real receive path or collide with its watcher.
+    Returns the joining node's name, or None on timeout."""
+    tpc = topic(cfg, BROADCAST)
+    deadline = time.time() + timeout
+    try:
+        for ev in _stream_events(cfg, tpc, str(int(time.time()) - 5),
+                                 deadline):
+            frm, _body, trusted, ctl = _open(ev, cfg, me)
+            if (trusted and isinstance(ctl, dict) and
+                    ctl.get("mw") == "announce" and frm and frm != me):
+                return frm
+    except (urllib.error.URLError, socket.timeout):
+        pass
+    return None
+
+
 def cmd_invite(args):
-    _print_invite(load_config())
+    cfg = load_config()
+    _print_invite(cfg)
+    if not _interactive():
+        return
+    # #54: the join announce fires once, at join time -- if nobody is
+    # looking, the inviter can't tell a completed join from a failed one.
+    # In a terminal, BE looking, right now, on a throwaway observer stream.
+    print("\nwaiting up to 120s for a join announce -- Ctrl-C to stop "
+          "waiting (the invite stays valid either way)")
+    joined = _await_join_announce(cfg, my_node(cfg, None))
+    if joined:
+        print(f"MESH_NODE_JOINED node={_single_line(joined)} -- join "
+              f"confirmed; it will appear in `mesh status` from now on")
+    else:
+        print("no join observed yet. The invite stays valid; a completed "
+              "join announces on the broadcast topic, so check `mesh "
+              "status` later. If someone DID join, their listener may have "
+              "stopped: the join terminal must stay open (or their harness "
+              "hook must be armed) for the node to be reachable.")
 
 
 def cmd_owner_init(args):
@@ -5852,7 +5890,9 @@ def _watch_if_interactive():
     Ctrl-C (handled in main()) stops the program and the watching with it."""
     if not _interactive():
         return
-    print("\nlistening for messages — Ctrl-C to stop")
+    print("\nlistening for messages — Ctrl-C to stop\n"
+          "THIS TERMINAL IS THIS NODE'S LISTENER: closing it deafens the "
+          "node\nuntil another watcher or a harness hook takes over (#54).")
     cmd_watch(argparse.Namespace(follow=True, timeout=None, as_node=None))
 
 
