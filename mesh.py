@@ -2022,19 +2022,23 @@ def _mint_member_cert(cfg, name, pubkey, ttl=CERT_TTL_DEFAULT):
         with open(payload_path, "wb") as f:
             f.write(payload)
         try:
+            # F3-aligned (lodestar's PR-97 cross-lane flag): inherited
+            # stdio so the passphrase prompt is reliably visible, and
+            # human typing time -- the ceremony standard, not the
+            # unattended-subprocess one. No-tty still fails closed via
+            # the prompt timing out.
             completed = subprocess.run(
                 [binary, "-Y", "sign", "-f", key_path,
                  "-n", _cert_namespace(cfg), payload_path],
-                capture_output=True, text=True, timeout=60,
-                env=_signing_env())
+                timeout=300, env=_signing_env())
         except subprocess.TimeoutExpired:
             raise ValueError(
                 "signing timed out — a passphrase-protected owner key needs "
                 "a present human to enter the passphrase at the terminal; an "
                 "unattended process cannot mint (#64)")
         if completed.returncode != 0:
-            raise ValueError("ssh-keygen could not sign the cert: "
-                             + completed.stderr.strip())
+            raise ValueError("ssh-keygen could not sign the cert "
+                             "(see its output above)")
         with open(payload_path + ".sig", "r", encoding="utf-8") as f:
             signature = f.read()
     finally:
