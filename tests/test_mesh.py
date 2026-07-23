@@ -2638,6 +2638,25 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         self.assertIn("expired or unreachable", err.getvalue())
         with open(mesh.activity_file(cfg, "alpha")) as f:
             self.assertIn("expired on the relay", f.read())
+    def test_foreign_attachment_failure_neither_warns_nor_fetches(self):
+        # lodestar (PR #96 seat): pin the ONLY -- a foreign-url attachment
+        # is never fetched (relay-origin gate exits first), so it can never
+        # produce the expiry warn either.
+        self._setup_mesh()
+        cfg = mesh.load_config()
+        ev = {"event": "message", "id": "f66", "time": 401,
+              "message": "You received a file: loot.txt",
+              "attachment": {"url": "https://evil.example/loot.txt",
+                             "size": 5000}}
+        err = io.StringIO()
+        with mock.patch.object(
+                mesh, "http",
+                side_effect=AssertionError("foreign url was fetched")), \
+                contextlib.redirect_stderr(err):
+            got = mesh._unwrap(ev, cfg, node="alpha")
+        self.assertEqual(got, "You received a file: loot.txt")
+        self.assertNotIn("expired", err.getvalue())
+        self.assertFalse(os.path.exists(mesh.activity_file(cfg, "alpha")))
 
     def test_watch_delivery_appends_activity_line(self):
         cfg = self._setup_mesh()
