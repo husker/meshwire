@@ -2402,9 +2402,19 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
                 "refusing to sign a full-set list that might silently omit "
                 "a record (an omission would read as an un-revocation)")
         for fpr, rec in store.items():
-            if isinstance(fpr, str) and isinstance(rec, dict):
-                entries[fpr] = {"name": rec.get("name", "") or "",
-                                "iat": rec.get("iat", 0)}
+            # PR-112 seat (lodestar F2): a malformed individual record gets
+            # the SAME refusal as an unreadable store -- silently skipping
+            # it would omit its fpr from the "full set", the exact
+            # un-revocation-in-effect the store-level refusal exists to
+            # prevent. One line, one consequence, one handling.
+            if not isinstance(fpr, str) or not isinstance(rec, dict):
+                raise ValueError(
+                    "the local revocation store holds a malformed record "
+                    "(fpr=%r) -- refusing to sign a full-set list that "
+                    "would silently omit it (an omission would read as an "
+                    "un-revocation); repair the store first" % (fpr,))
+            entries[fpr] = {"name": rec.get("name", "") or "",
+                            "iat": rec.get("iat", 0)}
     try:
         prev_body, _ = _load_revlist(cfg)
     except (OSError, ValueError):
@@ -2415,8 +2425,7 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
     issued = int(time.time())
     if prev_body is not None:
         for fpr, meta in prev_body["revocations"].items():
-            entries.setdefault(fpr, meta if isinstance(meta, dict)
-                               else {"name": "", "iat": 0})
+            entries.setdefault(fpr, meta)
         if issued <= prev_body.get("iat", 0):
             raise ValueError(
                 "clock says now <= the adopted list's iat -- a newer "
@@ -2427,6 +2436,20 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
             "revocations": entries}
     payload = json.dumps(body, sort_keys=True,
                          separators=(",", ":")).encode("utf-8")
+    # PR-112 seat (lodestar F1): verify enforces REVLIST_BLOCK_MAX, so a
+    # mint-side breach would produce a list NO receiver adopts -- signed in
+    # an attended ceremony, distributed, and discovered only via N remote
+    # rejections, the failure landing furthest from whoever can act. Refuse
+    # HERE, before the ceremony, where the human who can raise the constant
+    # (one constant drives both sides) is at the keyboard. b64 of the
+    # payload alone is a strict lower bound on the final block; the exact
+    # check runs again after signing.
+    if 11 + (len(payload) + 2) // 3 * 4 > REVLIST_BLOCK_MAX:
+        raise ValueError(
+            "the signed list would exceed REVLIST_BLOCK_MAX (%d bytes) and "
+            "no receiver would adopt it -- raising the bound is a design "
+            "decision (one constant drives mint and verify); make it "
+            "before minting, not after distributing" % REVLIST_BLOCK_MAX)
     binary = _ssh_keygen_binary()
     workdir = tempfile.mkdtemp(prefix=".mw-revlist-", dir=cfg["_dir"])
     payload_path = os.path.join(workdir, "payload")
@@ -2454,6 +2477,12 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
                        sort_keys=True, separators=(",", ":"))
     block = "mwrevlist1-" + base64.urlsafe_b64encode(
         token.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(block) > REVLIST_BLOCK_MAX:
+        raise ValueError(
+            "the signed list exceeds REVLIST_BLOCK_MAX (%d bytes) and no "
+            "receiver would adopt it -- raising the bound is a design "
+            "decision (one constant drives mint and verify); make it "
+            "before minting, not after distributing" % REVLIST_BLOCK_MAX)
     return block, body
 
 
@@ -2533,7 +2562,16 @@ def _verify_revlist(cfg, block, now=None):
 def _load_revlist(cfg):
     """(body, block) of the adopted list, or (None, None) when none is
     adopted. Raises OSError/ValueError on a PRESENT-but-unreadable cache:
-    status-path callers must fail shut on that, never read it as absent."""
+    status-path callers must fail shut on that, never read it as absent.
+
+    Per-entry and block validation are part of "readable" (PR-112 seat):
+    a cache whose entries can't be faithfully carried into the next mint,
+    or whose cached block has lost list shape, is corrupt -- unknown/fail
+    shut beats propagating it. The block is only TYPE-checked here (this
+    runs per frame on the status path); the future republish increment
+    MUST re-verify the block cryptographically before serving it -- the
+    body and block are not otherwise bound to each other (the seat's
+    confused-deputy note)."""
     path = revlist_file(cfg)
     if not os.path.exists(path):
         return None, None
@@ -2543,7 +2581,15 @@ def _load_revlist(cfg):
             or not isinstance(wrapped.get("body"), dict)
             or not isinstance(wrapped["body"].get("revocations"), dict)):
         raise ValueError("revlist cache malformed")
-    return wrapped["body"], wrapped.get("block")
+    for fpr, meta in wrapped["body"]["revocations"].items():
+        if not isinstance(fpr, str) or not isinstance(meta, dict):
+            raise ValueError("revlist cache malformed")
+    block = wrapped.get("block")
+    if (not isinstance(block, str)
+            or not block.startswith("mwrevlist1-")
+            or len(block) > REVLIST_BLOCK_MAX):
+        raise ValueError("revlist cache malformed")
+    return wrapped["body"], block
 
 
 def _note_revlist(cfg, body, block):
@@ -6151,7 +6197,20 @@ def cmd_revlist_trust(args):
         loose = {}
     for fpr, rec in sorted((loose or {}).items()
                            if isinstance(loose, dict) else []):
-        if not isinstance(rec, dict) or fpr in body["revocations"]:
+        if fpr in body["revocations"]:
+            continue
+        if not isinstance(rec, dict):
+            # PR-112 seat (lodestar F2): the audit's whole job is surfacing
+            # omissions, so it must not share the mint's old silent-skip --
+            # that skipped exactly the record a mint would have omitted. It
+            # cannot refuse (the adopted list is valid); it must be loud. A
+            # malformed record has no readable iat, so warn unconditionally.
+            print(f"MESH_WARN: loose revocation record "
+                  f"fpr={_single_line(str(fpr))} is MALFORMED and absent "
+                  "from the adopted revlist -- record KEPT; repair the "
+                  "store (mint refuses to carry malformed records, so it "
+                  "will stay omitted until repaired)",
+                  file=sys.stderr)
             continue
         if rec.get("iat", 0) <= body["iat"]:
             print(f"MESH_WARN: adopted revlist (iat={body['iat']}) omits "

@@ -3466,23 +3466,23 @@ class RevlistTests(unittest.TestCase):
     def test_adoption_is_monotonic_on_iat(self):
         older = self._crafted_body(iat=1000)
         newer = self._crafted_body(iat=1001)
-        self.assertEqual(mesh._note_revlist(self.cfg, older, "b1"),
+        self.assertEqual(mesh._note_revlist(self.cfg, older, "mwrevlist1-b1"),
                          "adopted")
-        self.assertEqual(mesh._note_revlist(self.cfg, newer, "b2"),
+        self.assertEqual(mesh._note_revlist(self.cfg, newer, "mwrevlist1-b2"),
                          "adopted")
-        self.assertEqual(mesh._note_revlist(self.cfg, older, "b1"), "older")
-        self.assertEqual(mesh._note_revlist(self.cfg, newer, "b2"),
+        self.assertEqual(mesh._note_revlist(self.cfg, older, "mwrevlist1-b1"), "older")
+        self.assertEqual(mesh._note_revlist(self.cfg, newer, "mwrevlist1-b2"),
                          "current")
         body, block = mesh._load_revlist(self.cfg)
         self.assertEqual(body["iat"], 1001)
-        self.assertEqual(block, "b2")
+        self.assertEqual(block, "mwrevlist1-b2")
 
     def test_status_reads_the_adopted_list_end_to_end(self):
         # A key revoked ONLY via the adopted list (no loose record) must
         # report revoked -- and CERT_REVOKED on the log-only frame path.
         pub = self._node_pubkey()
         fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
-        mesh._note_revlist(self.cfg, self._crafted_body(fprs=[fpr]), "b")
+        mesh._note_revlist(self.cfg, self._crafted_body(fprs=[fpr]), "mwrevlist1-b")
         self.assertEqual(mesh._revocation_status(self.cfg, pub), "revoked")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -3497,7 +3497,7 @@ class RevlistTests(unittest.TestCase):
         # corruption
         with open(mesh.revocations_file(self.cfg), "w") as f:
             f.write("{ not json")
-        mesh._note_revlist(self.cfg, self._crafted_body(fprs=[fpr]), "b")
+        mesh._note_revlist(self.cfg, self._crafted_body(fprs=[fpr]), "mwrevlist1-b")
         self.assertEqual(mesh._revocation_status(self.cfg, pub), "revoked")
         # corrupt loose store + list does NOT prove it -> unknown
         other = self._node_pubkey()
@@ -3584,10 +3584,84 @@ class RevlistTests(unittest.TestCase):
         self.assertTrue(ok, reason)
         self.assertEqual(len(body["revocations"]), 1)
 
+    def test_mint_refuses_a_list_no_receiver_would_adopt(self):
+        # PR-112 seat F1: verify enforces REVLIST_BLOCK_MAX, so mint must
+        # too -- otherwise the owner signs in an attended ceremony and
+        # discovers the failure N receivers later. Gross oversize refuses
+        # BEFORE the ceremony (payload b64 is a strict lower bound).
+        big = {f"SHA256:{i:04d}" + "x" * 40: {"name": f"node{i}", "iat": i}
+               for i in range(1200)}
+        mesh._write_json_secure(mesh.revocations_file(self.cfg), big)
+        with self.assertRaises(ValueError) as caught:
+            mesh._mint_revlist(self.cfg)
+        self.assertIn("REVLIST_BLOCK_MAX", str(caught.exception))
+        self.assertIn("before minting", str(caught.exception))
+
+    def test_mint_post_sign_size_check_is_exact(self):
+        # The pre-ceremony estimate is a lower bound; the post-sign check
+        # is the enforcer. Shrink the constant so a small real list passes
+        # the estimate, signs, and is then refused at the exact check.
+        self._revoke(self._node_pubkey())
+        with mock.patch.object(mesh, "REVLIST_BLOCK_MAX", 600):
+            with self.assertRaises(ValueError) as caught:
+                mesh._mint_revlist(self.cfg)
+        self.assertIn("exceeds", str(caught.exception))
+
+    def test_mint_refuses_a_malformed_loose_record(self):
+        # PR-112 seat F2: a malformed individual record gets the same
+        # refusal as an unreadable store -- silently skipping it would
+        # omit its fpr from the "full set", an un-revocation in effect.
+        fpr = self._revoke(self._node_pubkey())
+        store = mesh._load_json_regular(mesh.revocations_file(self.cfg),
+                                        require_private=False)
+        store["SHA256:malformed"] = "not-a-record"
+        mesh._write_json_secure(mesh.revocations_file(self.cfg), store)
+        with self.assertRaises(ValueError) as caught:
+            mesh._mint_revlist(self.cfg)
+        self.assertIn("malformed record", str(caught.exception))
+        self.assertIn("SHA256:malformed", str(caught.exception))
+        self.assertNotIn(fpr, str(caught.exception))
+
+    def test_audit_warns_on_a_malformed_loose_record(self):
+        # PR-112 seat F2, audit half: the superset audit must not share
+        # the silent-skip -- it skipped exactly the record a mint would
+        # have omitted. It cannot refuse; it must be loud.
+        block, body = mesh._mint_revlist(self.cfg)
+        mesh._write_json_secure(mesh.revocations_file(self.cfg),
+                                {"SHA256:mal": "junk"})
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "load_config",
+                               return_value=self.cfg), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            mesh.cmd_revlist_trust(argparse.Namespace(block=block))
+        self.assertIn("revlist adopted", out.getvalue())
+        self.assertIn("MALFORMED", err.getvalue())
+        self.assertIn("SHA256:mal", err.getvalue())
+
+    def test_load_revlist_rejects_corrupt_entries_and_block(self):
+        # PR-112 seat, confused-deputy note: per-entry validation and the
+        # block type-check are part of "readable"; a cache failing either
+        # must read unknown (fail shut), never propagate. The republish
+        # increment must additionally re-verify the block cryptographically.
+        pub = self._node_pubkey()
+        good = self._crafted_body(iat=1000)
+        for wrapped in (
+                {"body": dict(good, revocations={"SHA256:x": "junk"}),
+                 "block": "mwrevlist1-b"},
+                {"body": good, "block": "wrong-prefix"},
+                {"body": good, "block": None}):
+            mesh._write_json_secure(mesh.revlist_file(self.cfg), wrapped)
+            with self.assertRaises(ValueError):
+                mesh._load_revlist(self.cfg)
+            self.assertEqual(mesh._revocation_status(self.cfg, pub),
+                             "unknown")
+        os.remove(mesh.revlist_file(self.cfg))
+
     def test_cert_show_reports_list_only_entries(self):
         fpr = "SHA256:list-only"
         mesh._note_revlist(
-            self.cfg, self._crafted_body(fprs=[fpr]), "b")
+            self.cfg, self._crafted_body(fprs=[fpr]), "mwrevlist1-b")
         out = io.StringIO()
         with mock.patch.object(mesh, "load_config",
                                return_value=self.cfg), \
