@@ -1557,12 +1557,31 @@ class PinStoreFull(RuntimeError):
 
 
 def _pin_cap(cfg):
-    """Fleet-size-scaled bound on distinct pins (#76 c4, bastion): belt-and-
-    braces against any mesh-key holder announcing unbounded identities --
-    including a leaked pre-revocation owner key minting enrollments. Loud
-    refusal over silent growth; a refused pin never affects delivery."""
-    roster = cfg.get("nodes") or []
-    return max(PIN_STORE_CAP_FLOOR, 4 * max(len(roster), 1))
+    """Bound on distinct pins (#76 c4, bastion): belt-and-braces against
+    any mesh-key holder announcing unbounded identities -- including a
+    leaked pre-revocation owner key minting enrollments. Loud refusal over
+    silent growth; a refused pin never affects delivery.
+
+    Scaled ONLY from inputs a wire adversary cannot inflate (lodestar's
+    PR-99 seat finding): a constant floor, the OWNER-CERTIFIED member
+    count (certs carry the owner signature -- #76 Phase A), and an
+    explicit local `pin_cap` config override. cfg['nodes'] is deliberately
+    NOT an input: note_peer auto-grows it on any authenticated first
+    contact, so a malicious member inflates it 1:1 with the pins it mints
+    and a roster-scaled cap never triggers against the named adversary."""
+    override = cfg.get("pin_cap")
+    if (isinstance(override, int) and not isinstance(override, bool)
+            and override > 0):
+        return override
+    certified = 0
+    try:
+        store = _load_json_regular(certs_file(cfg), require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+        if isinstance(store, dict):
+            certified = len(store)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return max(PIN_STORE_CAP_FLOOR, 4 * certified)
 
 
 def _bind_peer(cfg, node, pub):

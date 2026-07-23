@@ -2920,11 +2920,28 @@ class MemberCertTests(unittest.TestCase):
         mesh._note_cert(self.cfg, stale)
         self.assertIn("CERT_STALE", status_for("beta", pub))
 
+    def test_pin_cap_ignores_roster_inflation(self):
+        # lodestar's PR-99 finding: note_peer auto-grows cfg['nodes'] on
+        # any authenticated first contact, so a roster-scaled cap widens
+        # 1:1 with a malicious member's fabricated names and never fires.
+        # The cap must not move when the roster balloons.
+        inflated = dict(self.cfg, nodes=[f"fake{i}" for i in range(100)])
+        self.assertEqual(mesh._pin_cap(inflated), mesh.PIN_STORE_CAP_FLOOR)
+
+    def test_pin_cap_scales_with_certified_members_and_override(self):
+        # The scaling inputs are wire-uninflatable: owner-signed cert count
+        # and the local pin_cap override.
+        for i in range(8):
+            mesh._note_cert(self.cfg, {"fpr": f"SHA256:c{i}", "name": f"m{i}",
+                                       "key": "k", "iat": 1, "exp": 2**31})
+        self.assertEqual(mesh._pin_cap(self.cfg), 32)
+        self.assertEqual(mesh._pin_cap(dict(self.cfg, pin_cap=5)), 5)
+
     def test_pin_cap_refuses_new_names_loudly_but_not_as_forgery(self):
-        # #76 c4 (bastion): at the fleet-scaled cap, a NEW name is refused
-        # with a loud warn -- and via a RuntimeError subclass, so the
-        # verdict path reads it as provisional (UNVERIFIED), never as a
-        # key MISMATCH accusation.
+        # #76 c4 (bastion): at the cap, a NEW name is refused with a loud
+        # warn -- and via a RuntimeError subclass, so the verdict path
+        # reads it as provisional (UNVERIFIED), never as a key MISMATCH
+        # accusation.
         cfg = dict(self.cfg, nodes=["a"])
         cap = mesh._pin_cap(cfg)
         self.assertEqual(cap, mesh.PIN_STORE_CAP_FLOOR)
