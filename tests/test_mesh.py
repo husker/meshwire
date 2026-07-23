@@ -2920,6 +2920,39 @@ class MemberCertTests(unittest.TestCase):
         mesh._note_cert(self.cfg, stale)
         self.assertIn("CERT_STALE", status_for("beta", pub))
 
+    def test_pin_cap_refuses_new_names_loudly_but_not_as_forgery(self):
+        # #76 c4 (bastion): at the fleet-scaled cap, a NEW name is refused
+        # with a loud warn -- and via a RuntimeError subclass, so the
+        # verdict path reads it as provisional (UNVERIFIED), never as a
+        # key MISMATCH accusation.
+        cfg = dict(self.cfg, nodes=["a"])
+        cap = mesh._pin_cap(cfg)
+        self.assertEqual(cap, mesh.PIN_STORE_CAP_FLOOR)
+        pins = {f"n{i}": f"ssh-ed25519 AAAA{i}" for i in range(cap)}
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_load_pins", return_value=pins), \
+                mock.patch.object(mesh, "_write_json_secure") as write, \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(mesh.PinStoreFull) as caught:
+                mesh._bind_peer(cfg, "newcomer", self._node_pubkey())
+        self.assertNotIsInstance(caught.exception, ValueError)
+        self.assertIsInstance(caught.exception, RuntimeError)
+        write.assert_not_called()
+        self.assertIn("pin store at its cap", err.getvalue())
+
+    def test_pin_cap_never_blocks_an_existing_pin(self):
+        # Re-binding an already-pinned name at cap is untouched: the cap
+        # bounds GROWTH, not established identities.
+        cfg = dict(self.cfg, nodes=["a"])
+        cap = mesh._pin_cap(cfg)
+        pub = mesh._normalize_pubkey(self._node_pubkey())
+        pins = {f"n{i}": f"ssh-ed25519 AAAA{i}" for i in range(cap - 1)}
+        pins["known"] = pub
+        with mock.patch.object(mesh, "_load_pins", return_value=pins), \
+                mock.patch.object(mesh, "_write_json_secure"):
+            got = mesh._bind_peer(cfg, "known", pub)
+        self.assertEqual(got, pub)
+
     def test_cert_mint_requires_a_pinned_key(self):
         with mock.patch.object(mesh, "load_config",
                                return_value=self.cfg), \

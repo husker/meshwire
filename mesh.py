@@ -1546,6 +1546,25 @@ def _pins_lock_file(cfg):
     return os.path.join(tempfile.gettempdir(), "mw-pins-lock-" + suffix)
 
 
+PIN_STORE_CAP_FLOOR = 16
+
+
+class PinStoreFull(RuntimeError):
+    """#76 c4: the TOFU pin store hit its fleet-scaled cap. A RuntimeError
+    subclass ON PURPOSE: the frame-verdict path maps ValueError to
+    FRAME_MISMATCH (a forgery accusation) and RuntimeError to
+    FRAME_UNVERIFIED (provisional posture) -- a cap refusal is the latter."""
+
+
+def _pin_cap(cfg):
+    """Fleet-size-scaled bound on distinct pins (#76 c4, bastion): belt-and-
+    braces against any mesh-key holder announcing unbounded identities --
+    including a leaked pre-revocation owner key minting enrollments. Loud
+    refusal over silent growth; a refused pin never affects delivery."""
+    roster = cfg.get("nodes") or []
+    return max(PIN_STORE_CAP_FLOOR, 4 * max(len(roster), 1))
+
+
 def _bind_peer(cfg, node, pub):
     """Trust-on-first-use pin of node -> public key; returns the bound key.
 
@@ -1578,6 +1597,16 @@ def _bind_peer(cfg, node, pub):
                     f"peer '{node}' is already pinned to a different key; "
                     f"refusing to replace it")
             return existing.strip()
+        cap = _pin_cap(cfg)
+        if len(pins) >= cap:
+            # #76 c4: growth past the fleet-scaled bound is the attack
+            # shape, not organic membership. Refuse LOUDLY; the frame
+            # still delivers as unverified (provisional posture).
+            print(f"MESH_WARN: pin store at its cap ({len(pins)}/{cap}) — "
+                  f"refusing a new TOFU pin for "
+                  f"'{_single_line(node)}'. Prune stale pins or grow the "
+                  f"roster to admit members (#76 c4)", file=sys.stderr)
+            raise PinStoreFull(f"pin store at cap {cap}")
         pins[node] = pub
         _write_json_secure(pins_file(cfg), pins)
         return pub
