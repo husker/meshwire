@@ -621,13 +621,55 @@ class PeerTests(unittest.TestCase):
 
     def test_prune_peers_drops_stale_and_keeps_the_stamped_node(self):
         now = 1_000_000
+        cfg = {"nodes": []}
         peers = {"old": {"seen": now - mesh.PEER_SEEN_TTL - 1, "via": "m"},
                  "recent": {"seen": now - 10, "via": "m"},
                  "justnow": {"seen": now, "via": "m"}}
-        pruned = mesh._prune_peers(peers, "justnow", now)
+        pruned = mesh._prune_peers(cfg, peers, "justnow", now)
         self.assertNotIn("old", pruned)       # past the TTL
         self.assertIn("recent", pruned)
         self.assertIn("justnow", pruned)
+
+    def test_prune_never_exceeds_the_bound_v3(self):
+        # lodestar V3: the old code re-added keep_node AFTER truncating, so
+        # the store could be MAX+1. With a small roster the hard bound is
+        # MAX_TRACKED_PEERS exactly, never one over.
+        now = 1_000_000
+        cfg = {"nodes": ["a", "b"]}
+        peers = {f"n{i}": {"seen": now, "via": "m"}
+                 for i in range(mesh.MAX_TRACKED_PEERS + 50)}
+        pruned = mesh._prune_peers(cfg, peers, "n0", now)
+        self.assertLessEqual(len(pruned), mesh.MAX_TRACKED_PEERS)
+
+    def test_roster_peer_survives_flood_with_status_v1v2(self):
+        # lodestar V1+V2 (single root): a roster peer that declared BLOCKED
+        # must survive a flood WITH its load-bearing status, even when it
+        # sits in the exact position keep-newest would evict -- inserted
+        # LAST, same second as the flood, so ONLY roster-awareness saves it.
+        # (This is the deterministic proof: a roster-blind keep-newest would
+        # order it last on the stable tie and evict it. If this passed under
+        # roster-blind, it would be passing by insertion-order luck.)
+        now = 1_000_000
+        cfg = {"nodes": ["realpeer"]}
+        peers = {}
+        for i in range(mesh.MAX_TRACKED_PEERS + 100):
+            peers[f"flood{i}"] = {"seen": now, "via": "m"}   # FIRST
+        peers["realpeer"] = {"seen": now, "via": "m", "status": "blocked"}
+        pruned = mesh._prune_peers(cfg, peers, "flood0", now)
+        self.assertIn("realpeer", pruned)                    # not evicted
+        self.assertEqual(pruned["realpeer"]["status"], "blocked")  # status kept
+        self.assertLessEqual(len(pruned), mesh.MAX_TRACKED_PEERS)
+
+    def test_note_peer_preserves_status_on_a_roster_peers_ordinary_frame(self):
+        # V1's other half: an ordinary (non-presence) frame from a peer
+        # whose record still exists must not erase its status. Roster-aware
+        # eviction guarantees the roster record persists, so this holds.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)  # roster: alpha, beta
+            mesh.note_peer(cfg, "beta", "presence", status="blocked")
+            mesh.note_peer(cfg, "beta", "message")  # ordinary, carries no status
+            self.assertEqual(
+                mesh.load_peers(cfg)["beta"].get("status"), "blocked")
 
     def test_load_peers_resets_an_oversize_store(self):
         with tempfile.TemporaryDirectory() as d:
