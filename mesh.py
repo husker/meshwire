@@ -1208,7 +1208,14 @@ def _load_owner_trust(cfg):
 def _owner_key_is_passphraseless(binary, key_path):
     """True when the private key opens with an EMPTY passphrase. The empty
     string on this probe's argv is not a secret; _signing_env keeps agents
-    and askpass helpers out of the probe (#87 F1/F3)."""
+    and askpass helpers out of the probe (#87 F1/F3).
+
+    A non-zero returncode is read as 'protected'. Right after creation the
+    dominant non-zero cause is the wrong (empty) passphrase, which is the
+    correct read; an exotic probe failure would keep an unconfirmed key
+    (lodestar's low-risk nit on the PR #95 seat) -- acceptable because the
+    file is keygen-fresh and the live Windows ceremony (#62 bar) exercises
+    this path for real."""
     probe = subprocess.run(
         [binary, "-y", "-P", "", "-f", key_path],
         capture_output=True, text=True, timeout=60, env=_signing_env())
@@ -1256,16 +1263,28 @@ def _owner_init(cfg, allow_unprotected=False):
             raise ValueError("ssh-keygen could not create the owner key "
                              "(see its output above)")
         if _owner_key_is_passphraseless(binary, key_path):
+            undeleted = []
             for stale in (key_path, key_path + ".pub"):
                 try:
                     os.unlink(stale)
                 except FileNotFoundError:
                     pass
+                except OSError as exc:
+                    # Windows file locks etc. must not turn into a raw
+                    # traceback that hides the real problem and strands a
+                    # passphraseless key behind the already-exists guard
+                    # (lodestar, PR #95 seat).
+                    undeleted.append(f"{stale} ({exc})")
+            if undeleted:
+                fate = ("but COULD NOT be fully deleted -- remove manually "
+                        "before re-running: " + "; ".join(undeleted) + ".")
+            else:
+                fate = "and has been deleted."
             raise ValueError(
                 "the key was created WITHOUT a passphrase (empty at the "
-                "prompt) and has been deleted -- #64 requires one. Re-run "
-                "and set a passphrase, or pass --no-passphrase to create "
-                "an unprotected key deliberately.")
+                f"prompt) {fate} #64 requires one. Re-run and set a "
+                "passphrase, or pass --no-passphrase to create an "
+                "unprotected key deliberately.")
     with open(key_path + ".pub", "r", encoding="utf-8") as f:
         pub = f.read().strip()
     _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})

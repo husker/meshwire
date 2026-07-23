@@ -3451,6 +3451,41 @@ class SignedApprovalTests(unittest.TestCase):
         self.assertFalse(os.path.exists(mesh.owner_key_file(fresh)))
         self.assertFalse(os.path.exists(mesh.owner_key_file(fresh) + ".pub"))
 
+    def test_empty_passphrase_delete_failure_names_the_file(self):
+        # lodestar (PR #95 seat): a locked file (Windows) must surface as
+        # the loud ValueError naming what to remove -- never a raw unlink
+        # traceback that strands a passphraseless key behind the
+        # already-exists guard.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        fresh = make_cfg(other.name)
+        key = mesh.owner_key_file(fresh)
+
+        def fake_run(cmd, **kw):
+            with open(key, "w") as f:
+                f.write("key")
+            with open(key + ".pub", "w") as f:
+                f.write("ssh-ed25519 AAAA test")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        real_unlink = os.unlink
+
+        def locked_unlink(path):
+            if path == key:
+                raise PermissionError("locked by another process")
+            return real_unlink(path)
+
+        with mock.patch.object(mesh.subprocess, "run",
+                               side_effect=fake_run), \
+                mock.patch.object(mesh, "_owner_key_is_passphraseless",
+                                  return_value=True), \
+                mock.patch.object(mesh.os, "unlink",
+                                  side_effect=locked_unlink), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError,
+                                        "COULD NOT be fully deleted"):
+                mesh._owner_init(fresh)
+
     def test_no_passphrase_creates_unprotected_key_with_warning(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
