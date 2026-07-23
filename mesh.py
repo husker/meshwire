@@ -21,7 +21,6 @@ import base64
 import contextlib
 import email.message
 import errno
-import getpass
 import hashlib
 import hmac
 import io
@@ -1206,7 +1205,24 @@ def _load_owner_trust(cfg):
     return pub.strip()
 
 
-def _owner_init(cfg, passphrase=None, allow_unprotected=False):
+def _owner_key_is_passphraseless(binary, key_path):
+    """True when the private key opens with an EMPTY passphrase. The empty
+    string on this probe's argv is not a secret; _signing_env keeps agents
+    and askpass helpers out of the probe (#87 F1/F3).
+
+    A non-zero returncode is read as 'protected'. Right after creation the
+    dominant non-zero cause is the wrong (empty) passphrase, which is the
+    correct read; an exotic probe failure would keep an unconfirmed key
+    (lodestar's low-risk nit on the PR #95 seat) -- acceptable because the
+    file is keygen-fresh and the live Windows ceremony (#62 bar) exercises
+    this path for real."""
+    probe = subprocess.run(
+        [binary, "-y", "-P", "", "-f", key_path],
+        capture_output=True, text=True, timeout=60, env=_signing_env())
+    return probe.returncode == 0
+
+
+def _owner_init(cfg, allow_unprotected=False):
     """Create the mesh owner keypair here and trust it locally.
 
     The key is passphrase-protected by default. Minting an approval then runs
@@ -1217,24 +1233,58 @@ def _owner_init(cfg, passphrase=None, allow_unprotected=False):
     the gap #64 closes: cryptography cannot supply a decision nobody made.
 
     `allow_unprotected` (from `--no-passphrase`) keeps the old passphraseless
-    key for tests/CI, with the risk stated loudly in the output."""
+    key for tests/CI, with the risk stated loudly in the output.
+
+    #87 F3: for the protected path the passphrase NEVER exists in this
+    process or on any argv (ps / Win32 CommandLine stay clean) -- ssh-keygen
+    prompts for it on the inherited terminal itself. Passthrough cannot
+    pre-validate non-emptiness, so an empty passphrase is caught by probing
+    the created key and deleting it. The keygen-then-rekey alternative is
+    deliberately NOT used: `-p` takes `-N` too, plus a plaintext-key window
+    on disk."""
     key_path = owner_key_file(cfg)
     if os.path.exists(key_path) or os.path.exists(owner_trust_file(cfg)):
         raise ValueError("a mesh owner key or trust store already exists "
                          "here; refusing to replace it")
-    if not allow_unprotected and not (isinstance(passphrase, str)
-                                      and passphrase):
-        raise ValueError("owner key needs a passphrase (or --no-passphrase "
-                         "for an unprotected key)")
     binary = _ssh_keygen_binary()
-    completed = subprocess.run(
-        [binary, "-q", "-t", "ed25519",
-         "-N", "" if allow_unprotected else passphrase,
-         "-C", f"a2acast-owner-{cfg['mesh']}", "-f", key_path],
-        capture_output=True, text=True, timeout=60)
-    if completed.returncode != 0:
-        raise ValueError("ssh-keygen could not create the owner key: "
-                         + completed.stderr.strip())
+    cmd = [binary, "-q", "-t", "ed25519",
+           "-C", f"a2acast-owner-{cfg['mesh']}", "-f", key_path]
+    if allow_unprotected:
+        completed = subprocess.run(cmd + ["-N", ""], capture_output=True,
+                                   text=True, timeout=60)
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not create the owner key: "
+                             + completed.stderr.strip())
+    else:
+        # Inherited stdio so the prompt reaches the human; _signing_env so
+        # no GUI askpass can intercept it (F1) -- terminal or nothing.
+        completed = subprocess.run(cmd, timeout=300, env=_signing_env())
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not create the owner key "
+                             "(see its output above)")
+        if _owner_key_is_passphraseless(binary, key_path):
+            undeleted = []
+            for stale in (key_path, key_path + ".pub"):
+                try:
+                    os.unlink(stale)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    # Windows file locks etc. must not turn into a raw
+                    # traceback that hides the real problem and strands a
+                    # passphraseless key behind the already-exists guard
+                    # (lodestar, PR #95 seat).
+                    undeleted.append(f"{stale} ({exc})")
+            if undeleted:
+                fate = ("but COULD NOT be fully deleted -- remove manually "
+                        "before re-running: " + "; ".join(undeleted) + ".")
+            else:
+                fate = "and has been deleted."
+            raise ValueError(
+                "the key was created WITHOUT a passphrase (empty at the "
+                f"prompt) {fate} #64 requires one. Re-run and set a "
+                "passphrase, or pass --no-passphrase to create an "
+                "unprotected key deliberately.")
     with open(key_path + ".pub", "r", encoding="utf-8") as f:
         pub = f.read().strip()
     _write_json_secure(owner_trust_file(cfg), {"owner_pub": pub})
@@ -5078,35 +5128,40 @@ def cmd_owner_init(args):
     # cmd_join already refresh via _write_config_here; this was the third
     # entry point where a directory gains a secret, and it did not.
     _ensure_gitignore(cfg["_dir"])
-    passphrase = None
     if not getattr(args, "no_passphrase", False):
-        # Read the passphrase on the terminal (getpass, no echo). This is the
-        # point of #64: an unattended/agent run has no terminal and MUST fail
-        # here rather than silently mint a passphraseless key an agent could
-        # then use to sign approvals unattended.
+        # #64: an unattended/agent run has no terminal and MUST fail here
+        # rather than silently mint a passphraseless key. #87 F3: the
+        # passphrase itself is ssh-keygen's business alone -- it is never
+        # read into this process and never appears on any argv.
         if not sys.stdin.isatty():
             sys.exit("error: owner-init needs a terminal to set the key "
                      "passphrase. Run it interactively, or pass "
                      "--no-passphrase for an unprotected key (agents can then "
                      "mint unattended — see #64).")
-        try:
-            passphrase = getpass.getpass("Owner key passphrase: ")
-            confirm = getpass.getpass("Confirm passphrase: ")
-        except (EOFError, KeyboardInterrupt):
-            sys.exit("error: owner-init aborted")
-        if not passphrase:
-            sys.exit("error: empty passphrase; use --no-passphrase for an "
-                     "unprotected key")
-        if passphrase != confirm:
-            sys.exit("error: passphrases did not match")
+        print("ssh-keygen will prompt for the owner key passphrase — it "
+              "stays between you and ssh-keygen (#87 F3).")
     try:
-        _owner_init(cfg, passphrase=passphrase,
+        _owner_init(cfg,
                     allow_unprotected=getattr(args, "no_passphrase", False))
     except ValueError as exc:
         sys.exit(f"error: {exc}")
 
 
 def cmd_owner_trust(args):
+    # #87 F2: owner-key ROTATION is interactive-only, and it refuses in ANY
+    # unattended POSTURE -- the --unattended flag or an armed env var alike,
+    # each alone. Rotation is the moment out-of-band fingerprint
+    # confirmation matters most; an environment already armed for
+    # unattended trust IS an unattended posture even without the flag.
+    # This fires before any config or trust-file I/O.
+    if getattr(args, "replace", False) and (
+            args.unattended or
+            os.environ.get(OWNER_TRUST_UNATTENDED_ENV) == "1"):
+        sys.exit(f"error: --replace (owner-key rotation) is interactive-"
+                 f"only and refuses in any unattended posture: drop "
+                 f"--unattended and unset {OWNER_TRUST_UNATTENDED_ENV}, "
+                 f"then confirm the new fingerprint at the terminal "
+                 f"(#87 F2).")
     if args.unattended and os.environ.get(OWNER_TRUST_UNATTENDED_ENV) != "1":
         sys.exit(f"error: --unattended also requires "
                  f"{OWNER_TRUST_UNATTENDED_ENV}=1 in the environment. Two "
