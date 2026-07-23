@@ -2842,6 +2842,94 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         self.assertEqual(self._cursor()["since"], 207)
 
 
+class MemberCertTests(unittest.TestCase):
+    """#76 Phase A: owner-signed membership certs — mint, verify, cache,
+    and the log-only status reporting. Everything here is additive; the
+    cache file is the only state and deleting it reverts the phase."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _node_pubkey(self):
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        key = os.path.join(d, "nk")
+        subprocess.run(
+            [shutil.which("ssh-keygen"), "-q", "-t", "ed25519", "-N", "",
+             "-C", "test-node", "-f", key],
+            check=True, capture_output=True, timeout=60)
+        with open(key + ".pub", "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_cert_roundtrip_binds_the_key(self):
+        pub = self._node_pubkey()
+        block = mesh._mint_member_cert(self.cfg, "beta", pub)
+        ok, reason, body = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok, reason)
+        self.assertEqual(body["name"], "beta")
+        self.assertEqual(mesh._normalize_pubkey(body["key"]),
+                         mesh._normalize_pubkey(pub))
+        # tampering with the signed body must break the signature
+        import base64 as b64
+        raw = block[len("mwcert1-"):]
+        parsed = json.loads(b64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+        parsed["body"]["name"] = "mallory"
+        forged = "mwcert1-" + b64.urlsafe_b64encode(
+            json.dumps(parsed, sort_keys=True,
+                       separators=(",", ":")).encode()).decode().rstrip("=")
+        ok2, reason2, _ = mesh._verify_member_cert(self.cfg, forged)
+        self.assertFalse(ok2)
+        self.assertIn("signature", reason2)
+
+    def test_cert_rejects_wrong_mesh_and_expiry(self):
+        pub = self._node_pubkey()
+        block = mesh._mint_member_cert(self.cfg, "beta", pub, ttl=1)
+        other = make_cfg(tempfile.mkdtemp(dir=self.cfg["_dir"]))
+        other["id"] = "ffffffffffffffff"
+        ok, reason, _ = mesh._verify_member_cert(other, block)
+        self.assertFalse(ok)
+        self.assertIn("different mesh", reason)
+        ok2, reason2, _ = mesh._verify_member_cert(
+            self.cfg, block, now=mesh.time.time() + 120)
+        self.assertFalse(ok2)
+        self.assertIn("expired", reason2)
+
+    def test_cert_status_reporting_is_log_only_and_key_bound(self):
+        pub = self._node_pubkey()
+        block = mesh._mint_member_cert(self.cfg, "beta", pub)
+        ok, _, body = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok)
+        mesh._note_cert(self.cfg, body)
+        def status_for(frm, key):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                mesh._report_cert_status(self.cfg, frm, key)
+            return err.getvalue()
+        self.assertIn("CERT_OK", status_for("beta", pub))
+        # key-bound: a rename drifts the name, the cert stays valid
+        drift = status_for("beta-renamed", pub)
+        self.assertIn("CERT_NAME_DRIFT", drift)
+        self.assertIn("cert_name=beta", drift)
+        self.assertIn("CERT_MISSING", status_for("gamma",
+                                                 self._node_pubkey()))
+        stale = dict(body, exp=int(mesh.time.time()) - 10)
+        mesh._note_cert(self.cfg, stale)
+        self.assertIn("CERT_STALE", status_for("beta", pub))
+
+    def test_cert_mint_requires_a_pinned_key(self):
+        with mock.patch.object(mesh, "load_config",
+                               return_value=self.cfg), \
+                mock.patch.object(mesh, "_load_pins", return_value={}):
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_cert_mint(argparse.Namespace(node="ghost",
+                                                      ttl_days=365))
+        self.assertIn("no pinned key", str(caught.exception))
+
+
 class CodexHookTests(MembershipCmdTests):
     def _setup_mesh(self):
         cfg = make_cfg()
