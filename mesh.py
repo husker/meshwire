@@ -1974,6 +1974,193 @@ def _verify_approval(cfg, descriptor, token):
     return True, "ok"
 
 
+CERT_TTL_DEFAULT = 365 * 86400
+CERT_TTL_MAX = 400 * 86400
+CERT_BLOCK_MAX = 8192
+CERTS_NAME = ".meshwire.certs.json"
+
+
+def certs_file(cfg):
+    return os.path.join(cfg["_dir"], CERTS_NAME)
+
+
+def _cert_namespace(cfg):
+    """Distinct ssh-keygen namespace: a membership cert must never verify
+    as an approval token, nor the reverse."""
+    return f"a2acast-cert-{cfg['id']}"
+
+
+def _mint_member_cert(cfg, name, pubkey, ttl=CERT_TTL_DEFAULT):
+    """Owner-signed membership certificate (#76 Phase A, log-only era).
+
+    Certs bind the KEY, never the name alone (bastion's custody seat: three
+    renames in one afternoon, zero ceremonies) -- the name rides along for
+    display and drift observation, but verification pins the key. Minting
+    runs the owner key's signing ceremony: with a passphrase-protected key
+    (#64) that requires a human at the terminal, and it fails closed
+    unattended exactly like approval minting."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("cert needs a node name")
+    pub = _normalize_pubkey(pubkey)
+    if not isinstance(ttl, int) or isinstance(ttl, bool) \
+            or not 0 < ttl <= CERT_TTL_MAX:
+        raise ValueError("cert ttl must be 1..%d seconds" % CERT_TTL_MAX)
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        raise ValueError("this machine does not hold the mesh owner key "
+                         "(run `mesh owner-init` where the owner works)")
+    issued = int(time.time())
+    body = {"v": 1, "kind": "membercert", "mesh": cfg["id"],
+            "name": name, "key": pub, "fpr": _key_fingerprint(pub),
+            "iat": issued, "exp": issued + ttl}
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    binary = _ssh_keygen_binary()
+    workdir = tempfile.mkdtemp(prefix=".mw-cert-", dir=cfg["_dir"])
+    payload_path = os.path.join(workdir, "payload")
+    try:
+        with open(payload_path, "wb") as f:
+            f.write(payload)
+        try:
+            completed = subprocess.run(
+                [binary, "-Y", "sign", "-f", key_path,
+                 "-n", _cert_namespace(cfg), payload_path],
+                capture_output=True, text=True, timeout=60,
+                env=_signing_env())
+        except subprocess.TimeoutExpired:
+            raise ValueError(
+                "signing timed out — a passphrase-protected owner key needs "
+                "a present human to enter the passphrase at the terminal; an "
+                "unattended process cannot mint (#64)")
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign the cert: "
+                             + completed.stderr.strip())
+        with open(payload_path + ".sig", "r", encoding="utf-8") as f:
+            signature = f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    token = json.dumps({"body": body, "sig": signature},
+                       sort_keys=True, separators=(",", ":"))
+    return "mwcert1-" + base64.urlsafe_b64encode(
+        token.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _verify_member_cert(cfg, block, now=None):
+    """Return (ok, reason, body_or_None). Owner signature, shape, mesh id
+    and expiry -- callers compare body['key'] to the pin they hold; the
+    cert proves the OWNER vouched for that key, nothing else."""
+    if (not isinstance(block, str) or not block.startswith("mwcert1-")
+            or len(block) > CERT_BLOCK_MAX):
+        return False, "cert malformed", None
+    raw = block[len("mwcert1-"):]
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+        body, signature = parsed["body"], parsed["sig"]
+    except (ValueError, TypeError, KeyError):
+        return False, "cert malformed", None
+    if not isinstance(body, dict) or not isinstance(signature, str):
+        return False, "cert malformed", None
+    if body.get("v") != 1 or body.get("kind") != "membercert":
+        return False, "cert version or kind unsupported", None
+    if body.get("mesh") != cfg["id"]:
+        return False, "cert is for a different mesh", None
+    try:
+        key = _normalize_pubkey(body.get("key"))
+    except (ValueError, TypeError):
+        return False, "cert key unparseable", None
+    if body.get("fpr") != _key_fingerprint(key):
+        return False, "cert fingerprint mismatch", None
+    if not isinstance(body.get("name"), str) or not body["name"]:
+        return False, "cert name invalid", None
+    now = time.time() if now is None else now
+    exp, iat = body.get("exp"), body.get("iat")
+    if (not isinstance(exp, int) or isinstance(exp, bool)
+            or not isinstance(iat, int) or isinstance(iat, bool)
+            or iat > now + 300 or exp - iat > CERT_TTL_MAX + 300):
+        return False, "cert timestamps invalid", None
+    if now >= exp:
+        return False, "cert expired", None
+    try:
+        owner_pub = _load_owner_trust(cfg)
+    except ValueError as exc:
+        return False, str(exc), None
+    try:
+        binary = _ssh_keygen_binary()
+    except ValueError as exc:
+        return False, str(exc), None
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    principal = f"owner@{cfg['id']}"
+    workdir = tempfile.mkdtemp(prefix=".mw-certverify-", dir=cfg["_dir"])
+    try:
+        sig_path = os.path.join(workdir, "payload.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(signature)
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{principal} "
+                    f"namespaces=\"{_cert_namespace(cfg)}\" "
+                    f"{owner_pub}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+             "-n", _cert_namespace(cfg), "-s", sig_path],
+            input=payload, capture_output=True, timeout=60)
+        if completed.returncode != 0:
+            return False, "cert signature verification failed", None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return True, "ok", body
+
+
+def _note_cert(cfg, body):
+    """Cache a VERIFIED cert body, keyed by key fingerprint. Additive and
+    revertible: deleting the cache file reverts Phase A entirely (#76)."""
+    try:
+        store = _load_json_regular(certs_file(cfg), require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        store = {}
+    if not isinstance(store, dict):
+        store = {}
+    store[body["fpr"]] = body
+    _write_json_secure(certs_file(cfg), store)
+
+
+def _cert_for_key(cfg, pubkey):
+    """Cached cert body for a normalized pubkey, or None."""
+    try:
+        fpr = _key_fingerprint(_normalize_pubkey(pubkey))
+    except (ValueError, TypeError):
+        return None
+    try:
+        store = _load_json_regular(certs_file(cfg), require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return store.get(fpr) if isinstance(store, dict) else None
+
+
+def _report_cert_status(cfg, frm, pubkey):
+    """#76 Phase A observability: LOG-ONLY cert verdict for a pin-verified
+    frame. Never affects delivery; this line is the soak evidence."""
+    if not pubkey:
+        return
+    body = _cert_for_key(cfg, pubkey)
+    if body is None:
+        status = "CERT_MISSING"
+    elif time.time() >= body.get("exp", 0):
+        status = "CERT_STALE"
+    elif body.get("name") != frm:
+        # Key-bound by design: a rename makes the name drift while the
+        # cert stays valid for the key. Informational, expected after
+        # renames, resolved by re-minting at leisure.
+        status = f"CERT_NAME_DRIFT cert_name={_single_line(body['name'])}"
+    else:
+        status = "CERT_OK"
+    print(f"MESH_CERT from={_single_line(frm)} {status}", file=sys.stderr)
+
+
 def status_file(cfg, node):
     return os.path.join(cfg["_dir"], STATUS_NAME.format(node))
 
@@ -5214,6 +5401,59 @@ def cmd_owner_trust(args):
     print("mesh owner trusted — approvals from this owner verify here now")
 
 
+def cmd_cert_mint(args):
+    cfg = load_config()
+    pins = _load_pins(cfg)
+    pub = pins.get(args.node)
+    if not pub:
+        sys.exit(f"error: no pinned key for '{args.node}' — the owner "
+                 "machine pins a node after receiving a signed frame from "
+                 "it; it cannot certify a key it has never seen")
+    ttl_days = getattr(args, "ttl_days", 365)
+    if not isinstance(ttl_days, int) or not 0 < ttl_days <= 400:
+        sys.exit("error: --ttl-days must be 1..400")
+    try:
+        block = _mint_member_cert(cfg, args.node, pub, ttl=ttl_days * 86400)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"member cert for '{args.node}' "
+          f"({_key_fingerprint(_normalize_pubkey(pub))}) — distribute like "
+          "an invite; each member runs:")
+    print(f"  mesh cert-trust {block}")
+    print("Log-only in Phase A (#76): receivers observe and report cert "
+          "status, delivery never changes.")
+
+
+def cmd_cert_trust(args):
+    cfg = load_config()
+    ok, reason, body = _verify_member_cert(cfg, args.block)
+    if not ok:
+        sys.exit(f"error: cert rejected: {reason}")
+    _note_cert(cfg, body)
+    print(f"member cert cached: name={_single_line(body['name'])} "
+          f"fpr={body['fpr']} "
+          f"exp={time.strftime('%Y-%m-%d', time.localtime(body['exp']))} "
+          "(log-only in Phase A)")
+
+
+def cmd_cert_show(args):
+    cfg = load_config()
+    try:
+        store = _load_json_regular(certs_file(cfg), require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        store = {}
+    if not isinstance(store, dict) or not store:
+        print("no member certs cached here")
+        return
+    for fpr, body in sorted(store.items(),
+                            key=lambda kv: kv[1].get("name", "")):
+        if not isinstance(body, dict):
+            continue
+        print(f"{_single_line(body.get('name', '?'))}  {fpr}  exp="
+              f"{time.strftime('%Y-%m-%d', time.localtime(body.get('exp', 0)))}")
+
+
 def cmd_approve(args):
     cfg = load_config()
     try:
@@ -6178,8 +6418,13 @@ def _cmd_watch_owned(args, cfg, me):
             continue
         # stage 3: classify sender authenticity. Non-enforcing -- the verdict
         # is surfaced and pins an unseen peer, but never drops a frame.
-        _report_verdict(frm, ev, _frame_verdict(
-            cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev))
+        verdict = _frame_verdict(
+            cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev)
+        _report_verdict(frm, ev, verdict)
+        if verdict == FRAME_VERIFIED:
+            # #76 Phase A: log-only cert observability for verified frames,
+            # against the LOCAL pin (the key that actually verified).
+            _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
         if ctl:
             line = _handle_control(cfg, me, frm, ctl)
             checkpoint()  # control frames carry no undelivered payload
@@ -6854,6 +7099,9 @@ class MeshMCPServer:
             verdict = _frame_verdict(
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev)
             _report_verdict(frm, ev, verdict)
+            if verdict == FRAME_VERIFIED:
+                # #76 Phase A: log-only cert observability (see cmd_watch).
+                _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
             if ctl:
                 line = _handle_control(cfg, me, frm, ctl)
                 if line:
@@ -10442,6 +10690,20 @@ def main():
                    help="rotate: replace a different already-trusted owner "
                         "key (confirm the new fingerprint out of band first)")
     p.set_defaults(fn=cmd_owner_trust)
+    p = sub.add_parser("cert-mint",
+                       help="owner: mint a membership cert for a node's "
+                            "PINNED key (#76 Phase A, log-only)")
+    p.add_argument("node")
+    p.add_argument("--ttl-days", type=int, default=365)
+    p.set_defaults(fn=cmd_cert_mint)
+    p = sub.add_parser("cert-trust",
+                       help="verify an owner-signed member cert and cache "
+                            "it (log-only in Phase A)")
+    p.add_argument("block")
+    p.set_defaults(fn=cmd_cert_trust)
+    p = sub.add_parser("cert-show",
+                       help="list member certs cached on this node")
+    p.set_defaults(fn=cmd_cert_show)
 
     p = sub.add_parser("approve",
                        help="owner machine only: mint a single-use, "
