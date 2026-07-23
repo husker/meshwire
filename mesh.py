@@ -2368,7 +2368,7 @@ def _report_cert_status(cfg, frm, pubkey):
         # unreadable, so we cannot prove this key is clean. Never fall
         # through to a clean-looking cert status -- report the failure.
         print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
-              f"(revocation store unreadable — cannot confirm not-revoked)",
+              f"(revocation store unreadable -- cannot confirm not-revoked)",
               file=sys.stderr)
         return
     body = _cert_for_key(cfg, pubkey)
@@ -6537,11 +6537,11 @@ def _handle_control(cfg, me, frm, ctl, verdict=None):
             # chatter (lodestar B1); it is the attack-path event the #62
             # soak bar requires witnessing.
             print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
-                  f"KEY_MISMATCH (pin conflict — possible impersonation)",
+                  f"KEY_MISMATCH (pin conflict -- possible impersonation)",
                   file=sys.stderr)
         else:
             print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
-                  f"UNVERIFIED_SOURCE (ignored — not a proven key-continuity "
+                  f"UNVERIFIED_SOURCE (ignored -- not a proven key-continuity "
                   f"rename)", file=sys.stderr)
         return None
     if kind == "ping":

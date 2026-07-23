@@ -3063,6 +3063,10 @@ class MemberCertTests(unittest.TestCase):
         self.assertIn("impersonation", out)
         self.assertNotIn("UNVERIFIED_SOURCE", out)
         self.assertNotIn("WOULD_MIGRATE", out)
+        # bastion: soak-parseable evidence must survive a cp1252 console
+        # (no em dashes / typography that mojibakes or crashes on Windows).
+        out.encode("cp1252")
+        self.assertTrue(out.strip().isascii())
 
     def test_revoked_status_fails_shut_on_unreadable_store(self):
         # lodestar B2: a revoked key whose revocation store is corrupt must
