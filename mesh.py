@@ -2380,7 +2380,8 @@ def _report_cert_status(cfg, frm, pubkey):
         # unreadable, so we cannot prove this key is clean. Never fall
         # through to a clean-looking cert status -- report the failure.
         print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
-              f"(revocation store unreadable -- cannot confirm not-revoked)",
+              f"(cannot confirm not-revoked -- store unreadable or key "
+              f"unfingerprintable)",
               file=sys.stderr)
         return
     body = _cert_for_key(cfg, pubkey)

@@ -3108,25 +3108,24 @@ class MemberCertTests(unittest.TestCase):
         src = open(mesh.__file__, encoding="utf-8").read()
         offenders = []
 
-        def literals_of(node):
-            parts = []
-            for a in node.args:
-                if isinstance(a, _ast.Constant) and isinstance(a.value, str):
-                    parts.append(a.value)
-                elif isinstance(a, _ast.JoinedStr):
-                    parts += [v.value for v in a.values
-                              if isinstance(v, _ast.Constant)
-                              and isinstance(v.value, str)]
-            return "".join(parts)
+        def joined_text(node):
+            return "".join(v.value for v in node.values
+                           if isinstance(v, _ast.Constant)
+                           and isinstance(v.value, str))
 
+        # Emission-mechanism-agnostic (lodestar PR-108): scan EVERY literal
+        # that begins a MESH_ evidence token, not just print() args -- some
+        # MESH_ lines go out via sys.std{out,err}.write, and MESH_TASK_PENDING
+        # rides stdout, the one stream #98 shows can actually crash.
         for node in _ast.walk(_ast.parse(src)):
-            if (isinstance(node, _ast.Call)
-                    and isinstance(node.func, _ast.Name)
-                    and node.func.id == "print"):
-                lit = literals_of(node)
-                if "MESH_" in lit and not lit.isascii():
-                    offenders.append((node.lineno,
-                                      lit.encode("unicode_escape").decode()))
+            text = None
+            if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+                text = node.value
+            elif isinstance(node, _ast.JoinedStr):
+                text = joined_text(node)
+            if text and text.lstrip().startswith("MESH_") and not text.isascii():
+                offenders.append((node.lineno,
+                                  text.encode("unicode_escape").decode()))
         self.assertEqual(offenders, [], f"non-ASCII MESH_* literals: {offenders}")
 
     def test_rename_line_carries_the_frame_id(self):
@@ -3151,7 +3150,12 @@ class MemberCertTests(unittest.TestCase):
             captured["sender"] = sender
             captured["ctl"] = ctl
 
-        with mock.patch.object(mesh, "my_node", return_value="oldname"), \
+        # load_config MUST be mocked (lodestar PR-108): unmocked, cmd_iam's
+        # real load_config walks UP to any enclosing mesh and _mutate_config
+        # then appends 'newname' to that REAL roster -- so the test does
+        # damage exactly where it passes. Mock it to the isolated tmp cfg.
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                mock.patch.object(mesh, "my_node", return_value="oldname"), \
                 mock.patch.object(mesh, "_detect_harness",
                                   return_value="claude"), \
                 mock.patch.object(mesh, "node_file",
