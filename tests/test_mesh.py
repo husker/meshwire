@@ -2970,6 +2970,84 @@ class MemberCertTests(unittest.TestCase):
             got = mesh._bind_peer(cfg, "known", pub)
         self.assertEqual(got, pub)
 
+    def test_revocation_roundtrip_and_status_precedence(self):
+        # #76 slice 2: an owner-signed revocation verifies, caches, and makes
+        # _report_cert_status log CERT_REVOKED for that key -- OVER any cert
+        # status (revoked beats CERT_OK).
+        pub = self._node_pubkey()
+        cert = mesh._mint_member_cert(self.cfg, "beta", pub)
+        _, _, cbody = mesh._verify_member_cert(self.cfg, cert)
+        mesh._note_cert(self.cfg, cbody)
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
+        block = mesh._mint_revocation(self.cfg, fpr, name="beta")
+        ok, reason, body = mesh._verify_revocation(self.cfg, block)
+        self.assertTrue(ok, reason)
+        self.assertEqual(body["fpr"], fpr)
+        mesh._note_revocation(self.cfg, body)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._report_cert_status(self.cfg, "beta", pub)
+        self.assertIn("CERT_REVOKED", err.getvalue())
+        self.assertNotIn("CERT_OK", err.getvalue())
+
+    def test_revocation_rejects_wrong_mesh_and_forgery(self):
+        pub = self._node_pubkey()
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
+        block = mesh._mint_revocation(self.cfg, fpr)
+        other = make_cfg(tempfile.mkdtemp(dir=self.cfg["_dir"]))
+        other["id"] = "ffffffffffffffff"
+        ok, reason, _ = mesh._verify_revocation(other, block)
+        self.assertFalse(ok)
+        self.assertIn("different mesh", reason)
+        import base64 as b64
+        raw = block[len("mwrevoke1-"):]
+        parsed = json.loads(b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        parsed["body"]["fpr"] = "SHA256:tampered"
+        forged = "mwrevoke1-" + b64.urlsafe_b64encode(
+            json.dumps(parsed, sort_keys=True,
+                       separators=(",", ":")).encode()).decode().rstrip("=")
+        ok2, reason2, _ = mesh._verify_revocation(self.cfg, forged)
+        self.assertFalse(ok2)
+        self.assertIn("signature", reason2)
+
+    def test_revocation_namespace_isolated_from_certs(self):
+        # A revocation block must never verify as a cert, nor vice versa:
+        # distinct ssh-keygen namespaces.
+        pub = self._node_pubkey()
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
+        rev = mesh._mint_revocation(self.cfg, fpr)
+        ok, _, _ = mesh._verify_member_cert(self.cfg, rev.replace(
+            "mwrevoke1-", "mwcert1-", 1))
+        self.assertFalse(ok)
+        cert = mesh._mint_member_cert(self.cfg, "beta", pub)
+        ok2, _, _ = mesh._verify_revocation(self.cfg, cert.replace(
+            "mwcert1-", "mwrevoke1-", 1))
+        self.assertFalse(ok2)
+
+    def test_rename_observation_is_log_only_and_verdict_gated(self):
+        # #93/#76 slice 2: a verified rename control frame logs WOULD_MIGRATE
+        # and migrates NOTHING; an unverified source is logged as ignored.
+        # Neither writes a pin.
+        pins_before = dict(mesh._load_pins(self.cfg))
+        ctl = {"mw": "rename", "old": "beta", "new": "beta-new",
+               "ts": 1}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            line = mesh._handle_control(self.cfg, "alpha", "beta", ctl,
+                                        verdict=mesh.FRAME_VERIFIED)
+        self.assertIsNone(line)
+        self.assertIn("WOULD_MIGRATE", err.getvalue())
+        self.assertIn("beta -> beta-new", err.getvalue())
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            mesh._handle_control(self.cfg, "alpha", "beta", ctl,
+                                 verdict=mesh.FRAME_UNVERIFIED)
+        self.assertIn("UNVERIFIED_SOURCE", err2.getvalue())
+        self.assertNotIn("WOULD_MIGRATE", err2.getvalue())
+        # log-only: the pin store is untouched by either observation
+        self.assertEqual(mesh._load_pins(self.cfg), pins_before)
+        self.assertNotIn("beta-new", mesh._load_pins(self.cfg))
+
     def test_cert_mint_requires_a_pinned_key(self):
         with mock.patch.object(mesh, "load_config",
                                return_value=self.cfg), \
