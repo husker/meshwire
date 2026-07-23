@@ -48,6 +48,13 @@ if not installed as a command).
    same as no watcher.
    Mesh deliveries arrive automatically between turns. To wait for a message or
    task result, end your turn — do not sleep or poll `mesh_pending` in a loop.
+   **Windows: if the plugin hooks never seem to arm** (no wakes at all, and
+   SessionStart shows `Executable not found in $PATH: "mesh"`), the harness
+   spawns hooks with the registry PATH, not your shell's — and uv installs
+   `mesh` to `%USERPROFILE%\.local\bin`, which a shell profile may add but the
+   Windows *registry* User PATH does not. Fix: add that directory to the User
+   PATH (`uv tool update-shell`, or set it in the registry) and restart the
+   session; until then, fall back to the one-shot re-arm loop above. (#90)
 
 ## When the watcher prints
 
