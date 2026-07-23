@@ -111,6 +111,16 @@ def _append_activity(cfg, node, kind, frm, text, unsolicited=False):
 TASKS_NAME = ".meshwire.tasks.json"
 DELEGATE_TASKS_NAME = ".meshwire.delegate-tasks.{}.json"
 PEERS_NAME = ".meshwire.peers.json"
+# #106: peers.json is written from the untrusted per-frame receive path, so
+# it needs the bounds every other store here has. A hard entry cap (keep the
+# most-recently-seen) bounds a flood -- and because every frame re-stamps an
+# ACTIVE peer's `seen`, currently-talking peers always survive eviction; only
+# stale-and-crowded-out ones drop, and they reappear on their next frame. A
+# generous display TTL trims long-idle sightings (like the replay ledger's
+# bounded window). The byte cap on load is the corruption/abuse backstop.
+MAX_TRACKED_PEERS = 512
+PEER_SEEN_TTL = 30 * 86400
+PEERS_FILE_MAX = 8 * 1024 * 1024
 REPLAY_NAME = ".meshwire.replay-{}.json"
 REPLAY_REVISIT_THRESHOLD = 20000  # #77: above this, the full-rewrite save is
 # worth measuring (~26ms); surfaced in `mesh status` so the trigger is visible
@@ -2420,10 +2430,60 @@ def set_local_status(cfg, node, status):
 
 def load_peers(cfg):
     try:
+        # #106: bound the read like every other store. An oversize file is
+        # abuse or corruption, not legitimate state (a pruned store stays
+        # ~40KB); reset it and let live sightings rebuild -- active peers
+        # re-populate on their next frame.
+        if os.path.getsize(peers_file(cfg)) > PEERS_FILE_MAX:
+            return {}
         with open(peers_file(cfg), "r", encoding="utf-8") as f:
-            return json.load(f)
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _prune_peers(cfg, peers, keep_node, now=None):
+    """Bound peers.json (#106) with ROSTER-AWARE eviction (lodestar PR-107).
+
+    Keep every roster peer WHOLE. cfg['nodes'] is already bounded by
+    _pin_cap, so that set is safe to retain in full -- and doing so fixes
+    three bugs a plain keep-newest introduced:
+      V1: an evicted record rebuilds WITHOUT its presence status on the next
+          ordinary frame, and status is load-bearing (a 'blocked' worker
+          would silently re-enter the eligible set). Roster peers -- where
+          real workers live -- are never evicted, so their status is never
+          erased. (Exempting status-carrying peers instead would NOT work:
+          any member can send presence, so that exemption is floodable.)
+      V2: `seen` is whole seconds and sort() is stable, so a same-second
+          burst is ordered by the flooder's insertion order. Roster peers
+          are kept regardless of the tie, so a real peer stamped in the
+          flood's second still survives.
+    Flood names are exactly the ones the roster cap DECLINED, so they are
+    non-roster and evicted first; within the non-roster remainder keep the
+    most-recently-seen up to the budget. Size is bounded by
+    max(MAX_TRACKED_PEERS, |roster|) -- never the +1 overflow V3 hit."""
+    now = int(time.time()) if now is None else now
+    fresh = {n: p for n, p in peers.items()
+             if isinstance(p, dict) and isinstance(p.get("seen"), int)
+             and p["seen"] > now - PEER_SEEN_TTL}
+    if keep_node in peers and keep_node not in fresh:
+        fresh[keep_node] = peers[keep_node]
+    if len(fresh) <= MAX_TRACKED_PEERS:
+        return fresh
+    roster = set(cfg.get("nodes") or [])
+    kept = {n: p for n, p in fresh.items() if n in roster}
+    budget = MAX_TRACKED_PEERS - len(kept)
+    if budget > 0:
+        # keep_node was just stamped with `now`, so it sorts first here and
+        # is always within budget (unless the roster alone fills the cap --
+        # a huge-mesh edge where an unrostered just-seen peer waits for its
+        # next frame, matching the roster-cap decline).
+        others = sorted(((n, p) for n, p in fresh.items() if n not in roster),
+                        key=lambda kv: kv[1].get("seen", 0), reverse=True)
+        for n, p in others[:budget]:
+            kept[n] = p
+    return kept
 
 
 def note_peer(cfg, node, via, status=None):
@@ -2433,6 +2493,9 @@ def note_peer(cfg, node, via, status=None):
     """
     if not node or node == BROADCAST:
         return
+    if not os.path.exists(peers_file(cfg)):
+        _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
+    peers = load_peers(cfg)  # #106: load ONCE (was twice on the declined path)
     if node not in cfg["nodes"]:
         # #100: the durable roster is invite-embedded and read by status/
         # addressing, so an unbounded auto-grow lets any mesh-key holder
@@ -2449,22 +2512,21 @@ def note_peer(cfg, node, via, status=None):
                 if node not in latest["nodes"]:
                     latest["nodes"].append(node)
             _mutate_config(cfg, _add_node)
-        elif not load_peers(cfg).get(node):
-            # First time we decline to admit this name -- warn once (the
-            # peers.json check makes it once-per-name, not once-per-frame).
+        elif node not in peers:
+            # First time we decline to admit this name -- warn once, gated on
+            # the already-loaded store (once-per-name, not once-per-frame).
             print(f"MESH_WARN: roster at its cap ({len(cfg['nodes'])}) -- "
                   f"not adding auto-discovered '{_single_line(node)}' to the "
                   f"durable roster; its sighting is still tracked. Prune "
                   f"nodes or raise pin_cap to admit it (#100)",
                   file=sys.stderr)
-    if not os.path.exists(peers_file(cfg)):
-        _ensure_gitignore(cfg["_dir"])  # v0.4 meshes upgraded in place
-    peers = load_peers(cfg)
+    now = int(time.time())
     peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
-    peer.update({"seen": int(time.time()), "via": via})
+    peer.update({"seen": now, "via": via})
     if status in PRESENCE_STATES:
-        peer.update({"status": status, "status_seen": int(time.time())})
+        peer.update({"status": status, "status_seen": now})
     peers[node] = peer
+    peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
         json.dump(peers, f, indent=2)
         f.write("\n")

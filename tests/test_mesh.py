@@ -596,6 +596,107 @@ class PeerTests(unittest.TestCase):
             self.assertFalse(os.path.exists(cfg["_path"]))  # config untouched
             self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "pong")
 
+    def test_peers_store_is_bounded_under_a_flood(self):
+        # #106: a flood cannot grow peers.json without bound (the store half
+        # of #100). Feed far more than the cap; the file stays bounded.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            for i in range(mesh.MAX_TRACKED_PEERS + 200):
+                mesh.note_peer(cfg, f"flood{i}", "message")
+            peers = mesh.load_peers(cfg)
+            self.assertLessEqual(len(peers), mesh.MAX_TRACKED_PEERS)
+
+    def test_active_peer_survives_a_flood(self):
+        # The bound must not evict a currently-active peer: because each
+        # frame re-stamps `seen`, an active peer always has a fresh timestamp
+        # and survives keep-newest eviction.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "realpeer", "message")
+            for i in range(mesh.MAX_TRACKED_PEERS + 100):
+                mesh.note_peer(cfg, f"flood{i}", "message")
+                if i % 50 == 0:
+                    mesh.note_peer(cfg, "realpeer", "pong")  # stays active
+            self.assertIn("realpeer", mesh.load_peers(cfg))
+
+    def test_prune_peers_drops_stale_and_keeps_the_stamped_node(self):
+        now = 1_000_000
+        cfg = {"nodes": []}
+        peers = {"old": {"seen": now - mesh.PEER_SEEN_TTL - 1, "via": "m"},
+                 "recent": {"seen": now - 10, "via": "m"},
+                 "justnow": {"seen": now, "via": "m"}}
+        pruned = mesh._prune_peers(cfg, peers, "justnow", now)
+        self.assertNotIn("old", pruned)       # past the TTL
+        self.assertIn("recent", pruned)
+        self.assertIn("justnow", pruned)
+
+    def test_prune_never_exceeds_the_bound_v3(self):
+        # lodestar V3: the old code re-added keep_node AFTER truncating, so
+        # the store could be MAX+1. With a small roster the hard bound is
+        # MAX_TRACKED_PEERS exactly, never one over.
+        now = 1_000_000
+        cfg = {"nodes": ["a", "b"]}
+        peers = {f"n{i}": {"seen": now, "via": "m"}
+                 for i in range(mesh.MAX_TRACKED_PEERS + 50)}
+        pruned = mesh._prune_peers(cfg, peers, "n0", now)
+        self.assertLessEqual(len(pruned), mesh.MAX_TRACKED_PEERS)
+
+    def test_roster_peer_survives_flood_with_status_v1v2(self):
+        # lodestar V1+V2 (single root): a roster peer that declared BLOCKED
+        # must survive a flood WITH its load-bearing status, even when it
+        # sits in the exact position keep-newest would evict -- inserted
+        # LAST, same second as the flood, so ONLY roster-awareness saves it.
+        # (This is the deterministic proof: a roster-blind keep-newest would
+        # order it last on the stable tie and evict it. If this passed under
+        # roster-blind, it would be passing by insertion-order luck.)
+        now = 1_000_000
+        cfg = {"nodes": ["realpeer"]}
+        peers = {}
+        for i in range(mesh.MAX_TRACKED_PEERS + 100):
+            peers[f"flood{i}"] = {"seen": now, "via": "m"}   # FIRST
+        peers["realpeer"] = {"seen": now, "via": "m", "status": "blocked"}
+        pruned = mesh._prune_peers(cfg, peers, "flood0", now)
+        self.assertIn("realpeer", pruned)                    # not evicted
+        self.assertEqual(pruned["realpeer"]["status"], "blocked")  # status kept
+        self.assertLessEqual(len(pruned), mesh.MAX_TRACKED_PEERS)
+
+    def test_note_peer_preserves_status_on_a_roster_peers_ordinary_frame(self):
+        # V1's other half: an ordinary (non-presence) frame from a peer
+        # whose record still exists must not erase its status. Roster-aware
+        # eviction guarantees the roster record persists, so this holds.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)  # roster: alpha, beta
+            mesh.note_peer(cfg, "beta", "presence", status="blocked")
+            mesh.note_peer(cfg, "beta", "message")  # ordinary, carries no status
+            self.assertEqual(
+                mesh.load_peers(cfg)["beta"].get("status"), "blocked")
+
+    def test_load_peers_resets_an_oversize_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with open(mesh.peers_file(cfg), "w") as f:
+                f.write("x" * (mesh.PEERS_FILE_MAX + 1))
+            self.assertEqual(mesh.load_peers(cfg), {})  # reset, not a crash
+
+    def test_note_peer_loads_the_store_once(self):
+        # #106 F2: the declined (attacker-driven) path did TWO load_peers
+        # per frame; it must now load once.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            # fill the roster to the cap so the next name is declined
+            for i in range(mesh._pin_cap(cfg) - len(cfg["nodes"])):
+                mesh.note_peer(cfg, f"n{i}", "message")
+            calls = {"n": 0}
+            real = mesh.load_peers
+
+            def counting(c):
+                calls["n"] += 1
+                return real(c)
+
+            with mock.patch.object(mesh, "load_peers", side_effect=counting):
+                mesh.note_peer(cfg, "declined-name", "message")
+            self.assertEqual(calls["n"], 1)
+
     def test_note_peer_caps_auto_roster_growth_but_still_tracks(self):
         # #100: a flood of fabricated first-contact names cannot grow the
         # durable (invite-embedded) roster without bound; past the cap the
