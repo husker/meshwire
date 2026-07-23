@@ -3094,6 +3094,50 @@ class MemberCertTests(unittest.TestCase):
         self.assertIn("impersonation", out)
         self.assertNotIn("UNVERIFIED_SOURCE", out)
         self.assertNotIn("WOULD_MIGRATE", out)
+        # bastion: soak-parseable evidence must survive a cp1252 console.
+        out.encode("cp1252")
+        self.assertTrue(out.strip().isascii())
+
+    def test_rename_line_carries_the_frame_id(self):
+        # PR-102 follow-up (both seats): evidence must be auditable to a
+        # specific frame, not just a stream position.
+        ctl = {"mw": "rename", "new": "beta-new", "ts": 1}
+        ev = {"id": "frame-abc123"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "alpha", "beta", ctl,
+                                 verdict=mesh.FRAME_VERIFIED, ev=ev)
+        self.assertIn("id=frame-abc123", err.getvalue())
+
+    def test_iam_rename_frame_does_not_mint_ctl_old(self):
+        # PR-102 follow-up (lodestar): `old` must NOT ride the ctl -- a
+        # future migration phase reading an unauthenticated ctl['old']
+        # would be a one-line pin hijack. Only `new` is minted; the
+        # receiver derives old from the signed frm.
+        captured = {}
+
+        def fake_send(cfg, sender, to, body, title=None, ctl=None):
+            captured["sender"] = sender
+            captured["ctl"] = ctl
+
+        with mock.patch.object(mesh, "my_node", return_value="oldname"), \
+                mock.patch.object(mesh, "_detect_harness",
+                                  return_value="claude"), \
+                mock.patch.object(mesh, "node_file",
+                                  return_value=os.path.join(
+                                      self.cfg["_dir"], ".node")), \
+                mock.patch.object(mesh, "send_raw", side_effect=fake_send), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_iam(argparse.Namespace(node="newname"))
+        self.assertEqual(captured["sender"], "oldname")  # signed as old
+        self.assertEqual(captured["ctl"]["new"], "newname")
+        self.assertNotIn("old", captured["ctl"])         # old NOT minted
+
+    def test_revocation_status_fails_shut_on_unparseable_key(self):
+        # PR-102 follow-up (lodestar): the parse-failure branch must honor
+        # the function's own fail-shut principle -- 'unknown', not 'clean'.
+        self.assertEqual(
+            mesh._revocation_status(self.cfg, "not-a-valid-key"), "unknown")
 
     def test_revoked_status_fails_shut_on_unreadable_store(self):
         # lodestar B2: a revoked key whose revocation store is corrupt must

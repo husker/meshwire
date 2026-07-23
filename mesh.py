@@ -2344,7 +2344,11 @@ def _revocation_status(cfg, pubkey):
     try:
         fpr = _key_fingerprint(_normalize_pubkey(pubkey))
     except (ValueError, TypeError):
-        return "clean"
+        # Can't fingerprint the key -> can't prove it isn't revoked. Its own
+        # fail-shut principle applies (lodestar PR-102 follow-up): 'unknown',
+        # never 'clean'. Unreachable from _report_cert_status today (the key
+        # already verified), but #74 will call this on the enforcement path.
+        return "unknown"
     path = revocations_file(cfg)
     if not os.path.exists(path):
         return "clean"
@@ -2376,7 +2380,7 @@ def _report_cert_status(cfg, frm, pubkey):
         # unreadable, so we cannot prove this key is clean. Never fall
         # through to a clean-looking cert status -- report the failure.
         print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
-              f"(revocation store unreadable — cannot confirm not-revoked)",
+              f"(revocation store unreadable -- cannot confirm not-revoked)",
               file=sys.stderr)
         return
     body = _cert_for_key(cfg, pubkey)
@@ -5859,8 +5863,13 @@ def cmd_iam(args):
     # way, and Phase A receivers only log WOULD_MIGRATE.
     if old and old != args.node and cfg.get("key"):
         try:
+            # Only `new` rides the ctl. `old` is deliberately NOT minted
+            # (lodestar PR-102 follow-up): the receiver derives old from the
+            # SIGNED `frm`, so a future migration phase can never be tempted
+            # to read an unauthenticated ctl['old'] -- that would be a
+            # one-line pin hijack. Humans still see old in the body text.
             send_raw(cfg, old, BROADCAST, f"{old} is now {args.node}",
-                     ctl={"mw": "rename", "old": old, "new": args.node,
+                     ctl={"mw": "rename", "new": args.node,
                           "ts": int(time.time())})
         except (urllib.error.URLError, socket.timeout, UnicodeError,
                 ValueError, OSError):
@@ -6531,7 +6540,7 @@ def _stream_open(cfg, tpc, since, timeout):
     return http(f"{cfg['server']}/{tpc}/json?since={since}", timeout=timeout)
 
 
-def _handle_control(cfg, me, frm, ctl, verdict=None):
+def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     """React to an announce/ping/pong control message.
     Returns an agent-facing stdout line, or None (control chatter never
     surfaces as MESH_MESSAGE and never wakes an agent, except the rare and
@@ -6547,14 +6556,21 @@ def _handle_control(cfg, me, frm, ctl, verdict=None):
         # WOULD_MIGRATE -- we migrate no pin and write no tombstone; real
         # migration is a gated later phase. Continuity is only as strong as
         # the source pin (B3): a verified source is a real key-continuity
-        # rename, anything else is an unproven claim.
+        # rename, anything else is an unproven claim. `old` is the SIGNED
+        # frm, never ctl['old'] (which is not even minted) -- reading an
+        # unauthenticated old would be a pin hijack.
         old, new = frm, ctl.get("new")
         if not isinstance(new, str) or not new or new == BROADCAST:
             return None
+        # Frame id on the line (bastion/lodestar PR-102 follow-up): the
+        # evidence must be auditable to a specific frame, not just a stream
+        # position. ASCII-only tokens -- soak-parseable evidence must survive
+        # a cp1252 console (bastion) and never depend on #98's console fix.
+        fid = _single_line(ev.get("id")) if isinstance(ev, dict) else "?"
+        head = f"MESH_RENAME id={fid} {_single_line(old)} -> {_single_line(new)}"
         if verdict == FRAME_VERIFIED:
-            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
-                  f"WOULD_MIGRATE (key-verified; Phase A log-only, pin NOT "
-                  f"migrated)", file=sys.stderr)
+            print(f"{head} WOULD_MIGRATE (key-verified; Phase A log-only, "
+                  f"pin NOT migrated)", file=sys.stderr)
         elif verdict == FRAME_MISMATCH:
             # A DIFFERENT key than the one pinned for `old` is asking the
             # fleet to carry old's identity to `new` -- the exact
@@ -6562,13 +6578,11 @@ def _handle_control(cfg, me, frm, ctl, verdict=None):
             # product is evidence, so this cannot read as generic unverified
             # chatter (lodestar B1); it is the attack-path event the #62
             # soak bar requires witnessing.
-            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
-                  f"KEY_MISMATCH (pin conflict — possible impersonation)",
-                  file=sys.stderr)
+            print(f"{head} KEY_MISMATCH (pin conflict -- possible "
+                  f"impersonation)", file=sys.stderr)
         else:
-            print(f"MESH_RENAME {_single_line(old)} -> {_single_line(new)} "
-                  f"UNVERIFIED_SOURCE (ignored — not a proven key-continuity "
-                  f"rename)", file=sys.stderr)
+            print(f"{head} UNVERIFIED_SOURCE (ignored -- not a proven "
+                  f"key-continuity rename)", file=sys.stderr)
         return None
     if kind == "ping":
         note_peer(cfg, frm, "message", ctl.get("status"))
@@ -6790,7 +6804,7 @@ def _cmd_watch_owned(args, cfg, me):
             # against the LOCAL pin (the key that actually verified).
             _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
         if ctl:
-            line = _handle_control(cfg, me, frm, ctl, verdict=verdict)
+            line = _handle_control(cfg, me, frm, ctl, verdict=verdict, ev=ev)
             checkpoint()  # control frames carry no undelivered payload
             if line:
                 print(line)
@@ -7467,7 +7481,7 @@ class MeshMCPServer:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
             if ctl:
-                line = _handle_control(cfg, me, frm, ctl, verdict=verdict)
+                line = _handle_control(cfg, me, frm, ctl, verdict=verdict, ev=ev)
                 if line:
                     self.deliver({"kind": "node_joined", "from": frm,
                                   "text": line, "verify": verdict})
