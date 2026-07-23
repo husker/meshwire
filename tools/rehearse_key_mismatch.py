@@ -106,7 +106,10 @@ def _run_arm(receiver, signer, frame_id):
     return verdict, err.getvalue()
 
 
-def rehearse(out=sys.stdout):
+def rehearse(out=sys.stdout, keep=False):
+    """Run both arms. Returns a result dict; callers assert on its fields
+    rather than on the printed text, so reformatting the capture cannot
+    break them."""
     root = tempfile.mkdtemp(prefix="mw-rehearsal-")
     shared = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
     failures = []
@@ -163,8 +166,9 @@ def rehearse(out=sys.stdout):
                             % verdict2)
         if "WOULD_MIGRATE" not in log2:
             failures.append("control arm: no WOULD_MIGRATE evidence line")
-        if "KEY_MISMATCH" in log2:
-            failures.append("control arm: leaked KEY_MISMATCH")
+        for token in ("KEY_MISMATCH", "UNVERIFIED_SOURCE"):
+            if token in log2:
+                failures.append("control arm: leaked %s" % token)
         say()
 
         # ---- Ph1 purity: neither arm may mutate durable state ----
@@ -186,9 +190,11 @@ def rehearse(out=sys.stdout):
                 say("  - %s" % f)
         else:
             say("REHEARSAL RESULT: PASS")
-        return not failures, root
+        return {"ok": not failures, "root": root, "failures": failures,
+                "attack": {"verdict": verdict, "log": log},
+                "control": {"verdict": verdict2, "log": log2}}
     finally:
-        if not os.environ.get("MW_REHEARSAL_KEEP"):
+        if not keep:
             shutil.rmtree(root, ignore_errors=True)
 
 
@@ -197,12 +203,10 @@ def main():
     ap.add_argument("--keep", action="store_true",
                     help="keep the scratch mesh directory for inspection")
     args = ap.parse_args()
+    result = rehearse(keep=args.keep)
     if args.keep:
-        os.environ["MW_REHEARSAL_KEEP"] = "1"
-    ok, root = rehearse()
-    if args.keep:
-        print("\nscratch mesh kept at: %s" % root)
-    return 0 if ok else 1
+        print("\nscratch mesh kept at: %s" % result["root"])
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":

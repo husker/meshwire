@@ -4,6 +4,10 @@ A tool that is only run by hand once per release rots between releases, and
 the whole point of landing it was that soak records cite a fresh capture
 rather than a frozen comment. This runs it in the normal suite so a change to
 the verdict chain breaks the rehearsal here rather than at soak-closure time.
+
+Assertions read the structured result, never the printed capture: the capture
+is human-facing text and reformatting it must not fail the suite (bastion,
+PR-109 seat).
 """
 import importlib.util
 import io
@@ -24,25 +28,42 @@ def _load():
 
 class RehearsalToolTests(unittest.TestCase):
 
-    def test_rehearsal_passes_both_arms(self):
-        out = io.StringIO()
-        ok, _ = _load().rehearse(out=out)
-        text = out.getvalue()
-        self.assertTrue(ok, "rehearsal FAILED:\n" + text)
-        # the attack arm derives the mismatch rather than being handed it
-        self.assertIn("derived verdict      : 'mismatch'", text)
-        self.assertIn("KEY_MISMATCH", text)
-        # the control arm proves the harness discriminates -- without it, a
-        # verifier that always returned mismatch would pass
-        self.assertIn("derived verdict      : 'verified'", text)
-        self.assertIn("WOULD_MIGRATE", text)
-        self.assertIn("REHEARSAL RESULT: PASS", text)
+    def setUp(self):
+        self.tool = _load()
+        self.mesh = self.tool.mesh
+
+    def test_attack_arm_derives_the_mismatch(self):
+        # the verdict must be DERIVED from a real key conflict, not handed
+        # in as tests/test_mesh.py does
+        result = self.tool.rehearse(out=io.StringIO())
+        self.assertTrue(result["ok"], result["failures"])
+        self.assertEqual(result["attack"]["verdict"], self.mesh.FRAME_MISMATCH)
+        self.assertIn("KEY_MISMATCH", result["attack"]["log"])
+        self.assertNotIn("WOULD_MIGRATE", result["attack"]["log"])
+
+    def test_control_arm_proves_the_harness_discriminates(self):
+        # without this, a verifier that returned mismatch unconditionally
+        # would pass the attack arm and the rehearsal would be theatre
+        result = self.tool.rehearse(out=io.StringIO())
+        self.assertEqual(result["control"]["verdict"],
+                         self.mesh.FRAME_VERIFIED)
+        self.assertIn("WOULD_MIGRATE", result["control"]["log"])
+        for token in ("KEY_MISMATCH", "UNVERIFIED_SOURCE"):
+            self.assertNotIn(token, result["control"]["log"])
 
     def test_rehearsal_cleans_up_its_scratch_mesh(self):
-        ok, root = _load().rehearse(out=io.StringIO())
-        self.assertTrue(ok)
-        self.assertFalse(os.path.exists(root),
-                         "scratch mesh left behind at " + root)
+        result = self.tool.rehearse(out=io.StringIO())
+        self.assertTrue(result["ok"], result["failures"])
+        self.assertFalse(os.path.exists(result["root"]),
+                         "scratch mesh left behind at " + result["root"])
+
+    def test_keep_retains_the_scratch_mesh(self):
+        import shutil
+        result = self.tool.rehearse(out=io.StringIO(), keep=True)
+        try:
+            self.assertTrue(os.path.isdir(result["root"]))
+        finally:
+            shutil.rmtree(result["root"], ignore_errors=True)
 
 
 if __name__ == "__main__":
