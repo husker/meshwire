@@ -1147,6 +1147,59 @@ def _signing_env():
                          "SSH_ASKPASS_REQUIRE", "DISPLAY")}
 
 
+def _owner_key_is_unprotected(cfg):
+    """True when the owner private key can be read with no passphrase.
+
+    #110: `owner-init` enforces a passphrase at key CREATION and never
+    revisits it. A key made with `--no-passphrase`, or made before that
+    enforcement landed, keeps unattended-mint capability forever and
+    nothing ever says so -- the #64 guarantee reads as satisfied because
+    the code path exists, while the deployed key may not carry it.
+
+    Probe the key actually in use: ask ssh-keygen for the public half with
+    stdin closed and `_signing_env()` scrubbing every agent/askpass escape,
+    so nothing can answer a prompt on our behalf. If that succeeds, no
+    passphrase stands between any process on this machine and a valid owner
+    signature.
+
+    Returns None when it cannot be determined (no key here, no ssh-keygen,
+    timeout): a caller must never report a guarantee it did not establish.
+    """
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        return None
+    try:
+        binary = _ssh_keygen_binary()
+    except ValueError:
+        return None
+    try:
+        completed = subprocess.run(
+            [binary, "-y", "-f", key_path], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=30, env=_signing_env())
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return completed.returncode == 0
+
+
+def _warn_if_owner_key_unprotected(cfg):
+    """Loud, distinguishable warning at every mint from an unprotected owner
+    key (#110). Deliberately NOT fail-closed: refusing would break meshes
+    whose key predates the enforcement, which is a policy change wanting a
+    deprecation window, argued separately. The point here is that an
+    unattended mint must never be silently indistinguishable from an
+    attended one."""
+    if _owner_key_is_unprotected(cfg) is not True:
+        return
+    print("MESH_WARN: the owner key has NO passphrase -- #64's "
+          "fail-closed-unattended guarantee is NOT in force. Any process "
+          "that can read the key file, including an agent on this machine, "
+          "can mint owner artifacts unattended, so THIS MINT IS NOT "
+          "EVIDENCE A HUMAN WAS PRESENT. Fix: `ssh-keygen -p` on the owner "
+          "key; consider re-minting afterwards, since artifacts signed "
+          "while it was unprotected cannot claim presence retroactively "
+          "(#110)", file=sys.stderr)
+
+
 def _approval_namespace(cfg):
     return f"a2acast-approval@{cfg['id']}"
 
@@ -1920,6 +1973,7 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    _warn_if_owner_key_unprotected(cfg)
     issued = int(time.time())
     body = {"v": 1, "alg": "ssh-ed25519",
             "h": hashlib.sha256(canonical).hexdigest(),
@@ -2078,6 +2132,7 @@ def _mint_member_cert(cfg, name, pubkey, ttl=CERT_TTL_DEFAULT):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    _warn_if_owner_key_unprotected(cfg)
     issued = int(time.time())
     body = {"v": 1, "kind": "membercert", "mesh": cfg["id"],
             "name": name, "key": pub, "fpr": _key_fingerprint(pub),
@@ -2238,6 +2293,7 @@ def _mint_revocation(cfg, fpr, name=""):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    _warn_if_owner_key_unprotected(cfg)
     issued = int(time.time())
     body = {"v": 1, "kind": "revocation", "mesh": cfg["id"], "fpr": fpr,
             "name": name if isinstance(name, str) else "",
@@ -2384,6 +2440,7 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    _warn_if_owner_key_unprotected(cfg)
     if (not isinstance(horizon_days, int) or isinstance(horizon_days, bool)
             or not 0 < horizon_days <= REVLIST_HORIZON_MAX):
         raise ValueError("revlist horizon must be 1..%d days"
@@ -5958,6 +6015,37 @@ def cmd_owner_init(args):
                     allow_unprotected=getattr(args, "no_passphrase", False))
     except ValueError as exc:
         sys.exit(f"error: {exc}")
+
+
+def cmd_owner_check(args):
+    """Audit the owner key's passphrase protection without minting anything
+    (#110). The whole failure this closes is invisibility: an operator who
+    has read #64 will reasonably believe minting requires them to be
+    present, and until now nothing told them otherwise."""
+    cfg = load_config()
+    if not os.path.isfile(owner_key_file(cfg)):
+        print("this machine does not hold the mesh owner key -- nothing to "
+              "check here (run this where the owner works)")
+        return
+    state = _owner_key_is_unprotected(cfg)
+    if state is None:
+        sys.exit("error: could not determine whether the owner key is "
+                 "passphrase-protected (ssh-keygen unavailable or timed "
+                 "out) -- not reporting a guarantee that was not "
+                 "established")
+    if state:
+        print("OWNER KEY: UNPROTECTED -- no passphrase.")
+        print("  #64's fail-closed-unattended guarantee is NOT in force.")
+        print("  Any process that can read the key file, including an agent")
+        print("  on this machine, can mint owner artifacts unattended, so no")
+        print("  owner-signed artifact from this key evidences human")
+        print("  presence.")
+        print("  Fix:  ssh-keygen -p -f " + owner_key_file(cfg))
+        print("  Then consider re-minting: artifacts signed while it was")
+        print("  unprotected cannot claim presence retroactively.")
+        sys.exit(1)
+    print("OWNER KEY: passphrase-protected -- unattended read refuses, so "
+          "#64's guarantee is in force here.")
 
 
 def cmd_owner_trust(args):
@@ -11505,6 +11593,11 @@ def main():
                         "any process that can read it, including an agent, "
                         "can mint owner approvals unattended")
     p.set_defaults(fn=cmd_owner_init)
+
+    p = sub.add_parser("owner-check",
+                       help="audit whether the owner key is "
+                            "passphrase-protected (#110); exits 1 if not")
+    p.set_defaults(fn=cmd_owner_check)
 
     p = sub.add_parser("owner-trust",
                        help="trust the mesh owner here from its mwtrust1- "

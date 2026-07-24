@@ -3935,6 +3935,102 @@ class CodexHookTests(MembershipCmdTests):
         self.assertEqual(seen["h"], "claude")
 
 
+class OwnerKeyProtectionTests(unittest.TestCase):
+    """#110: the passphrase is enforced at key CREATION and never rechecked,
+    so a key made with --no-passphrase (or before that enforcement landed)
+    keeps unattended-mint capability forever with no signal. Probe the key
+    actually in use, and make every mint from an unprotected one loud."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+
+    def _init_owner(self, protected):
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        if protected:
+            subprocess.run([shutil.which("ssh-keygen"), "-p", "-P", "",
+                            "-N", "hunter2hunter2", "-f",
+                            mesh.owner_key_file(self.cfg)],
+                           check=True, capture_output=True)
+
+    def test_probe_detects_an_unprotected_key(self):
+        self._init_owner(protected=False)
+        self.assertIs(mesh._owner_key_is_unprotected(self.cfg), True)
+
+    def test_probe_detects_a_protected_key(self):
+        self._init_owner(protected=True)
+        # must not hang or prompt: stdin closed + askpass/agent scrubbed
+        self.assertIs(mesh._owner_key_is_unprotected(self.cfg), False)
+
+    def test_probe_is_undetermined_without_a_key(self):
+        self.assertIsNone(mesh._owner_key_is_unprotected(self.cfg))
+
+    def test_probe_ignores_an_ssh_agent(self):
+        # _signing_env scrubs SSH_AUTH_SOCK, so an agent holding the
+        # decrypted key must not make a protected key look unprotected
+        self._init_owner(protected=True)
+        with mock.patch.dict(os.environ,
+                             {"SSH_AUTH_SOCK": "/tmp/nonexistent-agent",
+                              "SSH_ASKPASS": "/bin/true",
+                              "SSH_ASKPASS_REQUIRE": "force"}):
+            self.assertIs(mesh._owner_key_is_unprotected(self.cfg), False)
+
+    def test_every_mint_warns_on_an_unprotected_key(self):
+        self._init_owner(protected=False)
+        pub = mesh._own_node_pubkey(
+            make_cfg(tempfile.mkdtemp(dir=self.cfg["_dir"])), "claude")
+        if pub is None:
+            d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+            c2 = make_cfg(d)
+            mesh._ensure_node_key(c2, "beta", "claude")
+            pub = mesh._own_node_pubkey(c2, "claude")
+        mesh._bind_peer(self.cfg, "beta", pub)
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
+        for label, call in (
+                ("cert", lambda: mesh._mint_member_cert(self.cfg, "beta", pub)),
+                ("revocation", lambda: mesh._mint_revocation(self.cfg, fpr)),
+                ("revlist", lambda: mesh._mint_revlist(self.cfg)),
+                ("approval", lambda: mesh._approve_descriptor(
+                    self.cfg, {"action": "test", "nonce": "n" * 24}))):
+            err = io.StringIO()
+            # no blanket except: every mint must SUCCEED against an
+            # unprotected key (nothing prompts), so an exception here is a
+            # real failure and must not be swallowed into a passing warn
+            with contextlib.redirect_stderr(err):
+                call()
+            self.assertIn("NO passphrase", err.getvalue(), label)
+            self.assertIn("NOT EVIDENCE A HUMAN WAS PRESENT",
+                          err.getvalue().upper(), label)
+
+    def test_mint_is_silent_on_a_protected_key(self):
+        self._init_owner(protected=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._warn_if_owner_key_unprotected(self.cfg)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_owner_check_reports_and_exits_nonzero_when_unprotected(self):
+        self._init_owner(protected=False)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                mesh.cmd_owner_check(argparse.Namespace())
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("UNPROTECTED", out.getvalue())
+        self.assertIn("ssh-keygen -p", out.getvalue())
+
+    def test_owner_check_is_quiet_and_zero_when_protected(self):
+        self._init_owner(protected=True)
+        out = io.StringIO()
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+                contextlib.redirect_stdout(out):
+            mesh.cmd_owner_check(argparse.Namespace())
+        self.assertIn("passphrase-protected", out.getvalue())
+
+
 class PresenceLockTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
