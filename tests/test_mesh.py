@@ -4974,15 +4974,25 @@ class PeerPinTests(unittest.TestCase):
                 # key already pinned
                 results.append(("reject", k, str(exc)))
             except RuntimeError as exc:
-                # loser could not take the lock at all. Platform-dependent:
-                # the POSIX path blocks-then-compares, the Windows path is
-                # non-blocking, so the SAME race yields ValueError on one and
-                # RuntimeError on the other. Production already treats this as
-                # transient -- _verify_frame catches (RuntimeError, OSError)
-                # and returns FRAME_UNVERIFIED rather than crashing the
-                # receive loop -- so both are non-clobber outcomes and the
-                # invariant is identical. Asserting on WHICH exception the
-                # loser saw tests the platform, not the guarantee.
+                # loser never took the lock at all. _acquire_path_lock runs
+                # the SAME retry loop on every platform (attempts x jittered
+                # wait, no platform gate), so which exception the loser sees
+                # is a TIMING dichotomy, not a platform one: acquire after
+                # the winner releases -> fresh re-read inside the lock ->
+                # ValueError; exhaust the retry budget while the lock is held
+                # or delete-pending -> RuntimeError. Environmental factors
+                # make the budget path likelier on some machines -- a
+                # real-time scanner stretches the Windows delete-pending
+                # EACCES window the loop already treats as busy, and
+                # filesystem load compounds it -- but that is measured
+                # correlation, not platform determination (the same failure
+                # reproduces across interpreters on an affected box and on
+                # none of CI's). Production treats it as transient:
+                # _verify_frame catches (RuntimeError, OSError) and returns
+                # FRAME_UNVERIFIED rather than crash the receive loop. Both
+                # outcomes are non-clobber and the invariant is identical, so
+                # asserting on WHICH exception arrived tests the environment,
+                # not the guarantee.
                 results.append(("unavailable", k, str(exc)))
 
         ts = [threading.Thread(target=bind, args=(k,))
