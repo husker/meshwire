@@ -2342,15 +2342,294 @@ def _note_revocation(cfg, body):
     _write_json_secure(revocations_file(cfg), store)
 
 
+REVLIST_NAME = ".meshwire.revlist.json"
+# Owner-signed lists are wire-uninflatable (only the owner key can grow
+# one), so the bound is generous rather than tight -- and an OVERSIZE block
+# is rejected with its own reason, never conflated with corruption
+# (lodestar's #74 gate: too-big-but-valid must be distinguishable).
+REVLIST_BLOCK_MAX = CERT_BLOCK_MAX * 16
+REVLIST_HORIZON_DEFAULT = 90     # days; a tunable the owner picks, not a
+REVLIST_HORIZON_MAX = 400        # schedule the protocol demands (lodestar)
+
+
+def revlist_file(cfg):
+    return os.path.join(cfg["_dir"], REVLIST_NAME)
+
+
+def _revlist_namespace(cfg):
+    """Distinct ssh-keygen namespace: a revocation LIST must never verify
+    as a single revocation, a membership cert, or an approval, nor any
+    reverse."""
+    return f"a2acast-revlist-{cfg['id']}"
+
+
+def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
+    """Owner-signed full-set revocation list (#76 distribution, increment 1).
+
+    The list is the freshness anchor the distribution legs will assert
+    against: `iat` orders publications (monotonic by construction), and
+    `valid_until` bounds how long a holder may consider its view current --
+    it never un-revokes anything, revocation is permanent. Compaction rides
+    this mint (lodestar: growth and the chance to compact are the same
+    attended event), but in Phase A there is no redundancy predicate yet,
+    so the list NEVER drops a record: it signs the union of every
+    revocation this machine knows -- the loose store plus any previously
+    adopted list. Refusing on an unreadable loose store is load-bearing:
+    signing a "full" list from a store we could not fully read could
+    silently omit a record, and an omission from an owner-signed full-set
+    list is downstream indistinguishable from an un-revocation attempt.
+
+    Returns (block, body)."""
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        raise ValueError("this machine does not hold the mesh owner key "
+                         "(run `mesh owner-init` where the owner works)")
+    if (not isinstance(horizon_days, int) or isinstance(horizon_days, bool)
+            or not 0 < horizon_days <= REVLIST_HORIZON_MAX):
+        raise ValueError("revlist horizon must be 1..%d days"
+                         % REVLIST_HORIZON_MAX)
+    entries = {}
+    loose_path = revocations_file(cfg)
+    if os.path.exists(loose_path):
+        try:
+            store = _load_json_regular(loose_path, require_private=False,
+                                       max_bytes=CERT_BLOCK_MAX * 64)
+        except (OSError, ValueError):
+            store = None
+        if not isinstance(store, dict):
+            raise ValueError(
+                "the local revocation store exists but cannot be read -- "
+                "refusing to sign a full-set list that might silently omit "
+                "a record (an omission would read as an un-revocation)")
+        for fpr, rec in store.items():
+            # PR-112 seat (lodestar F2): a malformed individual record gets
+            # the SAME refusal as an unreadable store -- silently skipping
+            # it would omit its fpr from the "full set", the exact
+            # un-revocation-in-effect the store-level refusal exists to
+            # prevent. One line, one consequence, one handling.
+            if not isinstance(fpr, str) or not isinstance(rec, dict):
+                raise ValueError(
+                    "the local revocation store holds a malformed record "
+                    "(fpr=%r) -- refusing to sign a full-set list that "
+                    "would silently omit it (an omission would read as an "
+                    "un-revocation); repair the store first" % (fpr,))
+            entries[fpr] = {"name": rec.get("name", "") or "",
+                            "iat": rec.get("iat", 0)}
+    try:
+        prev_body, _ = _load_revlist(cfg)
+    except (OSError, ValueError):
+        raise ValueError(
+            "the adopted revlist cache exists but cannot be read -- "
+            "refusing to sign a full-set list that might silently omit "
+            "a record it carried")
+    issued = int(time.time())
+    if prev_body is not None:
+        for fpr, meta in prev_body["revocations"].items():
+            entries.setdefault(fpr, meta)
+        if issued <= prev_body.get("iat", 0):
+            raise ValueError(
+                "clock says now <= the adopted list's iat -- a newer "
+                "publication must carry a strictly greater iat or no "
+                "receiver will adopt it; fix the clock and re-run")
+    body = {"v": 1, "kind": "revlist", "mesh": cfg["id"], "iat": issued,
+            "valid_until": issued + horizon_days * 86400,
+            "revocations": entries}
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    # PR-112 seat (lodestar F1): verify enforces REVLIST_BLOCK_MAX, so a
+    # mint-side breach would produce a list NO receiver adopts -- signed in
+    # an attended ceremony, distributed, and discovered only via N remote
+    # rejections, the failure landing furthest from whoever can act. Refuse
+    # HERE, before the ceremony, where the human who can raise the constant
+    # (one constant drives both sides) is at the keyboard. b64 of the
+    # payload alone is a strict lower bound on the final block; the exact
+    # check runs again after signing.
+    if 11 + (len(payload) + 2) // 3 * 4 > REVLIST_BLOCK_MAX:
+        raise ValueError(
+            "the signed list would exceed REVLIST_BLOCK_MAX (%d bytes) and "
+            "no receiver would adopt it -- raising the bound is a design "
+            "decision (one constant drives mint and verify); make it "
+            "before minting, not after distributing" % REVLIST_BLOCK_MAX)
+    binary = _ssh_keygen_binary()
+    workdir = tempfile.mkdtemp(prefix=".mw-revlist-", dir=cfg["_dir"])
+    payload_path = os.path.join(workdir, "payload")
+    try:
+        with open(payload_path, "wb") as f:
+            f.write(payload)
+        try:
+            completed = subprocess.run(
+                [binary, "-Y", "sign", "-f", key_path,
+                 "-n", _revlist_namespace(cfg), payload_path],
+                timeout=300, env=_signing_env())
+        except subprocess.TimeoutExpired:
+            raise ValueError(
+                "signing timed out — a passphrase-protected owner key needs "
+                "a present human to enter the passphrase at the terminal; an "
+                "unattended process cannot mint (#64)")
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign the revlist "
+                             "(see its output above)")
+        with open(payload_path + ".sig", "r", encoding="utf-8") as f:
+            signature = f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    token = json.dumps({"body": body, "sig": signature},
+                       sort_keys=True, separators=(",", ":"))
+    block = "mwrevlist1-" + base64.urlsafe_b64encode(
+        token.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(block) > REVLIST_BLOCK_MAX:
+        raise ValueError(
+            "the signed list exceeds REVLIST_BLOCK_MAX (%d bytes) and no "
+            "receiver would adopt it -- raising the bound is a design "
+            "decision (one constant drives mint and verify); make it "
+            "before minting, not after distributing" % REVLIST_BLOCK_MAX)
+    return block, body
+
+
+def _verify_revlist(cfg, block, now=None):
+    """Return (ok, reason, body_or_None): owner signature, shape, mesh id.
+
+    An EXPIRED list still verifies: its revocations are permanent facts and
+    `valid_until` only bounds freshness (the future don't-enforce gate) --
+    rejecting it here would let time un-revoke keys. Oversize is rejected
+    with a DISTINCT reason from malformed: many legitimate revocations are
+    a design problem to raise, not corruption to fail shut on."""
+    if not isinstance(block, str) or not block.startswith("mwrevlist1-"):
+        return False, "revlist malformed", None
+    if len(block) > REVLIST_BLOCK_MAX:
+        return False, ("revlist exceeds the size bound (the block may be "
+                       "valid but too large -- raise REVLIST_BLOCK_MAX by "
+                       "design decision, this is not corruption)"), None
+    raw = block[len("mwrevlist1-"):]
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(
+            raw + "=" * (-len(raw) % 4)))
+        body, signature = parsed["body"], parsed["sig"]
+    except (ValueError, TypeError, KeyError):
+        return False, "revlist malformed", None
+    if not isinstance(body, dict) or not isinstance(signature, str):
+        return False, "revlist malformed", None
+    if body.get("v") != 1 or body.get("kind") != "revlist":
+        return False, "revlist version or kind unsupported", None
+    if body.get("mesh") != cfg["id"]:
+        return False, "revlist is for a different mesh", None
+    iat, valid_until = body.get("iat"), body.get("valid_until")
+    now = time.time() if now is None else now
+    if (not isinstance(iat, int) or isinstance(iat, bool)
+            or not isinstance(valid_until, int)
+            or isinstance(valid_until, bool)
+            or valid_until <= iat or iat > now + 300):
+        return False, "revlist timestamps invalid", None
+    revs = body.get("revocations")
+    if not isinstance(revs, dict):
+        return False, "revlist entries invalid", None
+    for fpr, meta in revs.items():
+        if (not isinstance(fpr, str) or not fpr.startswith("SHA256:")
+                or not isinstance(meta, dict)):
+            return False, "revlist entries invalid", None
+    try:
+        owner_pub = _load_owner_trust(cfg)
+    except ValueError as exc:
+        return False, str(exc), None
+    try:
+        binary = _ssh_keygen_binary()
+    except ValueError as exc:
+        return False, str(exc), None
+    payload = json.dumps(body, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    principal = f"owner@{cfg['id']}"
+    workdir = tempfile.mkdtemp(prefix=".mw-revlistverify-", dir=cfg["_dir"])
+    try:
+        sig_path = os.path.join(workdir, "payload.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(signature)
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{principal} "
+                    f"namespaces=\"{_revlist_namespace(cfg)}\" "
+                    f"{owner_pub}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path, "-I", principal,
+             "-n", _revlist_namespace(cfg), "-s", sig_path],
+            input=payload, capture_output=True, timeout=60)
+        if completed.returncode != 0:
+            return False, "revlist signature verification failed", None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return True, "ok", body
+
+
+def _load_revlist(cfg):
+    """(body, block) of the adopted list, or (None, None) when none is
+    adopted. Raises OSError/ValueError on a PRESENT-but-unreadable cache:
+    status-path callers must fail shut on that, never read it as absent.
+
+    Per-entry and block validation are part of "readable" (PR-112 seat):
+    a cache whose entries can't be faithfully carried into the next mint,
+    or whose cached block has lost list shape, is corrupt -- unknown/fail
+    shut beats propagating it. The block is only TYPE-checked here (this
+    runs per frame on the status path); the future republish increment
+    MUST re-verify the block cryptographically before serving it -- the
+    body and block are not otherwise bound to each other (the seat's
+    confused-deputy note)."""
+    path = revlist_file(cfg)
+    if not os.path.exists(path):
+        return None, None
+    wrapped = _load_json_regular(path, require_private=False,
+                                 max_bytes=REVLIST_BLOCK_MAX * 4)
+    if (not isinstance(wrapped, dict)
+            or not isinstance(wrapped.get("body"), dict)
+            or not isinstance(wrapped["body"].get("revocations"), dict)):
+        raise ValueError("revlist cache malformed")
+    for fpr, meta in wrapped["body"]["revocations"].items():
+        if not isinstance(fpr, str) or not isinstance(meta, dict):
+            raise ValueError("revlist cache malformed")
+    block = wrapped.get("block")
+    if (not isinstance(block, str)
+            or not block.startswith("mwrevlist1-")
+            or len(block) > REVLIST_BLOCK_MAX):
+        raise ValueError("revlist cache malformed")
+    return wrapped["body"], block
+
+
+def _note_revlist(cfg, body, block):
+    """Adopt a VERIFIED list if strictly newer; monotonic on iat.
+
+    Returns 'adopted', 'current' (same iat), or 'older' (ignored). The raw
+    block is cached beside the body because a list is self-validating --
+    keeping it is what lets ANY node republish later (the distribution
+    design's no-privileged-republisher property). Purely additive: nothing
+    else is pruned or rewritten, so deleting the cache file is a complete
+    revert."""
+    try:
+        prev_body, _ = _load_revlist(cfg)
+    except (OSError, ValueError):
+        prev_body = None    # unreadable cache: a verified newer list may
+        #                     overwrite it -- that is the repair path
+    if prev_body is not None:
+        if body["iat"] < prev_body.get("iat", 0):
+            return "older"
+        if body["iat"] == prev_body.get("iat", 0):
+            return "current"
+    _write_json_secure(revlist_file(cfg), {"body": body, "block": block})
+    return "adopted"
+
+
 def _revocation_status(cfg, pubkey):
     """'revoked', 'clean', or 'unknown'. Read-only.
 
-    'unknown' means the revocation store EXISTS but could not be read
-    (corrupt/oversize) -- we cannot prove the key is NOT revoked, so this
-    must FAIL SHUT downstream, never read as clean (lodestar B2). An ABSENT
-    store is 'clean' -- there genuinely are no revocations yet, the common
-    Phase A case; staleness of a present-but-behind view is the epoch gate's
-    job once distribution lands, not this function's."""
+    Verdict lattice: revoked > unknown > clean. A fingerprint found in ANY
+    readable source -- the loose record store or the adopted owner-signed
+    list (#76 distribution increment 1) -- is 'revoked', even when the
+    OTHER source is unreadable: a proven revocation is never weakened by
+    unrelated corruption. 'unknown' means some present store could not be
+    read and no readable source proved revocation -- we cannot prove the
+    key is NOT revoked, so this must FAIL SHUT downstream, never read as
+    clean (lodestar B2). ABSENT stores are 'clean' -- there genuinely are
+    no revocations yet, the common Phase A case. An EXPIRED adopted list
+    still evidences its revocations: revocation is permanent, expiry only
+    bounds freshness (the future don't-enforce gate is #74's, not this
+    function's)."""
     try:
         fpr = _key_fingerprint(_normalize_pubkey(pubkey))
     except (ValueError, TypeError):
@@ -2359,17 +2638,27 @@ def _revocation_status(cfg, pubkey):
         # never 'clean'. Unreachable from _report_cert_status today (the key
         # already verified), but #74 will call this on the enforcement path.
         return "unknown"
+    unreadable = False
     path = revocations_file(cfg)
-    if not os.path.exists(path):
-        return "clean"
+    if os.path.exists(path):
+        store = None
+        try:
+            store = _load_json_regular(path, require_private=False,
+                                       max_bytes=CERT_BLOCK_MAX * 64)
+        except (OSError, ValueError):
+            pass
+        if not isinstance(store, dict):
+            unreadable = True
+        elif fpr in store:
+            return "revoked"
     try:
-        store = _load_json_regular(path, require_private=False,
-                                   max_bytes=CERT_BLOCK_MAX * 64)
+        lbody, _ = _load_revlist(cfg)
     except (OSError, ValueError):
-        return "unknown"
-    if not isinstance(store, dict):
-        return "unknown"
-    return "revoked" if fpr in store else "clean"
+        unreadable = True
+        lbody = None
+    if lbody is not None and fpr in lbody["revocations"]:
+        return "revoked"
+    return "unknown" if unreadable else "clean"
 
 
 def _report_cert_status(cfg, frm, pubkey):
@@ -5781,8 +6070,10 @@ def cmd_cert_show(args):
     except (FileNotFoundError, OSError, ValueError):
         store = {}
     if not isinstance(store, dict) or not store:
+        # No early return: revocations and the adopted revlist must show
+        # even on a mesh with zero certs cached.
         print("no member certs cached here")
-        return
+        store = {}
     for fpr, body in sorted(store.items(),
                             key=lambda kv: kv[1].get("name", "")):
         if not isinstance(body, dict):
@@ -5798,6 +6089,26 @@ def cmd_cert_show(args):
     for fpr, body in sorted((revs or {}).items()):
         if isinstance(body, dict):
             print(f"REVOKED  {_single_line(body.get('name', '?'))}  {fpr}")
+    try:
+        lbody, _ = _load_revlist(cfg)
+    except (OSError, ValueError):
+        print("revlist: PRESENT BUT UNREADABLE -- revocation checks fail "
+              "shut (CERT_REVCHECK_FAILED) until repaired or a verified "
+              "newer list is adopted")
+        return
+    if lbody is not None:
+        stale = ("  STALE" if time.time() >= lbody.get("valid_until", 0)
+                 else "")
+        until = time.strftime("%Y-%m-%d",
+                              time.localtime(lbody.get("valid_until", 0)))
+        print(f"revlist: {len(lbody['revocations'])} entries  "
+              f"iat={lbody.get('iat', 0)}  valid_until={until}{stale}")
+        for fpr, meta in sorted(lbody["revocations"].items()):
+            if isinstance(revs, dict) and fpr in revs:
+                continue
+            name = meta.get("name", "?") if isinstance(meta, dict) else "?"
+            print(f"REVOKED  {_single_line(name or '?')}  {fpr}  "
+                  "(via revlist)")
 
 
 def cmd_cert_revoke(args):
@@ -5832,6 +6143,81 @@ def cmd_revoke_trust(args):
     print(f"revocation cached: fpr={body['fpr']}"
           f"{(' name=' + _single_line(body['name'])) if body.get('name') else ''} "
           "(log-only in Phase A)")
+
+
+def cmd_revlist_sign(args):
+    cfg = load_config()
+    try:
+        block, body = _mint_revlist(cfg, horizon_days=args.days)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    n = len(body["revocations"])
+    until = time.strftime("%Y-%m-%d", time.localtime(body["valid_until"]))
+    print(f"owner-signed revocation list: {n} revocation(s), "
+          f"iat={body['iat']}, valid until {until} -- distribute to every "
+          "member, each runs:")
+    print(f"  mesh revlist-trust {block}")
+    if n == 0:
+        print("(an empty list is still meaningful: the owner's signed "
+              "statement that nothing is revoked as of its issue time -- "
+              "the freshness baseline the distribution legs will assert "
+              "against)")
+    print("Log-only in Phase A (#76): adoption changes no delivery "
+          f"behavior and is fully reverted by deleting {REVLIST_NAME}")
+
+
+def cmd_revlist_trust(args):
+    cfg = load_config()
+    ok, reason, body = _verify_revlist(cfg, args.block)
+    if not ok:
+        sys.exit(f"error: revlist rejected: {reason}")
+    verdict = _note_revlist(cfg, body, args.block)
+    if verdict == "older":
+        sys.exit("error: revlist ignored: strictly older than the adopted "
+                 "list (adoption is monotonic on iat)")
+    if verdict == "current":
+        print("revlist already adopted (same iat); nothing to do")
+        return
+    n = len(body["revocations"])
+    until = time.strftime("%Y-%m-%d", time.localtime(body["valid_until"]))
+    stale = ("  [STALE -- past valid_until; its revocations still count, "
+             "revocation is permanent]"
+             if time.time() >= body["valid_until"] else "")
+    print(f"revlist adopted: {n} revocation(s), iat={body['iat']}, "
+          f"valid until {until}{stale} (log-only in Phase A)")
+    # Superset audit (never a prune): a loose record the owner's FULL-SET
+    # list should have known about but omits is the inconsistency the
+    # never-drop rule exists to surface. The record is KEPT -- dropping on
+    # inference would be un-revoking a key -- and the omission is loud.
+    try:
+        loose = _load_json_regular(revocations_file(cfg),
+                                   require_private=False,
+                                   max_bytes=CERT_BLOCK_MAX * 64)
+    except (FileNotFoundError, OSError, ValueError):
+        loose = {}
+    for fpr, rec in sorted((loose or {}).items()
+                           if isinstance(loose, dict) else []):
+        if fpr in body["revocations"]:
+            continue
+        if not isinstance(rec, dict):
+            # PR-112 seat (lodestar F2): the audit's whole job is surfacing
+            # omissions, so it must not share the mint's old silent-skip --
+            # that skipped exactly the record a mint would have omitted. It
+            # cannot refuse (the adopted list is valid); it must be loud. A
+            # malformed record has no readable iat, so warn unconditionally.
+            print(f"MESH_WARN: loose revocation record "
+                  f"fpr={_single_line(str(fpr))} is MALFORMED and absent "
+                  "from the adopted revlist -- record KEPT; repair the "
+                  "store (mint refuses to carry malformed records, so it "
+                  "will stay omitted until repaired)",
+                  file=sys.stderr)
+            continue
+        if rec.get("iat", 0) <= body["iat"]:
+            print(f"MESH_WARN: adopted revlist (iat={body['iat']}) omits "
+                  f"known revocation fpr={_single_line(fpr)} "
+                  f"(record iat={rec.get('iat', 0)}) -- record KEPT; a "
+                  "full-set list signed after a record should contain it",
+                  file=sys.stderr)
 
 
 def cmd_approve(args):
@@ -11156,6 +11542,19 @@ def main():
                             "(log-only in Phase A)")
     p.add_argument("block")
     p.set_defaults(fn=cmd_revoke_trust)
+    p = sub.add_parser("revlist-sign",
+                       help="owner: sign the full-set revocation list -- "
+                            "the freshness anchor for revocation "
+                            "distribution (#76, log-only)")
+    p.add_argument("--days", type=int, default=REVLIST_HORIZON_DEFAULT,
+                   help="freshness horizon in days (default %d); a tunable, "
+                        "never un-revokes" % REVLIST_HORIZON_DEFAULT)
+    p.set_defaults(fn=cmd_revlist_sign)
+    p = sub.add_parser("revlist-trust",
+                       help="verify an owner-signed revocation list and "
+                            "adopt it if strictly newer (log-only)")
+    p.add_argument("block")
+    p.set_defaults(fn=cmd_revlist_trust)
 
     p = sub.add_parser("approve",
                        help="owner machine only: mint a single-use, "
