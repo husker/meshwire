@@ -1218,21 +1218,85 @@ def _load_owner_trust(cfg):
     return pub.strip()
 
 
-def _owner_key_is_passphraseless(binary, key_path):
-    """True when the private key opens with an EMPTY passphrase. The empty
-    string on this probe's argv is not a secret; _signing_env keeps agents
-    and askpass helpers out of the probe (#87 F1/F3).
-
-    A non-zero returncode is read as 'protected'. Right after creation the
-    dominant non-zero cause is the wrong (empty) passphrase, which is the
-    correct read; an exotic probe failure would keep an unconfirmed key
-    (lodestar's low-risk nit on the PR #95 seat) -- acceptable because the
-    file is keygen-fresh and the live Windows ceremony (#62 bar) exercises
-    this path for real."""
+def _owner_key_protection(binary, key_path):
+    """'unprotected' | 'protected' | 'unknown', three-way FROM THE PROBE'S
+    OWN OUTPUT (PR-114 seat, lodestar). returncode 0 proves the key opens
+    with an empty passphrase. A recognised wrong-passphrase signature
+    proves decryption was attempted and passphrase-refused -- the only
+    non-zero that EVIDENCES protection. Every other failure (missing,
+    unreadable, empty, corrupt) established nothing and must read
+    'unknown', never 'protected': a positive attestation gets read, so it
+    must not be reachable on zero evidence -- 'protected' means the probe
+    ran and PROVED it, never 'the probe did not contradict it' (the B2
+    fail-open/fail-shut asymmetry, this subsystem's turn). The empty
+    string on the probe's argv is not a secret; _signing_env keeps agents
+    and askpass helpers out (#87 F1/F3); stdin is closed so a prompting
+    build fails fast instead of waiting."""
     probe = subprocess.run(
         [binary, "-y", "-P", "", "-f", key_path],
-        capture_output=True, text=True, timeout=60, env=_signing_env())
-    return probe.returncode == 0
+        capture_output=True, text=True, timeout=60, env=_signing_env(),
+        stdin=subprocess.DEVNULL)
+    if probe.returncode == 0:
+        return "unprotected"
+    combined = ((probe.stderr or "") + (probe.stdout or "")).lower()
+    # OpenSSH's stable wording for a passphrase refusal ("incorrect
+    # passphrase supplied to decrypt private key"); a build that words it
+    # differently degrades to 'unknown' -- the safe direction. The
+    # recognised set can grow on platform evidence (the #62 ceremony and
+    # the PR-114 Windows seat check exactly this).
+    if "incorrect passphrase" in combined:
+        return "protected"
+    return "unknown"
+
+
+def _owner_key_is_passphraseless(binary, key_path):
+    """Creation-site bool view of the tri-state probe: 'unknown' reads as
+    not-passphraseless, keeping owner-init behavior identical to the old
+    non-zero-means-protected read -- acceptable THERE because the file is
+    keygen-fresh (lodestar's PR-95 nit); mint-time callers must use
+    _owner_key_protection and honor 'unknown' (#110)."""
+    return _owner_key_protection(binary, key_path) == "unprotected"
+
+
+def _mint_provenance_check(cfg):
+    """#110: #64's attended-mint property is enforced at key CREATION and
+    was never revisited at USE, so a pre-hardening or --no-passphrase key
+    mints unattended, silently, forever, while reading as #64-satisfied
+    (lodestar: when a property is enforced at creation, something must
+    verify it at use, or it only holds for artifacts created after the
+    enforcement landed). Probe the key actually in use at every mint and
+    make the gap LOUD. A warning, never a refusal: fail-closed-at-mint
+    would break existing meshes and is a separate policy argument with a
+    deprecation window (the issue's own split). Probe failure degrades to
+    'unknown' -- a warn system must not brick minting, but it must never
+    overclaim either, so 'unknown' is distinct from 'passphrase-gated'.
+
+    Returns 'passphrase-gated' | 'agent-capable' | 'unknown' -- with
+    agents and askpass scrubbed from the signing env (#87 F1), a
+    completed sign on a passphrase-gated key proves passphrase custody at
+    a terminal (never overclaim 'a human acted' -- the #87 changelog
+    language)."""
+    try:
+        binary = _ssh_keygen_binary()
+        state = _owner_key_protection(binary, owner_key_file(cfg))
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        state = "unknown"
+    if state == "unprotected":
+        print("MESH_WARN: the owner key in use has NO passphrase -- this "
+              "mint is agent-capable, not human-proved; #64's "
+              "attended-ceremony property is NOT in force for this key "
+              "(#110). Remediate attended: ssh-keygen -p on the owner "
+              "key, then consider re-minting circulating artifacts",
+              file=sys.stderr)
+        return "agent-capable"
+    if state == "protected":
+        return "passphrase-gated"
+    print("MESH_WARN: owner-key protection probe INCONCLUSIVE (missing, "
+          "unreadable, or corrupt key file, or an unrecognised ssh-keygen "
+          "build) -- provenance recorded as unknown, never as "
+          "passphrase-gated (#110); the signing step will say more",
+          file=sys.stderr)
+    return "unknown"
 
 
 def _owner_init(cfg, allow_unprotected=False):
@@ -1920,6 +1984,7 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    provenance = _mint_provenance_check(cfg)
     issued = int(time.time())
     body = {"v": 1, "alg": "ssh-ed25519",
             "h": hashlib.sha256(canonical).hexdigest(),
@@ -1954,6 +2019,8 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
             signature = f.read()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+    print(f"MESH_MINT kind=approval provenance={provenance}",
+          file=sys.stderr)
     token = json.dumps({"body": body, "sig": signature},
                        sort_keys=True, separators=(",", ":"))
     return "mwapproval1-" + base64.urlsafe_b64encode(
@@ -2078,6 +2145,7 @@ def _mint_member_cert(cfg, name, pubkey, ttl=CERT_TTL_DEFAULT):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    provenance = _mint_provenance_check(cfg)
     issued = int(time.time())
     body = {"v": 1, "kind": "membercert", "mesh": cfg["id"],
             "name": name, "key": pub, "fpr": _key_fingerprint(pub),
@@ -2112,6 +2180,8 @@ def _mint_member_cert(cfg, name, pubkey, ttl=CERT_TTL_DEFAULT):
             signature = f.read()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+    print(f"MESH_MINT kind=membercert provenance={provenance}",
+          file=sys.stderr)
     token = json.dumps({"body": body, "sig": signature},
                        sort_keys=True, separators=(",", ":"))
     return "mwcert1-" + base64.urlsafe_b64encode(
@@ -2238,6 +2308,7 @@ def _mint_revocation(cfg, fpr, name=""):
     if not os.path.isfile(key_path):
         raise ValueError("this machine does not hold the mesh owner key "
                          "(run `mesh owner-init` where the owner works)")
+    provenance = _mint_provenance_check(cfg)
     issued = int(time.time())
     body = {"v": 1, "kind": "revocation", "mesh": cfg["id"], "fpr": fpr,
             "name": name if isinstance(name, str) else "",
@@ -2267,6 +2338,8 @@ def _mint_revocation(cfg, fpr, name=""):
             signature = f.read()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+    print(f"MESH_MINT kind=revocation provenance={provenance}",
+          file=sys.stderr)
     token = json.dumps({"body": body, "sig": signature},
                        sort_keys=True, separators=(",", ":"))
     return "mwrevoke1-" + base64.urlsafe_b64encode(
@@ -2431,6 +2504,7 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
                 "clock says now <= the adopted list's iat -- a newer "
                 "publication must carry a strictly greater iat or no "
                 "receiver will adopt it; fix the clock and re-run")
+    provenance = _mint_provenance_check(cfg)
     body = {"v": 1, "kind": "revlist", "mesh": cfg["id"], "iat": issued,
             "valid_until": issued + horizon_days * 86400,
             "revocations": entries}
@@ -2483,6 +2557,8 @@ def _mint_revlist(cfg, horizon_days=REVLIST_HORIZON_DEFAULT):
             "receiver would adopt it -- raising the bound is a design "
             "decision (one constant drives mint and verify); make it "
             "before minting, not after distributing" % REVLIST_BLOCK_MAX)
+    print(f"MESH_MINT kind=revlist provenance={provenance}",
+          file=sys.stderr)
     return block, body
 
 
@@ -5958,6 +6034,39 @@ def cmd_owner_init(args):
                     allow_unprotected=getattr(args, "no_passphrase", False))
     except ValueError as exc:
         sys.exit(f"error: {exc}")
+
+
+def cmd_owner_check(args):
+    """#110: audit the attended-mint property without minting anything.
+    Exit codes are the answer for scripts: 0 protected, 1 unprotected,
+    2 absent, 3 probe-failed (never read 3 as protected)."""
+    cfg = load_config()
+    key_path = owner_key_file(cfg)
+    if not os.path.isfile(key_path):
+        print("owner key: ABSENT -- this machine does not hold the mesh "
+              "owner key (the normal state for every node but one)")
+        sys.exit(2)
+    try:
+        binary = _ssh_keygen_binary()
+        state = _owner_key_protection(binary, key_path)
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"owner key: PRESENT, protection UNKNOWN (probe failed: "
+              f"{_single_line(str(exc))}) -- do not read this as protected")
+        sys.exit(3)
+    if state == "unprotected":
+        print("owner key: PRESENT, NO PASSPHRASE -- #64's attended-mint "
+              "property is NOT in force: any process that can read the key "
+              "can mint owner artifacts unattended (#110). Remediate "
+              "attended: ssh-keygen -p on the owner key, then consider "
+              "re-minting circulating artifacts")
+        sys.exit(1)
+    if state == "unknown":
+        print("owner key: PRESENT, protection UNKNOWN (probe inconclusive: "
+              "missing/unreadable/corrupt key file or unrecognised "
+              "ssh-keygen wording) -- do not read this as protected")
+        sys.exit(3)
+    print("owner key: PRESENT, passphrase-PROTECTED -- minting requires "
+          "the passphrase at a terminal (attended-mint property in force)")
 
 
 def cmd_owner_trust(args):
@@ -11506,6 +11615,12 @@ def main():
                         "can mint owner approvals unattended")
     p.set_defaults(fn=cmd_owner_init)
 
+    p = sub.add_parser("owner-check",
+                       help="audit whether the owner key in use carries "
+                            "#64's attended-mint property (exit 0 "
+                            "protected / 1 unprotected / 2 absent / 3 "
+                            "probe-failed) (#110)")
+    p.set_defaults(fn=cmd_owner_check)
     p = sub.add_parser("owner-trust",
                        help="trust the mesh owner here from its mwtrust1- "
                             "block (share it privately, like an invite)")

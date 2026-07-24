@@ -3672,6 +3672,210 @@ class RevlistTests(unittest.TestCase):
         self.assertIn("revlist:", out.getvalue())
 
 
+class MintProvenanceTests(unittest.TestCase):
+    """#110: the #64 attended-mint property is verified at USE, not only
+    at creation -- every owner mint probes the key actually in use, warns
+    loudly on an unprotected one, and labels the artifact's provenance so
+    an unattended mint is never silently indistinguishable from an
+    attended one."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _node_pubkey(self):
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        key = os.path.join(d, "nk")
+        subprocess.run(
+            [shutil.which("ssh-keygen"), "-q", "-t", "ed25519", "-N", "",
+             "-C", "test-node", "-f", key],
+            check=True, capture_output=True, timeout=60)
+        with open(key + ".pub", "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_probe_distinguishes_protected_from_unprotected(self):
+        binary = mesh._ssh_keygen_binary()
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        for name, passphrase, expect in (("open", "", True),
+                                         ("shut", "s3cret-passphrase",
+                                          False)):
+            key = os.path.join(d, name)
+            subprocess.run(
+                [shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+                 "-N", passphrase, "-f", key],
+                check=True, capture_output=True, timeout=60)
+            self.assertEqual(
+                mesh._owner_key_is_passphraseless(binary, key), expect,
+                name)
+
+    def test_unprotected_mints_warn_and_label_every_kind(self):
+        # All four owner-mint sites: loud MESH_WARN + agent-capable label.
+        pub = self._node_pubkey()
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(pub))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._mint_member_cert(self.cfg, "beta", pub)
+            mesh._mint_revocation(self.cfg, fpr)
+            mesh._mint_revlist(self.cfg)
+            mesh._approve_descriptor(
+                self.cfg, {"action": "x", "nonce": "n" * 16})
+        out = err.getvalue()
+        for kind in ("membercert", "revocation", "revlist", "approval"):
+            self.assertIn(f"MESH_MINT kind={kind} "
+                          "provenance=agent-capable", out)
+        self.assertEqual(out.count("MESH_WARN: the owner key in use has "
+                                   "NO passphrase"), 4)
+
+    def test_protection_tristate_never_attests_on_zero_evidence(self):
+        # PR-114 seat (lodestar, measured): corrupt, empty, and missing
+        # key files used to read 'protected' -- a positive attestation on
+        # zero evidence. 'protected' must mean the probe PROVED it (a
+        # recognised passphrase refusal), never 'did not contradict it'.
+        binary = mesh._ssh_keygen_binary()
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        protected = os.path.join(d, "shut")
+        subprocess.run(
+            [shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+             "-N", "s3cret-passphrase", "-f", protected],
+            check=True, capture_output=True, timeout=60)
+        self.assertEqual(mesh._owner_key_protection(binary, protected),
+                         "protected")
+        self.assertEqual(
+            mesh._owner_key_protection(
+                binary, mesh.owner_key_file(self.cfg)), "unprotected")
+        garbage = os.path.join(d, "garbage")
+        with open(garbage, "w") as f:
+            f.write("this is not a private key")
+        self.assertEqual(mesh._owner_key_protection(binary, garbage),
+                         "unknown")
+        empty = os.path.join(d, "empty")
+        open(empty, "w").close()
+        self.assertEqual(mesh._owner_key_protection(binary, empty),
+                         "unknown")
+        self.assertEqual(
+            mesh._owner_key_protection(binary, os.path.join(d, "absent")),
+            "unknown")
+
+    def test_protected_reads_protected_with_agent_and_askpass_armed(self):
+        # lodestar's salvage from closed PR 115: passes today because
+        # _signing_env scrubs these, but nothing else pins it -- this is
+        # the case where a naive probe lies quietly (an ssh-agent or
+        # askpass helper answering the passphrase would make a protected
+        # key read unprotected).
+        binary = mesh._ssh_keygen_binary()
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        key = os.path.join(d, "shut")
+        subprocess.run(
+            [shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+             "-N", "s3cret-passphrase", "-f", key],
+            check=True, capture_output=True, timeout=60)
+        armed = {"SSH_AUTH_SOCK": "/tmp/fake-agent.sock",
+                 "SSH_ASKPASS": "/bin/echo",
+                 "SSH_ASKPASS_REQUIRE": "force"}
+        with mock.patch.dict(os.environ, armed):
+            self.assertEqual(mesh._owner_key_protection(binary, key),
+                             "protected")
+
+    def test_protected_key_labels_passphrase_gated_without_warning(self):
+        # The probe is mocked to 'protected' while the real (unprotected)
+        # key does the signing -- tests the wiring; the probe itself has
+        # its own real-key tests above.
+        pub = self._node_pubkey()
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_owner_key_protection",
+                               return_value="protected"), \
+                contextlib.redirect_stderr(err):
+            block = mesh._mint_member_cert(self.cfg, "beta", pub)
+        self.assertIn("MESH_MINT kind=membercert "
+                      "provenance=passphrase-gated", err.getvalue())
+        self.assertNotIn("MESH_WARN", err.getvalue())
+        ok, reason, _ = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok, reason)
+
+    def test_probe_failure_degrades_to_unknown_and_never_blocks(self):
+        # A warn system must not brick minting -- but it must never
+        # overclaim either: 'unknown' plus the INCONCLUSIVE warning, not
+        # 'passphrase-gated', and not the no-passphrase warning.
+        pub = self._node_pubkey()
+        err = io.StringIO()
+        with mock.patch.object(
+                mesh, "_owner_key_protection",
+                side_effect=subprocess.TimeoutExpired("probe", 60)), \
+                contextlib.redirect_stderr(err):
+            block = mesh._mint_member_cert(self.cfg, "beta", pub)
+        out = err.getvalue()
+        self.assertIn("MESH_MINT kind=membercert provenance=unknown", out)
+        self.assertIn("INCONCLUSIVE", out)
+        self.assertNotIn("provenance=passphrase-gated", out)
+        self.assertNotIn("NO passphrase", out)
+        ok, reason, _ = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok, reason)
+
+    def test_corrupt_owner_key_never_attests_end_to_end(self):
+        # lodestar's measured scenario, end to end: a corrupt key file
+        # must produce the inconclusive warning and NO passphrase-gated
+        # attestation anywhere -- the mint then fails at signing, which
+        # is fine; what matters is that nothing positive was recorded.
+        with open(mesh.owner_key_file(self.cfg), "w") as f:
+            f.write("this is not a private key")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(ValueError):
+                mesh._mint_member_cert(self.cfg, "beta",
+                                       self._node_pubkey())
+        self.assertIn("INCONCLUSIVE", err.getvalue())
+        self.assertNotIn("provenance=passphrase-gated", err.getvalue())
+
+    def test_owner_check_exit_codes_are_the_audit_answer(self):
+        with mock.patch.object(mesh, "load_config",
+                               return_value=self.cfg):
+            # unprotected -> 1
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_check(argparse.Namespace())
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("NO PASSPHRASE", out.getvalue())
+            # protected -> returns (exit 0)
+            out = io.StringIO()
+            with mock.patch.object(mesh, "_owner_key_protection",
+                                   return_value="protected"), \
+                    contextlib.redirect_stdout(out):
+                mesh.cmd_owner_check(argparse.Namespace())
+            self.assertIn("passphrase-PROTECTED", out.getvalue())
+            # probe failure -> 3, never read as protected
+            out = io.StringIO()
+            with mock.patch.object(
+                    mesh, "_owner_key_protection",
+                    side_effect=OSError("probe broke")), \
+                    contextlib.redirect_stdout(out), \
+                    self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_check(argparse.Namespace())
+            self.assertEqual(caught.exception.code, 3)
+            self.assertIn("do not read this as protected", out.getvalue())
+            # inconclusive probe on a REAL corrupt key -> 3 (lodestar's
+            # measured case; used to exit 0 as PROTECTED)
+            with open(mesh.owner_key_file(self.cfg), "w") as f:
+                f.write("this is not a private key")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_check(argparse.Namespace())
+            self.assertEqual(caught.exception.code, 3)
+            self.assertIn("do not read this as protected", out.getvalue())
+            # absent -> 2
+            os.remove(mesh.owner_key_file(self.cfg))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_check(argparse.Namespace())
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("ABSENT", out.getvalue())
+
+
 class CodexHookTests(MembershipCmdTests):
     def _setup_mesh(self):
         cfg = make_cfg()
