@@ -4968,9 +4968,22 @@ class PeerPinTests(unittest.TestCase):
         def bind(k):
             barrier.wait()
             try:
-                results.append(("ok", mesh._bind_peer(self.cfg, "peer", k)))
+                results.append(("ok", k, mesh._bind_peer(self.cfg, "peer", k)))
             except ValueError as exc:
-                results.append(("reject", str(exc)))
+                # loser blocked, re-read inside the lock, found a different
+                # key already pinned
+                results.append(("reject", k, str(exc)))
+            except RuntimeError as exc:
+                # loser could not take the lock at all. Platform-dependent:
+                # the POSIX path blocks-then-compares, the Windows path is
+                # non-blocking, so the SAME race yields ValueError on one and
+                # RuntimeError on the other. Production already treats this as
+                # transient -- _verify_frame catches (RuntimeError, OSError)
+                # and returns FRAME_UNVERIFIED rather than crashing the
+                # receive loop -- so both are non-clobber outcomes and the
+                # invariant is identical. Asserting on WHICH exception the
+                # loser saw tests the platform, not the guarantee.
+                results.append(("unavailable", k, str(exc)))
 
         ts = [threading.Thread(target=bind, args=(k,))
               for k in (keyA, keyB)]
@@ -4978,17 +4991,25 @@ class PeerPinTests(unittest.TestCase):
             t.start()
         for t in ts:
             t.join()
+        self.assertEqual(len(results), 2, results)  # no thread died
         oks = [r for r in results if r[0] == "ok"]
-        rejects = [r for r in results if r[0] == "reject"]
-        # both may "ok" only if they raced to the SAME key; with different
-        # keys exactly one ok and one reject, or two oks of the same key is
-        # impossible here since keys differ
-        stored = mesh._pinned_peer_key(self.cfg, "peer")
-        self.assertIn(stored, (mesh._normalize_pubkey(keyA),
-                               mesh._normalize_pubkey(keyB)))
+        losers = [r for r in results if r[0] in ("reject", "unavailable")]
+
+        # The invariant, asserted on STORE STATE so it holds on every
+        # platform: exactly one binder won, the store holds precisely that
+        # winner's key, and the loser neither pinned nor clobbered.
         self.assertEqual(len(oks), 1, results)
-        self.assertEqual(len(rejects), 1, results)
-        self.assertIn("different key", rejects[0][1])
+        self.assertEqual(len(losers), 1, results)
+        winner_key = mesh._normalize_pubkey(oks[0][1])
+        stored = mesh._pinned_peer_key(self.cfg, "peer")
+        self.assertEqual(stored, winner_key, results)
+        self.assertEqual(stored, mesh._normalize_pubkey(oks[0][2]), results)
+        self.assertNotEqual(mesh._normalize_pubkey(losers[0][1]), stored)
+        # and the loser's failure is one of the two known non-clobber paths
+        if losers[0][0] == "reject":
+            self.assertIn("different key", losers[0][2])
+        else:
+            self.assertIn("lock is unavailable", losers[0][2])
 
     def test_pin_file_is_not_world_readable(self):
         if os.name != "posix":
