@@ -1218,22 +1218,44 @@ def _load_owner_trust(cfg):
     return pub.strip()
 
 
-def _owner_key_is_passphraseless(binary, key_path):
-    """True when the private key opens with an EMPTY passphrase. The empty
-    string on this probe's argv is not a secret; _signing_env keeps agents
-    and askpass helpers out of the probe (#87 F1/F3).
-
-    A non-zero returncode is read as 'protected'. Right after creation the
-    dominant non-zero cause is the wrong (empty) passphrase, which is the
-    correct read; an exotic probe failure would keep an unconfirmed key
-    (lodestar's low-risk nit on the PR #95 seat) -- acceptable because the
-    file is keygen-fresh and the live Windows ceremony (#62 bar) exercises
-    this path for real."""
+def _owner_key_protection(binary, key_path):
+    """'unprotected' | 'protected' | 'unknown', three-way FROM THE PROBE'S
+    OWN OUTPUT (PR-114 seat, lodestar). returncode 0 proves the key opens
+    with an empty passphrase. A recognised wrong-passphrase signature
+    proves decryption was attempted and passphrase-refused -- the only
+    non-zero that EVIDENCES protection. Every other failure (missing,
+    unreadable, empty, corrupt) established nothing and must read
+    'unknown', never 'protected': a positive attestation gets read, so it
+    must not be reachable on zero evidence -- 'protected' means the probe
+    ran and PROVED it, never 'the probe did not contradict it' (the B2
+    fail-open/fail-shut asymmetry, this subsystem's turn). The empty
+    string on the probe's argv is not a secret; _signing_env keeps agents
+    and askpass helpers out (#87 F1/F3); stdin is closed so a prompting
+    build fails fast instead of waiting."""
     probe = subprocess.run(
         [binary, "-y", "-P", "", "-f", key_path],
         capture_output=True, text=True, timeout=60, env=_signing_env(),
         stdin=subprocess.DEVNULL)
-    return probe.returncode == 0
+    if probe.returncode == 0:
+        return "unprotected"
+    combined = ((probe.stderr or "") + (probe.stdout or "")).lower()
+    # OpenSSH's stable wording for a passphrase refusal ("incorrect
+    # passphrase supplied to decrypt private key"); a build that words it
+    # differently degrades to 'unknown' -- the safe direction. The
+    # recognised set can grow on platform evidence (the #62 ceremony and
+    # the PR-114 Windows seat check exactly this).
+    if "incorrect passphrase" in combined:
+        return "protected"
+    return "unknown"
+
+
+def _owner_key_is_passphraseless(binary, key_path):
+    """Creation-site bool view of the tri-state probe: 'unknown' reads as
+    not-passphraseless, keeping owner-init behavior identical to the old
+    non-zero-means-protected read -- acceptable THERE because the file is
+    keygen-fresh (lodestar's PR-95 nit); mint-time callers must use
+    _owner_key_protection and honor 'unknown' (#110)."""
+    return _owner_key_protection(binary, key_path) == "unprotected"
 
 
 def _mint_provenance_check(cfg):
@@ -1256,11 +1278,10 @@ def _mint_provenance_check(cfg):
     language)."""
     try:
         binary = _ssh_keygen_binary()
-        unprotected = _owner_key_is_passphraseless(binary,
-                                                   owner_key_file(cfg))
+        state = _owner_key_protection(binary, owner_key_file(cfg))
     except (ValueError, OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    if unprotected:
+        state = "unknown"
+    if state == "unprotected":
         print("MESH_WARN: the owner key in use has NO passphrase -- this "
               "mint is agent-capable, not human-proved; #64's "
               "attended-ceremony property is NOT in force for this key "
@@ -1268,7 +1289,14 @@ def _mint_provenance_check(cfg):
               "key, then consider re-minting circulating artifacts",
               file=sys.stderr)
         return "agent-capable"
-    return "passphrase-gated"
+    if state == "protected":
+        return "passphrase-gated"
+    print("MESH_WARN: owner-key protection probe INCONCLUSIVE (missing, "
+          "unreadable, or corrupt key file, or an unrecognised ssh-keygen "
+          "build) -- provenance recorded as unknown, never as "
+          "passphrase-gated (#110); the signing step will say more",
+          file=sys.stderr)
+    return "unknown"
 
 
 def _owner_init(cfg, allow_unprotected=False):
@@ -6020,18 +6048,23 @@ def cmd_owner_check(args):
         sys.exit(2)
     try:
         binary = _ssh_keygen_binary()
-        unprotected = _owner_key_is_passphraseless(binary, key_path)
+        state = _owner_key_protection(binary, key_path)
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"owner key: PRESENT, protection UNKNOWN (probe failed: "
               f"{_single_line(str(exc))}) -- do not read this as protected")
         sys.exit(3)
-    if unprotected:
+    if state == "unprotected":
         print("owner key: PRESENT, NO PASSPHRASE -- #64's attended-mint "
               "property is NOT in force: any process that can read the key "
               "can mint owner artifacts unattended (#110). Remediate "
               "attended: ssh-keygen -p on the owner key, then consider "
               "re-minting circulating artifacts")
         sys.exit(1)
+    if state == "unknown":
+        print("owner key: PRESENT, protection UNKNOWN (probe inconclusive: "
+              "missing/unreadable/corrupt key file or unrecognised "
+              "ssh-keygen wording) -- do not read this as protected")
+        sys.exit(3)
     print("owner key: PRESENT, passphrase-PROTECTED -- minting requires "
           "the passphrase at a terminal (attended-mint property in force)")
 
