@@ -1231,7 +1231,8 @@ def _owner_key_is_passphraseless(binary, key_path):
     this path for real."""
     probe = subprocess.run(
         [binary, "-y", "-P", "", "-f", key_path],
-        capture_output=True, text=True, timeout=60, env=_signing_env())
+        capture_output=True, text=True, timeout=60, env=_signing_env(),
+        stdin=subprocess.DEVNULL)
     return probe.returncode == 0
 
 
