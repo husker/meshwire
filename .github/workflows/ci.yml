@@ -20,11 +20,18 @@ jobs:
           - { os: ubuntu-latest, python: "3.11" }
           - { os: ubuntu-latest, python: "3.12" }
           - { os: ubuntu-latest, python: "3.13" }
+          # 3.14 is inside requires-python (">=3.8", unbounded) and is
+          # what fleet machines actually run. Claiming support for an
+          # untested interpreter is how the pin-lock portability gap
+          # reached a developer instead of CI.
+          - { os: ubuntu-latest, python: "3.14" }
           - { os: macos-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.14" }
           # Windows joined the required matrix once the suite went green
           # on real windows-latest runners (#48/#50).
           - { os: windows-latest, python: "3.9" }
           - { os: windows-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.14" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:

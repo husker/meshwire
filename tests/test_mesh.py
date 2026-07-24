@@ -5328,9 +5328,32 @@ class PeerPinTests(unittest.TestCase):
         def bind(k):
             barrier.wait()
             try:
-                results.append(("ok", mesh._bind_peer(self.cfg, "peer", k)))
+                results.append(("ok", k, mesh._bind_peer(self.cfg, "peer", k)))
             except ValueError as exc:
-                results.append(("reject", str(exc)))
+                # loser blocked, re-read inside the lock, found a different
+                # key already pinned
+                results.append(("reject", k, str(exc)))
+            except RuntimeError as exc:
+                # loser never took the lock at all. _acquire_path_lock runs
+                # the SAME retry loop on every platform (attempts x jittered
+                # wait, no platform gate), so which exception the loser sees
+                # is a TIMING dichotomy, not a platform one: acquire after
+                # the winner releases -> fresh re-read inside the lock ->
+                # ValueError; exhaust the retry budget while the lock is held
+                # or delete-pending -> RuntimeError. Environmental factors
+                # make the budget path likelier on some machines -- a
+                # real-time scanner stretches the Windows delete-pending
+                # EACCES window the loop already treats as busy, and
+                # filesystem load compounds it -- but that is measured
+                # correlation, not platform determination (the same failure
+                # reproduces across interpreters on an affected box and on
+                # none of CI's). Production treats it as transient:
+                # _verify_frame catches (RuntimeError, OSError) and returns
+                # FRAME_UNVERIFIED rather than crash the receive loop. Both
+                # outcomes are non-clobber and the invariant is identical, so
+                # asserting on WHICH exception arrived tests the environment,
+                # not the guarantee.
+                results.append(("unavailable", k, str(exc)))
 
         ts = [threading.Thread(target=bind, args=(k,))
               for k in (keyA, keyB)]
@@ -5338,17 +5361,25 @@ class PeerPinTests(unittest.TestCase):
             t.start()
         for t in ts:
             t.join()
+        self.assertEqual(len(results), 2, results)  # no thread died
         oks = [r for r in results if r[0] == "ok"]
-        rejects = [r for r in results if r[0] == "reject"]
-        # both may "ok" only if they raced to the SAME key; with different
-        # keys exactly one ok and one reject, or two oks of the same key is
-        # impossible here since keys differ
-        stored = mesh._pinned_peer_key(self.cfg, "peer")
-        self.assertIn(stored, (mesh._normalize_pubkey(keyA),
-                               mesh._normalize_pubkey(keyB)))
+        losers = [r for r in results if r[0] in ("reject", "unavailable")]
+
+        # The invariant, asserted on STORE STATE so it holds on every
+        # platform: exactly one binder won, the store holds precisely that
+        # winner's key, and the loser neither pinned nor clobbered.
         self.assertEqual(len(oks), 1, results)
-        self.assertEqual(len(rejects), 1, results)
-        self.assertIn("different key", rejects[0][1])
+        self.assertEqual(len(losers), 1, results)
+        winner_key = mesh._normalize_pubkey(oks[0][1])
+        stored = mesh._pinned_peer_key(self.cfg, "peer")
+        self.assertEqual(stored, winner_key, results)
+        self.assertEqual(stored, mesh._normalize_pubkey(oks[0][2]), results)
+        self.assertNotEqual(mesh._normalize_pubkey(losers[0][1]), stored)
+        # and the loser's failure is one of the two known non-clobber paths
+        if losers[0][0] == "reject":
+            self.assertIn("different key", losers[0][2])
+        else:
+            self.assertIn("lock is unavailable", losers[0][2])
 
     def test_pin_file_is_not_world_readable(self):
         if os.name != "posix":
